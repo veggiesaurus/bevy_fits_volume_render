@@ -1,10 +1,65 @@
-use std::io::{ErrorKind, Read};
+use std::io::{self, ErrorKind};
 use std::str::FromStr;
 
 use bevy::tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool};
 
 const BLOCK: usize = 2880;
-const CHUNK: usize = 4 << 20;
+/// Voxels read, decoded and summarised per task: 4 MB of output, small enough to stay in cache.
+const CHUNK_VOXELS: usize = 1 << 20;
+
+/// Bytes that can be read at any offset, so the data can be read in chunks on several threads.
+pub trait Source: MaybeSync {
+    fn size(&self) -> io::Result<u64>;
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
+}
+
+/// Sync where the chunks are read on several threads; wasm reads them in turn, so a JS array will do.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSync: Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Sync + ?Sized> MaybeSync for T {}
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSync {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> MaybeSync for T {}
+
+impl Source for [u8] {
+    fn size(&self) -> io::Result<u64> {
+        Ok(self.len() as u64)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        let start = usize::try_from(offset).map_err(|_| ErrorKind::UnexpectedEof)?;
+        let bytes = self
+            .get(start..start + buf.len())
+            .ok_or(ErrorKind::UnexpectedEof)?;
+        buf.copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Source for std::fs::File {
+    fn size(&self) -> io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+
+    #[cfg(unix)]
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(self, buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn read_at(&self, mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            match std::os::windows::fs::FileExt::seek_read(self, buf, offset)? {
+                0 => return Err(ErrorKind::UnexpectedEof.into()),
+                n => (buf, offset) = (&mut buf[n..], offset + n as u64),
+            }
+        }
+        Ok(())
+    }
+}
 
 pub struct Cube {
     pub dims: [usize; 3],
@@ -31,10 +86,11 @@ pub struct Stats {
     pub non_finite: usize,
 }
 
-pub fn read_fits(mut reader: impl Read, hdu: Option<usize>) -> Result<Cube, String> {
-    let mut index = 0;
+pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Cube, String> {
+    let size = source.size().map_err(|e| e.to_string())?;
+    let (mut index, mut offset) = (0, 0);
     loop {
-        let Some(cards) = read_header(&mut reader)? else {
+        let Some(cards) = read_header(source, &mut offset)? else {
             return Err(match hdu {
                 Some(n) => format!("HDU {n} not found, the file has {index}"),
                 None => "no image HDU with NAXIS >= 3 found".into(),
@@ -63,14 +119,14 @@ pub fn read_fits(mut reader: impl Read, hdu: Option<usize>) -> Result<Cube, Stri
                 ));
             }
             let dims = [axes[0] as usize, axes[1] as usize, axes[2] as usize];
-            let data = read_data(
-                &mut reader,
+            let (data, stats) = read_data(
+                source,
+                offset,
                 &cards,
                 bitpix,
                 width as usize,
                 dims.iter().product(),
             )?;
-            let stats = stats(&data);
             return Ok(Cube {
                 dims,
                 data,
@@ -87,25 +143,27 @@ pub fn read_fits(mut reader: impl Read, hdu: Option<usize>) -> Result<Cube, Stri
             [_, rest @ ..] if groups => width * gcount * (pcount + rest.iter().product::<u64>()),
             all => width * gcount * (pcount + all.iter().product::<u64>()),
         };
-        let padded = bytes.div_ceil(BLOCK as u64) * BLOCK as u64;
-        let skipped = std::io::copy(&mut reader.by_ref().take(padded), &mut std::io::sink())
-            .map_err(|e| e.to_string())?;
-        if skipped != padded {
+        offset += bytes.div_ceil(BLOCK as u64) * BLOCK as u64;
+        if offset > size {
             return Err(format!("HDU {index}: data truncated"));
         }
         index += 1;
     }
 }
 
-/// Returns None at a clean end of file.
-fn read_header(reader: &mut impl Read) -> Result<Option<Vec<String>>, String> {
+/// Reads the header starting at `offset` and moves it past the header. Returns None at a clean end of file.
+fn read_header<S: Source + ?Sized>(
+    source: &S,
+    offset: &mut u64,
+) -> Result<Option<Vec<String>>, String> {
     let mut cards = Vec::new();
     let mut block = [0u8; BLOCK];
     loop {
-        match reader.read_exact(&mut block) {
+        match source.read_at(*offset, &mut block) {
             Err(e) if e.kind() == ErrorKind::UnexpectedEof && cards.is_empty() => return Ok(None),
             r => r.map_err(|e| format!("reading FITS header: {e}"))?,
         }
+        *offset += BLOCK as u64;
         if cards.is_empty() && !block.starts_with(b"SIMPLE  =") && !block.starts_with(b"XTENSION=")
         {
             return Err("not an uncompressed FITS file".into());
@@ -146,13 +204,15 @@ fn num<T: FromStr>(cards: &[String], key: &str) -> Result<Option<T>, String> {
         .transpose()
 }
 
-fn read_data(
-    reader: &mut impl Read,
+/// Reads, decodes and summarises the data a chunk at a time, on all cores natively.
+fn read_data<S: Source + ?Sized>(
+    source: &S,
+    offset: u64,
     cards: &[String],
     bitpix: i64,
     width: usize,
     len: usize,
-) -> Result<Vec<f32>, String> {
+) -> Result<(Vec<f32>, Stats), String> {
     let bscale: f64 = num(cards, "BSCALE")?.unwrap_or(1.0);
     let bzero: f64 = num(cards, "BZERO")?.unwrap_or(0.0);
     // BLANK only applies to integer data.
@@ -173,46 +233,112 @@ fn read_data(
     let mut data = Vec::new();
     data.try_reserve_exact(len)
         .map_err(|_| format!("cannot allocate {len} voxels"))?;
-    let mut buf = vec![0u8; CHUNK.min(len * width)];
-    while data.len() < len {
-        let bytes = &mut buf[..(len - data.len()).min(CHUNK / width) * width];
-        reader
-            .read_exact(bytes)
+    data.resize(len, 0.0);
+    let decode = |chunk: usize, out: &mut [f32]| -> Result<Moments, String> {
+        let mut raw = vec![0u8; out.len() * width];
+        source
+            .read_at(offset + (chunk * CHUNK_VOXELS * width) as u64, &mut raw)
             .map_err(|e| format!("reading FITS data: {e}"))?;
         match bitpix {
-            8 => extend(&mut data, bytes, |b: [u8; 1]| int(b[0] as i64)),
-            16 => extend(&mut data, bytes, |b| int(i16::from_be_bytes(b) as i64)),
-            32 => extend(&mut data, bytes, |b| int(i32::from_be_bytes(b) as i64)),
-            64 => extend(&mut data, bytes, |b| int(i64::from_be_bytes(b))),
-            -32 => extend(&mut data, bytes, |b| float(f32::from_be_bytes(b) as f64)),
-            _ => extend(&mut data, bytes, |b| float(f64::from_be_bytes(b))),
+            8 => convert(out, &raw, |b: [u8; 1]| int(b[0] as i64)),
+            16 => convert(out, &raw, |b| int(i16::from_be_bytes(b) as i64)),
+            32 => convert(out, &raw, |b| int(i32::from_be_bytes(b) as i64)),
+            64 => convert(out, &raw, |b| int(i64::from_be_bytes(b))),
+            -32 => convert(out, &raw, |b| float(f32::from_be_bytes(b) as f64)),
+            _ => convert(out, &raw, |b| float(f64::from_be_bytes(b))),
+        }
+        Ok(Moments::of(out))
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let chunks = data.par_chunk_map_mut(
+        ComputeTaskPool::get_or_init(TaskPool::default),
+        CHUNK_VOXELS,
+        decode,
+    );
+    #[cfg(target_arch = "wasm32")]
+    let chunks: Vec<_> = data
+        .chunks_mut(CHUNK_VOXELS)
+        .enumerate()
+        .map(|(i, out)| decode(i, out))
+        .collect();
+    let moments = chunks.into_iter().try_fold(Moments::EMPTY, |all, chunk| {
+        Ok::<_, String>(all.merge(chunk?))
+    })?;
+    Ok((data, moments.stats(len)))
+}
+
+fn convert<const N: usize>(out: &mut [f32], raw: &[u8], f: impl Fn([u8; N]) -> f32) {
+    for (out, &bytes) in out.iter_mut().zip(raw.as_chunks::<N>().0) {
+        *out = f(bytes);
+    }
+}
+
+/// Count, mean, sum of squared deviations from the mean, and range of the finite values in a chunk.
+#[derive(Clone, Copy, Debug)]
+struct Moments {
+    n: usize,
+    mean: f64,
+    m2: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Moments {
+    const EMPTY: Self = Self {
+        n: 0,
+        mean: f64::NAN,
+        m2: 0.0,
+        min: f64::INFINITY,
+        max: f64::NEG_INFINITY,
+    };
+
+    /// Two passes over a chunk that's still in cache: a single running sum of squares loses precision on
+    /// data with a large pedestal.
+    fn of(values: &[f32]) -> Self {
+        let finite = || values.iter().filter(|v| v.is_finite()).map(|&v| v as f64);
+        let (mut n, mut sum, mut min, mut max) = (0, 0.0, f64::INFINITY, f64::NEG_INFINITY);
+        for v in finite() {
+            n += 1;
+            sum += v;
+            min = min.min(v);
+            max = max.max(v);
+        }
+        let mean = sum / n as f64;
+        let m2 = finite().map(|v| (v - mean) * (v - mean)).sum();
+        Self {
+            n,
+            mean,
+            m2,
+            min,
+            max,
         }
     }
-    Ok(data)
-}
 
-fn extend<const N: usize>(data: &mut Vec<f32>, bytes: &[u8], f: impl Fn([u8; N]) -> f32) {
-    data.extend(bytes.as_chunks::<N>().0.iter().map(|&b| f(b)));
-}
-
-fn stats(data: &[f32]) -> Stats {
-    let finite = || data.iter().filter(|v| v.is_finite()).map(|&v| v as f64);
-    let (mut min, mut max, mut sum, mut n) = (f64::INFINITY, f64::NEG_INFINITY, 0.0, 0usize);
-    for v in finite() {
-        min = min.min(v);
-        max = max.max(v);
-        sum += v;
-        n += 1;
+    /// Chan et al.'s pairwise update, which only ever adds squared deviations.
+    fn merge(self, other: Self) -> Self {
+        if self.n == 0 || other.n == 0 {
+            return if self.n == 0 { other } else { self };
+        }
+        let n = self.n + other.n;
+        let (na, nb) = (self.n as f64, other.n as f64);
+        let delta = other.mean - self.mean;
+        Self {
+            n,
+            mean: self.mean + delta * nb / n as f64,
+            m2: self.m2 + other.m2 + delta * delta * na * nb / n as f64,
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+        }
     }
-    let mean = sum / n as f64;
-    // Two passes: the one-pass formula loses precision on data with a large pedestal.
-    let squares: f64 = finite().map(|v| (v - mean) * (v - mean)).sum();
-    Stats {
-        min: min as f32,
-        max: max as f32,
-        mean,
-        std: (squares / (n as f64 - 1.0)).sqrt(),
-        non_finite: data.len() - n,
+
+    fn stats(self, len: usize) -> Stats {
+        Stats {
+            min: self.min as f32,
+            max: self.max as f32,
+            mean: self.mean,
+            std: (self.m2 / (self.n as f64 - 1.0)).sqrt(),
+            non_finite: len - self.n,
+        }
     }
 }
 
@@ -372,7 +498,7 @@ mod tests {
             data,
             cards: vec![],
             hdu: 0,
-            stats: stats(&[]),
+            stats: Moments::EMPTY.stats(0),
         };
 
         let (new_dims, max) = crop_and_downsample(&cube, [1, 0, 0], [4, 2, 1], [3, 2, 2], true);
@@ -392,6 +518,63 @@ mod tests {
                 11., 12., 13., 21., 22., 23., 111., 112., 113., 121., 122., 123.
             ]
         );
+    }
+
+    #[test]
+    fn merged_chunk_moments_match_the_whole() {
+        // A large pedestal is what the running sum of squares got wrong, and 500..515 holds an all-NaN chunk.
+        let data: Vec<f32> = (0..1000)
+            .map(|i| match i {
+                500..515 => f32::NAN,
+                _ if i % 97 == 0 => f32::INFINITY,
+                _ => 1e4 + (i % 5) as f32 * 0.25,
+            })
+            .collect();
+        let whole = Moments::of(&data);
+        let merged = data
+            .chunks(7)
+            .map(Moments::of)
+            .fold(Moments::EMPTY, Moments::merge);
+        assert_eq!(
+            (merged.n, merged.min, merged.max),
+            (whole.n, whole.min, whole.max)
+        );
+        assert!((merged.mean - whole.mean).abs() < 1e-9);
+        assert!((merged.m2 - whole.m2).abs() < 1e-9 * whole.m2);
+
+        let constant = [3.0f32; 10]
+            .chunks(3)
+            .map(Moments::of)
+            .fold(Moments::EMPTY, Moments::merge)
+            .stats(10);
+        assert_eq!((constant.mean, constant.std), (3.0, 0.0));
+    }
+
+    #[test]
+    fn reads_data_spanning_several_chunks() {
+        let len = 2 * CHUNK_VOXELS + 123;
+        let mut file = header(&[
+            "SIMPLE  =                    T",
+            "BITPIX  =                   16",
+            "NAXIS   =                    3",
+            &format!("NAXIS1  = {len:>20}"),
+            "NAXIS2  =                    1",
+            "NAXIS3  =                    1",
+        ]);
+        let value = |i: usize| (i % 1000) as i16;
+        file.extend(pad(
+            (0..len).flat_map(|i| value(i).to_be_bytes()).collect(),
+            0,
+        ));
+        let cube = read_fits(&file[..], None).unwrap();
+        assert!(
+            (cube.data.iter().enumerate()).all(|(i, &v)| v == value(i) as f32),
+            "voxels out of place across a chunk boundary"
+        );
+        let whole = Moments::of(&cube.data).stats(len);
+        assert_eq!((cube.stats.min, cube.stats.max), (0.0, 999.0));
+        assert!((cube.stats.mean - whole.mean).abs() < 1e-9);
+        assert!((cube.stats.std - whole.std).abs() < 1e-9);
     }
 
     #[test]

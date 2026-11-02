@@ -1,6 +1,9 @@
 //! Loading files handed over by web/index.html.
 
-use std::{io::Read, sync::Mutex};
+use std::{
+    io::{self, ErrorKind},
+    sync::Mutex,
+};
 
 use bevy::{platform::time::Instant, prelude::*};
 use js_sys::Uint8Array;
@@ -9,20 +12,22 @@ use crate::{Dataset, config, fits, ui::format_dims};
 
 static PENDING: Mutex<Option<Dataset>> = Mutex::new(None);
 
-/// Reads the page's copy of the file a chunk at a time, so it's never copied whole into wasm memory.
-struct JsReader {
-    array: Uint8Array,
-    at: u32,
-}
+/// The page's copy of the file, read a chunk at a time so it's never copied whole into wasm memory.
+struct JsBytes(Uint8Array);
 
-impl Read for JsReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = (self.array.length() - self.at).min(buf.len() as u32);
-        self.array
-            .subarray(self.at, self.at + n)
-            .copy_to(&mut buf[..n as usize]);
-        self.at += n;
-        Ok(n as usize)
+impl fits::Source for JsBytes {
+    fn size(&self) -> io::Result<u64> {
+        Ok(self.0.length() as u64)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        let start = u32::try_from(offset).map_err(|_| ErrorKind::UnexpectedEof)?;
+        let end = start
+            .checked_add(buf.len() as u32)
+            .filter(|&end| end <= self.0.length())
+            .ok_or(ErrorKind::UnexpectedEof)?;
+        self.0.subarray(start, end).copy_to(buf);
+        Ok(())
     }
 }
 
@@ -54,13 +59,7 @@ pub fn load_fits(
         (!config_toml.is_empty()).then_some(config_toml.as_str()),
         &config_overrides,
     )?;
-    let cube = fits::read_fits(
-        JsReader {
-            array: bytes,
-            at: 0,
-        },
-        hdu,
-    )?;
+    let cube = fits::read_fits(&JsBytes(bytes), hdu)?;
     let dataset = Dataset::new(name, cube, config, start);
     info!(
         "Loaded {} (HDU {}): {} in {:.2} s",

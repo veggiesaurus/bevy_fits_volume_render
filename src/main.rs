@@ -218,10 +218,12 @@ fn load_native() -> Dataset {
     let config = config::load(&config_path, &args.overrides)
         .unwrap_or_else(|e| fail(format!("{}: {e}", config_path.display())));
 
+    // Bevy's own task pools, made before the app so loading doesn't leave it a differently sized one.
+    bevy::app::TaskPoolOptions::default().create_default_pools();
     let start = Instant::now();
     let file = std::fs::File::open(&args.file)
         .unwrap_or_else(|e| fail(format!("{}: {e}", args.file.display())));
-    let cube = fits::read_fits(std::io::BufReader::new(file), args.hdu)
+    let cube = fits::read_fits(&file, args.hdu)
         .unwrap_or_else(|e| fail(format!("{}: {e}", args.file.display())));
     let name = args.file.file_name().map_or_else(
         || args.file.display().to_string(),

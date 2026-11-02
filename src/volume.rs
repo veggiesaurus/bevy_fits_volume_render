@@ -135,7 +135,7 @@ pub fn cube_image(dims: [usize; 3], data: &[f32]) -> Image {
         height: dims[1] as u32,
         depth_or_array_layers: dims[2] as u32,
     };
-    let bytes = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let bytes = bytemuck::cast_slice(data).to_vec();
     Image::new(
         size,
         TextureDimension::D3,
