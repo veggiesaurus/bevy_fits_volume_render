@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FITS Volume Renderer</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: oklch(0.2421 0.0129 258.3719); }
+  canvas { outline: none; }
+  #overlay {
+    position: fixed; left: 0.75rem; bottom: 0.75rem; max-width: calc(100% - 1.5rem); box-sizing: border-box;
+    display: flex; flex-direction: column; gap: 0.5rem; padding: 0.75rem;
+    background: oklch(0.2795 0.0368 260.031 / 0.9); color: oklch(0.9288 0.0126 255.5078);
+    border: 1px solid oklch(0.4461 0.0263 256.8018); border-radius: 0.5rem;
+    font: 13px Inter, system-ui, sans-serif; overflow-wrap: anywhere;
+  }
+</style>
+</head>
+<body>
+<canvas id="bevy"></canvas>
+<div id="overlay">
+  <input type="file" id="picker" aria-label="Open a FITS file" disabled>
+  <div id="status" role="status">Starting</div>
+</div>
+<script type="module">
+import init, { load_fits } from "./pkg/bevy_fits_volume_render.js";
+
+const status = document.getElementById("status");
+const picker = document.getElementById("picker");
+const canvas = document.getElementById("bevy");
+const params = new URLSearchParams(location.search);
+const file = params.get("file");
+params.delete("file");
+const overrides = [...params].map(([k, v]) => `${k}=${v}`).join("\n");
+const mb = n => `${(n / 1048576).toFixed(1)} MB`;
+
+async function download(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const total = Number(res.headers.get("Content-Length"));
+  const reader = res.body.getReader();
+  const chunks = [];
+  for (let got = 0; ;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    status.textContent = `Downloading ${mb(got)}${total ? ` of ${mb(total)}` : ""}`;
+  }
+  return new Blob(chunks).bytes();
+}
+
+async function load(name, getBytes) {
+  try {
+    const bytes = await getBytes();
+    status.textContent = `Loading ${name}`;
+    load_fits(name, bytes, config, overrides);
+    canvas.focus();
+    status.textContent = name;
+  } catch (e) {
+    status.textContent = `Could not load ${name}: ${e.message ?? e}`;
+  }
+}
+
+if (!navigator.gpu) {
+  status.textContent = "This browser does not support WebGPU. Try a recent Chrome, Edge or Safari.";
+  throw new Error("navigator.gpu is missing");
+}
+
+const config = await fetch("config.toml").then(r => (r.ok ? r.text() : ""), () => "");
+try {
+  await init();
+} catch (e) {
+  if (!e.message?.startsWith("Using exceptions for control flow")) {
+    status.textContent = `Failed to start: ${e.message ?? e}`;
+    throw e;
+  }
+}
+
+status.textContent = "Open a FITS file";
+picker.disabled = false;
+// winit doesn't take focus on a drag, and keys (shift-drag, C, R, Esc) only reach the focused canvas.
+canvas.addEventListener("pointerdown", () => canvas.focus());
+picker.addEventListener("change", () => picker.files[0] && load(picker.files[0].name, () => picker.files[0].bytes()));
+if (file) load(decodeURIComponent(new URL(file, location.href).pathname.split("/").pop()), () => download(file));
+</script>
+</body>
+</html>
