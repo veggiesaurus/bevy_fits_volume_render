@@ -15,10 +15,7 @@ pub struct Cube {
 impl Cube {
     /// The data unit from BUNIT, e.g. "Jy/beam" (or CASA's "beam-1 Jy").
     pub fn unit(&self) -> Option<&str> {
-        let card = self.cards.iter().find(|c| c.starts_with("BUNIT   ="))?;
-        let quoted = card[9..].trim_start().strip_prefix('\'')?;
-        let unit = quoted[..quoted.find('\'')?].trim_end();
-        (!unit.is_empty()).then_some(unit)
+        value(&self.cards, "BUNIT").filter(|u| !u.is_empty())
     }
 }
 
@@ -28,7 +25,8 @@ pub struct Stats {
     pub max: f32,
     pub mean: f64,
     pub std: f64,
-    pub nan_count: usize,
+    /// NaN and infinite voxels, which the other statistics leave out.
+    pub non_finite: usize,
 }
 
 pub fn read_fits(mut reader: impl Read, hdu: Option<usize>) -> Result<Cube, String> {
@@ -49,11 +47,18 @@ pub fn read_fits(mut reader: impl Read, hdu: Option<usize>) -> Result<Cube, Stri
             return Err(format!("HDU {index}: unsupported BITPIX {bitpix}"));
         }
         let width = bitpix.unsigned_abs() / 8;
-        let is_cube = naxis >= 3 && (index == 0 || value(&cards, "XTENSION") == Some("IMAGE"));
+        // A random-groups primary (UVFITS) has NAXIS1 = 0 and is no image.
+        let groups = value(&cards, "GROUPS") == Some("T");
+        let is_cube = naxis >= 3
+            && axes[..3].iter().all(|&n| n > 0)
+            && !groups
+            && (index == 0 || value(&cards, "XTENSION") == Some("IMAGE"));
 
         if hdu == Some(index) || (hdu.is_none() && is_cube) {
             if !is_cube {
-                return Err(format!("HDU {index} is not an image with NAXIS >= 3"));
+                return Err(format!(
+                    "HDU {index} is not an image with three non-empty axes"
+                ));
             }
             let dims = [axes[0] as usize, axes[1] as usize, axes[2] as usize];
             let data = read_data(
@@ -75,10 +80,10 @@ pub fn read_fits(mut reader: impl Read, hdu: Option<usize>) -> Result<Cube, Stri
 
         let pcount: u64 = num(&cards, "PCOUNT")?.unwrap_or(0);
         let gcount: u64 = num(&cards, "GCOUNT")?.unwrap_or(1);
-        let bytes = if naxis == 0 {
-            0
-        } else {
-            width * gcount * (pcount + axes.iter().product::<u64>())
+        let bytes = match &axes[..] {
+            [] => 0,
+            [_, rest @ ..] if groups => width * gcount * (pcount + rest.iter().product::<u64>()),
+            all => width * gcount * (pcount + all.iter().product::<u64>()),
         };
         let padded = bytes.div_ceil(BLOCK as u64) * BLOCK as u64;
         let skipped = std::io::copy(&mut reader.by_ref().take(padded), &mut std::io::sink())
@@ -116,18 +121,17 @@ fn read_header(reader: &mut impl Read) -> Result<Option<Vec<String>>, String> {
     }
 }
 
+/// A card's value: a quoted string without its quotes (and trailing spaces), or the text before any comment.
 fn value<'a>(cards: &'a [String], key: &str) -> Option<&'a str> {
     let card = cards
         .iter()
         .find(|c| c[..8].trim_end() == key && &c[8..10] == "= ")?;
-    Some(
-        card[10..]
-            .split('/')
-            .next()?
-            .trim()
-            .trim_matches('\'')
-            .trim(),
-    )
+    let field = card[10..].trim_start();
+    // ponytail: a quote doubled inside the string ('O''Brien') ends it early; fine for the keys read here.
+    match field.strip_prefix('\'') {
+        Some(quoted) => Some(quoted[..quoted.find('\'')?].trim_end()),
+        None => Some(field.split('/').next()?.trim()),
+    }
 }
 
 fn num<T: FromStr>(cards: &[String], key: &str) -> Result<Option<T>, String> {
@@ -149,7 +153,12 @@ fn read_data(
 ) -> Result<Vec<f32>, String> {
     let bscale: f64 = num(cards, "BSCALE")?.unwrap_or(1.0);
     let bzero: f64 = num(cards, "BZERO")?.unwrap_or(0.0);
-    let blank: Option<i64> = num(cards, "BLANK")?;
+    // BLANK only applies to integer data.
+    let blank: Option<i64> = if bitpix > 0 {
+        num(cards, "BLANK")?
+    } else {
+        None
+    };
     let int = |raw: i64| {
         if Some(raw) == blank {
             f32::NAN
@@ -185,38 +194,39 @@ fn extend<const N: usize>(data: &mut Vec<f32>, bytes: &[u8], f: impl Fn([u8; N])
 }
 
 fn stats(data: &[f32]) -> Stats {
-    let (mut min, mut max, mut sum, mut squares, mut n) =
-        (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0.0, 0usize);
-    for &v in data.iter().filter(|v| !v.is_nan()) {
+    let finite = || data.iter().filter(|v| v.is_finite()).map(|&v| v as f64);
+    let (mut min, mut max, mut sum, mut n) = (f64::INFINITY, f64::NEG_INFINITY, 0.0, 0usize);
+    for v in finite() {
         min = min.min(v);
         max = max.max(v);
-        sum += v as f64;
-        squares += v as f64 * v as f64;
+        sum += v;
         n += 1;
     }
-    let count = n as f64;
-    let std = ((count * squares - sum * sum) / (count * (count - 1.0))).sqrt();
+    let mean = sum / n as f64;
+    // Two passes: the one-pass formula loses precision on data with a large pedestal.
+    let squares: f64 = finite().map(|v| (v - mean) * (v - mean)).sum();
     Stats {
-        min,
-        max,
-        mean: sum / count,
-        std,
-        nan_count: data.len() - n,
+        min: min as f32,
+        max: max as f32,
+        mean,
+        std: (squares / (n as f64 - 1.0)).sqrt(),
+        non_finite: data.len() - n,
     }
 }
 
 pub fn find_downsample_factors(max_cube_size_mb: u64, region_dims: [usize; 3]) -> [usize; 3] {
     let [x, y, z] = region_dims.map(|d| d as u64);
     let (mut fx, mut fy, mut fz) = (1, 1, 1);
-    while x / fx > 2048 || y / fy > 2048 {
+    // Rounded up, as crop_and_downsample sizes the texture; iDaVIE rounds down here and can ask for 2049.
+    while x.div_ceil(fx) > 2048 || y.div_ceil(fy) > 2048 {
         fx += 1;
         fy += 1;
     }
-    while z / fz > 2048 {
+    while z.div_ceil(fz) > 2048 {
         fz += 1;
     }
     let max_elements = max_cube_size_mb * 1_000_000 / 4;
-    while x * y * z / (fx * fy * fz) > max_elements {
+    while x.div_ceil(fx) * y.div_ceil(fy) * z.div_ceil(fz) > max_elements {
         if z / fz > x / fx || z / fz > y / fy {
             fz += 1;
         } else {
@@ -245,6 +255,15 @@ pub fn crop_and_downsample(
     };
     let [width, height, _] = cube.dims;
     let mut out = Vec::with_capacity(dims.iter().product());
+    if factors == [1; 3] {
+        for z in min[2]..=max[2] {
+            for y in min[1]..=max[1] {
+                let row = (z * height + y) * width;
+                out.extend_from_slice(&cube.data[row + min[0]..=row + max[0]]);
+            }
+        }
+        return (dims, out);
+    }
     for oz in 0..dims[2] {
         for oy in 0..dims[1] {
             for ox in 0..dims[0] {
@@ -327,7 +346,7 @@ mod tests {
         assert_eq!(cube.cards[0], format!("{:<80}", image[0]));
         assert_eq!(cube.unit(), Some("Jy/beam"));
         assert_eq!(
-            (cube.stats.min, cube.stats.max, cube.stats.nan_count),
+            (cube.stats.min, cube.stats.max, cube.stats.non_finite),
             (10.0, 15.5, 1)
         );
         assert!(read_fits(&file[..], Some(0)).is_err());
@@ -365,5 +384,47 @@ mod tests {
     fn downsample_factors_match_idavie() {
         assert_eq!(find_downsample_factors(384, [4096, 4096, 100]), [5, 5, 1]);
         assert_eq!(find_downsample_factors(64, [512, 512, 2000]), [3, 3, 8]);
+        // 4097 / 2 rounds up to 2049, over the 3D texture limit.
+        assert_eq!(find_downsample_factors(384, [4097, 10, 10]), [3, 3, 1]);
+    }
+
+    #[test]
+    fn skips_a_random_groups_primary() {
+        let mut file = header(&[
+            "SIMPLE  =                    T",
+            "BITPIX  =                  -32",
+            "NAXIS   =                    4",
+            "NAXIS1  =                    0",
+            "NAXIS2  =                    3",
+            "NAXIS3  =                    2",
+            "NAXIS4  =                    1",
+            "GROUPS  =                    T",
+            "PCOUNT  =                    2",
+            "GCOUNT  =                    5",
+        ]);
+        // 5 groups of 2 parameters and 3 x 2 x 1 values, so 160 bytes.
+        file.extend(pad(vec![0; 160], 0));
+        file.extend(header(&[
+            "XTENSION= 'IMAGE   '",
+            "BITPIX  =                  -32",
+            "NAXIS   =                    3",
+            "NAXIS1  =                    2",
+            "NAXIS2  =                    1",
+            "NAXIS3  =                    1",
+            "BLANK   =                  0.5",
+        ]));
+        file.extend(pad(
+            [1.0f32, f32::INFINITY]
+                .iter()
+                .flat_map(|v| v.to_be_bytes())
+                .collect(),
+            0,
+        ));
+
+        let cube = read_fits(&file[..], None).unwrap();
+        assert_eq!((cube.hdu, cube.dims), (1, [2, 1, 1]));
+        assert!(read_fits(&file[..], Some(0)).is_err());
+        // An infinite voxel stays out of the range, which would otherwise scale everything to zero.
+        assert_eq!((cube.stats.max, cube.stats.non_finite), (1.0, 1));
     }
 }

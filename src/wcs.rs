@@ -3,29 +3,31 @@ use std::sync::Mutex;
 
 use starlink_ast::constants::BAD_VALUE;
 use starlink_ast::coords::PointSet;
-use starlink_ast::frames::{FrameSet, SkyFrame, SpecFrame, SpecSystem};
+use starlink_ast::frames::{DSBSpecFrame, FrameSet, SkyFrame, SpecFrame, SpecSystem};
 use starlink_ast::prelude::*;
 use starlink_ast::{AnyObject, FitsChan};
 
 // FrameSet is Send but not Sync, and a Bevy Resource needs both.
 pub struct Wcs(Mutex<FrameSet>);
 
-const _: fn() = || {
-    fn assert<T: Send + Sync>() {}
-    assert::<Wcs>();
-};
-
 impl Wcs {
+    /// None when the header has no WCS; an AST error reading it is logged.
     pub fn from_cards(cards: &[String]) -> Option<Wcs> {
-        let mut chan = FitsChan::new().ok()?;
-        // Commentary cards hold no WCS but dominate read time in long (e.g. CASA) headers.
-        let header: String = cards
-            .iter()
-            .filter(|c| !matches!(c[..8].trim_end(), "COMMENT" | "HISTORY" | ""))
-            .map(String::as_str)
-            .collect();
-        chan.put_cards(&header).ok()?;
-        let Some(AnyObject::FrameSet(mut fs)) = chan.read().ok()? else {
+        let read = || {
+            let mut chan = FitsChan::new()?;
+            // Commentary cards hold no WCS but dominate read time in long (e.g. CASA) headers.
+            let header: String = cards
+                .iter()
+                .filter(|c| !matches!(c[..8].trim_end(), "COMMENT" | "HISTORY" | ""))
+                .map(String::as_str)
+                .collect();
+            chan.put_cards(&header)?;
+            chan.read()
+        };
+        let Some(AnyObject::FrameSet(mut fs)) = read()
+            .map_err(|e| bevy::log::warn!("No WCS, AST could not read the header: {e}"))
+            .ok()?
+        else {
             return None;
         };
         if fs.nframe() <= 1 {
@@ -49,9 +51,9 @@ impl Wcs {
         let mut lines = vec![frame.title().unwrap_or_default()];
         for axis in 1..=frame.naxes() {
             let label = frame.label(axis).unwrap_or_default();
-            lines.push(match frame.unit(axis).unwrap_or_default() {
-                unit if unit.is_empty() => label,
-                unit => format!("{label} ({unit})"),
+            lines.push(match display_unit(frame, axis) {
+                Some(unit) => format!("{label} ({unit})"),
+                None => label,
             });
             if let Some(spec) = spec_frame(frame, axis) {
                 lines.push(format!("Standard of rest: {}", spec.std_of_rest().as_str()));
@@ -81,12 +83,9 @@ impl Wcs {
         (1..=frame.naxes())
             .map(|axis| {
                 let value = frame.format(axis, world[axis - 1]).ok()?;
-                let unit = frame.unit(axis).ok()?;
-                // A sky axis's Unit describes its sexagesimal format, not a unit to print.
-                Some(if sky_as_time(frame, axis).is_some() || unit.is_empty() {
-                    value
-                } else {
-                    format!("{value} {unit}")
+                Some(match display_unit(frame, axis) {
+                    Some(unit) => format!("{value} {unit}"),
+                    None => value,
                 })
             })
             .collect()
@@ -100,9 +99,9 @@ impl Wcs {
             return None;
         }
         let label = frame.label(axis).ok()?;
-        Some(match frame.unit(axis).ok()? {
-            unit if unit.is_empty() || sky_as_time(frame, axis).is_some() => label,
-            unit => format!("{label} ({unit})"),
+        Some(match display_unit(frame, axis) {
+            Some(unit) => format!("{label} ({unit})"),
+            None => label,
         })
     }
 
@@ -110,7 +109,7 @@ impl Wcs {
     /// `from`..`to`. Stands in for AST's Plot3D grid, which the Rust port doesn't include.
     pub fn edge_ticks(&self, axis: usize, from: [f64; 3], to: [f64; 3]) -> Vec<Tick> {
         const SAMPLES: usize = 64;
-        let mut fs = self.0.lock().unwrap();
+        let fs = self.0.lock().unwrap();
         if axis > fs.naxes() {
             return Vec::new();
         }
@@ -169,12 +168,9 @@ impl Wcs {
             Some(f) => f.to_string(),
             None => format!("%.{decimals}f"),
         };
-        let previous = fs
-            .test_format_str(axis)
-            .unwrap_or(false)
-            .then(|| fs.format_str(axis).ok())
-            .flatten();
-        if fs.set_format_str(axis, &format).is_err() {
+        // Labels are formatted on a copy, so the tick Format never reaches the cursor readout.
+        let mut frame = fs.current().snapshot();
+        if frame.set_format_str(axis, &format).is_err() {
             return Vec::new();
         }
 
@@ -197,17 +193,13 @@ impl Wcs {
                 // Transformed values aren't normalised (an RA can come out negative), so let AST do it.
                 let mut point = world.point(s).to_vec();
                 point[axis - 1] = value;
-                let _ = fs.current().norm(&mut point);
-                if let Ok(label) = fs.format(axis, point[axis - 1]) {
+                let _ = frame.norm(&mut point);
+                if let Ok(label) = frame.format(axis, point[axis - 1]) {
                     let at = ((s as f64 + along) / (SAMPLES - 1) as f64) as f32;
                     ticks.push((k, Tick { at, label }));
                 }
             }
         }
-        let _ = match previous {
-            Some(format) => fs.set_format_str(axis, &format),
-            None => fs.clear_format_str(axis),
-        };
         ticks.into_iter().map(|(_, tick)| tick).collect()
     }
 }
@@ -233,19 +225,41 @@ fn nice_step(raw: f64, sexagesimal: bool) -> f64 {
     [1.0, 60.0, 3600.0]
         .into_iter()
         .flat_map(|scale| [1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0].map(|m| m * scale))
+        // Degrees beyond 30, for edges spanning much of the sky.
+        .chain([45.0, 60.0, 90.0, 180.0].map(|d| d * 3600.0))
         .find(|&s| s >= raw)
         .unwrap_or_else(|| decade(raw))
 }
 
+/// The SpecFrame behind a spectral axis, including the one inside the DSBSpecFrame FitsChan makes when
+/// the header has IMAGFREQ.
 fn spec_frame(frame: &dyn Frame, axis: usize) -> Option<&SpecFrame> {
-    frame.primary_frame(axis - 1).0.as_any().downcast_ref()
+    let primary = frame.primary_frame(axis - 1).0.as_any();
+    primary.downcast_ref().or_else(|| {
+        primary
+            .downcast_ref::<DSBSpecFrame>()
+            .map(DSBSpecFrame::spec)
+    })
 }
 
 /// For a sky axis, whether it's shown as a time (RA) rather than an angle (Dec); None otherwise.
 fn sky_as_time(frame: &dyn Frame, axis: usize) -> Option<bool> {
     let (primary, primary_axis) = frame.primary_frame(axis - 1);
     let sky: &SkyFrame = primary.as_any().downcast_ref()?;
-    sky.as_time(primary_axis + 1).ok()
+    // primary_frame gives the internal axis, and as_time takes the permuted one (Dec first in some headers).
+    let permuted = sky
+        .axis_permutation()
+        .iter()
+        .position(|&a| a == primary_axis)?;
+    sky.as_time(permuted + 1).ok()
+}
+
+/// The Unit worth printing after a value: a sky axis's "hh:mm:ss.s" describes its format, not a unit.
+fn display_unit(frame: &dyn Frame, axis: usize) -> Option<String> {
+    frame
+        .unit(axis)
+        .ok()
+        .filter(|unit| !unit.is_empty() && !unit.contains(':'))
 }
 
 #[cfg(test)]
@@ -287,6 +301,32 @@ mod tests {
         assert_eq!(
             wcs.grid_to_world([270.5, 270.5, 11.0]).unwrap(),
             ["2:21:36.5", "-5:31:16", "1409.82 MHz"]
+        );
+    }
+
+    #[test]
+    fn latitude_first_header_ticks_dec_as_an_angle() {
+        let swap = |c: &&str| match &c[..5] {
+            k @ ("CTYPE" | "CRPIX" | "CDELT" | "CRVAL" | "CUNIT") if c.as_bytes()[5] != b'3' => {
+                let other = if c.as_bytes()[5] == b'1' { '2' } else { '1' };
+                format!("{k}{other}{:<74}", &c[6..])
+            }
+            _ => format!("{c:<80}"),
+        };
+        let cards: Vec<String> = CARDS.iter().map(swap).collect();
+        let wcs = Wcs::from_cards(&cards).unwrap();
+        let dec = wcs.edge_ticks(1, [0.5, 0.5, 0.5], [540.5, 0.5, 0.5]);
+        let ra = wcs.edge_ticks(2, [0.5, 0.5, 0.5], [0.5, 540.5, 0.5]);
+        let labels = |t: &[super::Tick]| t.iter().map(|t| t.label.clone()).collect::<Vec<_>>();
+        assert!(
+            !dec.is_empty() && dec.iter().all(|t| t.label.starts_with("-5:")),
+            "{:?}",
+            labels(&dec)
+        );
+        assert!(
+            !ra.is_empty() && ra.iter().all(|t| t.label.starts_with("2:2")),
+            "{:?}",
+            labels(&ra)
         );
     }
 

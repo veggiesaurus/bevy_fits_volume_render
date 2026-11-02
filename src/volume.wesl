@@ -150,8 +150,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let ray_delta = p_far - p_near;
     let total_length = length(ray_delta);
 
+    // iDaVIE takes the square root of max_length here, which leaves max_steps short of the longest rays.
     let max_length = length(params.slice_max - params.slice_min);
-    let step_length = sqrt(max_length) / floor(params.max_steps);
+    let step_length = max_length / floor(params.max_steps);
     let step_vector = normalize(ray_delta);
     let required_steps = i32(clamp(total_length / step_length, 0.0, params.max_steps));
 
@@ -172,8 +173,10 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     let remaining_step_length = total_length - f32(required_steps + 1) * step_length - length(rand_vector);
     position += step_vector * remaining_step_length * region_scale;
-    ray = accumulate(ray, position, remaining_step_length, highlight_min, highlight_max);
-    if params.projection_mode == 1u {
+    // iDaVIE weights this sample by remaining_step_length, which is negative and can zero the average.
+    let leftover_length = max(total_length - f32(required_steps) * step_length, 0.0);
+    ray = accumulate(ray, position, leftover_length, highlight_min, highlight_max);
+    if params.projection_mode == 1u && ray.cumulative_length > 0.0 {
         ray.value /= ray.cumulative_length;
     }
 
@@ -181,11 +184,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4(0.0);
     }
 
-    var ray_value = (ray.value - params.scale_min) / (params.scale_max - params.scale_min);
+    // The guards keep a constant cube, or equal thresholds, from dividing zero by zero.
+    var ray_value = (ray.value - params.scale_min) / max(params.scale_max - params.scale_min, 1e-30);
     ray_value = clamp(ray_value, params.threshold_min, params.threshold_max);
     // Unity's v axis points up the atlas, wgpu's points down, so no "1.0 -" here.
     let color_map_offset = (0.5 + params.color_map_index) / params.num_color_maps;
-    var x = (ray_value - params.threshold_min) / (params.threshold_max - params.threshold_min);
+    var x = (ray_value - params.threshold_min) / max(params.threshold_max - params.threshold_min, 1e-6);
 
     if params.scale_type == SQUARE {
         x = x * x;

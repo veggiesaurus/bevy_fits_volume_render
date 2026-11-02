@@ -16,7 +16,7 @@ cargo run --release -- --help
 
 `--config PATH` picks a config file, `--hdu N` picks an HDU (0 is the primary; by default it takes the first image with three or more axes) and any config key can be overridden as `--key value`, e.g. `--gpu-memory-limit-mb 128 --default-color-map Viridis`.
 
-The config lives at `$XDG_CONFIG_HOME/idavie-bevy/config.toml` (`~/.config/idavie-bevy/config.toml` when that's unset) and is written with the defaults on first run. The keys are the rendering subset of iDaVIE's `config.json`, with the same defaults:
+The config lives at `$XDG_CONFIG_HOME/idavie-bevy/config.toml` (`~/.config/idavie-bevy/config.toml` when that's unset) and is written with the defaults on first run. The keys are the rendering subset of iDaVIE's `config.json`, with the same defaults, plus `jitter`, which iDaVIE sets on the material:
 
 ```toml
 gpu_memory_limit_mb = 384       # texture budget; the cube is downsampled to fit, as in iDaVIE
@@ -27,7 +27,7 @@ default_scaling_type = "Linear" # Linear, Log, Sqrt, Square, Power or Gamma
 jitter = 1.0
 ```
 
-Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping reloads that region from the full resolution data, the same as iDaVIE, and the panel shows the downsampling factors before and after.
+Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping reloads that region from the full resolution data, the same as iDaVIE, clears the selection, and the panel shows the downsampling factors before and after.
 
 `SCREENSHOT=out.png` saves a frame once rendering has settled and exits, which is handy for side by side comparisons with iDaVIE.
 
@@ -38,7 +38,7 @@ Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to selec
 python3 -m http.server -d web 8000
 ```
 
-Then open http://localhost:8000 and pick a file, or pass `?file=<url>` for one served from the same origin. Any other query parameter overrides a config key (`?file=cube.fits&default_color_map=Viridis`), and a `config.toml` next to `index.html` is read if there is one. It needs a WebGPU browser; it's been tested in Chrome on macOS only.
+Then open http://localhost:8000 and pick a file, or pass `?file=<url>` for one served from the same origin. `?hdu=N` picks an HDU, any other query parameter overrides a config key (`?file=cube.fits&default_color_map=Viridis`), and a `config.toml` next to `index.html` is read if there is one. It needs a WebGPU browser; it's been tested in Chrome on macOS only.
 
 The build needs rustup's toolchain with the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` 0.2.130, matching the `wasm-bindgen` in `Cargo.lock`. The script puts `~/.cargo/bin` first on `PATH` because Homebrew's Rust has no wasm32 standard library. A cold release build takes over ten minutes and the wasm is about 70 MB; `wasm-opt` runs if it's installed.
 
@@ -55,6 +55,12 @@ The shader is a line for line port. The Unity specifics are translated rather th
 - uncompressed FITS only, using the first three axes, and the cube is always shown with X=Y=Z proportions
 - integer BLANK values become NaN; iDaVIE turns off cfitsio's null check and shows them as `BZERO + BSCALE * BLANK`
 - downsampling a crop clamps edge blocks to the crop rather than to the full cube, which looks like a latent bug in iDaVIE's `DataCropAndDownsample`
+- the downsampling factors are chosen from the rounded up texture size, so an axis can't come out at 2049 texels (over the 3D texture limit) as iDaVIE's rounded down check allows
+- the ray-marching step is the slice diagonal over `max_raymarching_steps`. iDaVIE's crop to selection change takes the square root of the diagonal a second time, which stops long rays (corner-on views) about a quarter short
+- in Average mode the last sample is weighted by the length left over, rather than iDaVIE's negative weight, which could zero the average and flicker at the edges
+- infinite voxels are left out of the range and statistics along with NaN ones, since one would scale every other voxel to zero
+- the selection outline is only white if cropping to it would actually load at full resolution, so the 2048 texel limit counts as well as the memory budget
+- the near plane follows the camera in, so a small crop doesn't end up behind it
 
 WCS comes from [starlink-ast](https://github.com/Starlink/starlink-ast-rs), the Rust port of AST, with spectral axes shown in MHz or km/s. The port doesn't include AST's `Plot3D`, so the WCS ticks on the bounding box are our own. Each axis is labelled on the box edge that's on the silhouette, at round values found with AST's transforms and formatted with AST's `Format`. The tick spacing is chosen by hand because `astGap` isn't ported either.
 

@@ -1,5 +1,10 @@
+use std::ops::RangeInclusive;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+
+/// iDaVIE's `[Range]` attributes on the material properties, shared by validation and the sliders.
+pub const JITTER: RangeInclusive<f32> = 0.0..=1.0;
+pub const RAYMARCHING_STEPS: RangeInclusive<u32> = 16..=512;
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
@@ -85,10 +90,16 @@ pub fn from_toml(text: Option<&str>, overrides: &[(String, String)]) -> Result<C
             ));
         }
     }
-    if !(16..=512).contains(&config.max_raymarching_steps) {
+    if !RAYMARCHING_STEPS.contains(&config.max_raymarching_steps) {
         return Err(format!(
-            "max_raymarching_steps must be in 16..=512, got {}",
+            "max_raymarching_steps must be in {RAYMARCHING_STEPS:?}, got {}",
             config.max_raymarching_steps
+        ));
+    }
+    if !JITTER.contains(&config.jitter) {
+        return Err(format!(
+            "jitter must be in {JITTER:?}, got {}",
+            config.jitter
         ));
     }
     if config.gpu_memory_limit_mb == 0 {
@@ -143,7 +154,7 @@ pub struct Args {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-const USAGE: &str = concat!(
+pub const USAGE: &str = concat!(
     "usage: ",
     env!("CARGO_PKG_NAME"),
     " [--config PATH] [--hdu N] [--<config-key> VALUE]... CUBE.fits\n",
@@ -152,19 +163,20 @@ const USAGE: &str = concat!(
     "  --<config-key> V    override any config key, e.g. --gpu-memory-limit-mb 512"
 );
 
+/// `Ok(None)` when help was asked for.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
+pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     let (mut file, mut config, mut hdu, mut overrides) = (None, None, None, Vec::new());
     while let Some(arg) = args.next() {
+        if arg == "-h" || arg == "--help" {
+            return Ok(None);
+        }
         let Some(key) = arg.strip_prefix("--") else {
-            if arg == "-h" || file.replace(PathBuf::from(arg)).is_some() {
+            if file.replace(PathBuf::from(arg)).is_some() {
                 return Err(USAGE.into());
             }
             continue;
         };
-        if key == "help" {
-            return Err(USAGE.into());
-        }
         let value = args
             .next()
             .ok_or_else(|| format!("--{key} needs a value\n{USAGE}"))?;
@@ -180,12 +192,12 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String
             _ => overrides.push((key.replace('-', "_"), value)),
         }
     }
-    Ok(Args {
+    Ok(Some(Args {
         file: file.ok_or(USAGE)?,
         config,
         hdu,
         overrides,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -207,6 +219,7 @@ mod tests {
             .map(String::from)
             .into_iter(),
         )
+        .unwrap()
         .unwrap();
         let config = from_toml(
             Some("jitter = 0.5\ndefault_scaling_type = \"Sqrt\""),
