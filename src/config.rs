@@ -12,8 +12,8 @@ pub struct Config {
     pub gpu_memory_limit_mb: u64,
     pub max_mode_downsampling: bool,
     pub max_raymarching_steps: u32,
-    pub default_color_map: String,
-    pub default_scaling_type: String,
+    pub default_color_map: ColorMap,
+    pub default_scaling_type: Scaling,
     pub jitter: f32,
 }
 
@@ -23,8 +23,8 @@ impl Default for Config {
             gpu_memory_limit_mb: 384,
             max_mode_downsampling: true,
             max_raymarching_steps: 384,
-            default_color_map: "Inferno".into(),
-            default_scaling_type: "Linear".into(),
+            default_color_map: ColorMap::try_from("Inferno".to_string()).unwrap(),
+            default_scaling_type: Scaling::try_from("Linear".to_string()).unwrap(),
             jitter: 1.0,
         }
     }
@@ -40,18 +40,55 @@ pub const COLOR_MAPS: [&str; 80] = [
     "Tab20B", "Tab20C", "Terrain", "Viridis", "Winter", "Wistia", "YlGn", "YlGnBu", "YlOrBr", "YlOrRd", "Turbo",
 ];
 pub const SCALING_TYPES: [&str; 6] = ["Linear", "Log", "Sqrt", "Square", "Power", "Gamma"];
+/// The index of Gamma in `SCALING_TYPES`, as volume.wesl's GAMMA.
+pub const GAMMA: u32 = 5;
 
-fn find(names: &[&str], name: &str) -> Option<usize> {
-    names.iter().position(|n| n.eq_ignore_ascii_case(name))
+/// A name from `COLOR_MAPS`, matched case-insensitively and held as its row in the atlas.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(try_from = "String", into = "String")]
+pub struct ColorMap(pub u32);
+
+/// A name from `SCALING_TYPES`, matched case-insensitively and held as the shader's scale type.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(try_from = "String", into = "String")]
+pub struct Scaling(pub u32);
+
+fn index(kind: &str, names: &[&str], name: &str) -> Result<u32, String> {
+    names
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(name))
+        .map(|i| i as u32)
+        .ok_or_else(|| {
+            format!(
+                "unknown {kind} '{name}', expected one of: {}",
+                names.join(", ")
+            )
+        })
 }
 
-impl Config {
-    pub fn color_map_index(&self) -> usize {
-        find(&COLOR_MAPS, &self.default_color_map).expect("validated by from_toml")
+impl TryFrom<String> for ColorMap {
+    type Error = String;
+    fn try_from(name: String) -> Result<Self, String> {
+        index("colour map", &COLOR_MAPS, &name).map(Self)
     }
+}
 
-    pub fn scaling_type_index(&self) -> u32 {
-        find(&SCALING_TYPES, &self.default_scaling_type).expect("validated by from_toml") as u32
+impl From<ColorMap> for String {
+    fn from(map: ColorMap) -> Self {
+        COLOR_MAPS[map.0 as usize].into()
+    }
+}
+
+impl TryFrom<String> for Scaling {
+    type Error = String;
+    fn try_from(name: String) -> Result<Self, String> {
+        index("scaling type", &SCALING_TYPES, &name).map(Self)
+    }
+}
+
+impl From<Scaling> for String {
+    fn from(scaling: Scaling) -> Self {
+        SCALING_TYPES[scaling.0 as usize].into()
     }
 }
 
@@ -70,26 +107,6 @@ pub fn from_toml(text: Option<&str>, overrides: &[(String, String)]) -> Result<C
     let config: Config = table
         .try_into()
         .map_err(|e| e.to_string().trim().to_string())?;
-
-    for (key, name, names) in [
-        (
-            "default_color_map",
-            &config.default_color_map,
-            &COLOR_MAPS[..],
-        ),
-        (
-            "default_scaling_type",
-            &config.default_scaling_type,
-            &SCALING_TYPES[..],
-        ),
-    ] {
-        if find(names, name).is_none() {
-            return Err(format!(
-                "unknown {key} '{name}', expected one of: {}",
-                names.join(", ")
-            ));
-        }
-    }
     if !RAYMARCHING_STEPS.contains(&config.max_raymarching_steps) {
         return Err(format!(
             "max_raymarching_steps must be in {RAYMARCHING_STEPS:?}, got {}",
@@ -235,8 +252,8 @@ mod tests {
             (512, false, 0.5)
         );
         assert_eq!(
-            (config.color_map_index(), config.scaling_type_index()),
-            (72, 2)
+            (config.default_color_map, config.default_scaling_type),
+            (ColorMap(72), Scaling(2))
         );
 
         let err = from_toml(None, &[("max_steps".into(), "100".into())]).unwrap_err();

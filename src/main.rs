@@ -27,7 +27,25 @@ const UNITY_FROM_LOCAL: Vec3 = Vec3::new(1.0, 1.0, -1.0);
 const SELECTION_SATURATE_FACTOR: f32 = 0.7;
 
 /// 0-based inclusive voxel corners.
-type Region = ([usize; 3], [usize; 3]);
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Region {
+    min: [usize; 3],
+    max: [usize; 3],
+}
+
+impl Region {
+    fn extent(&self) -> [usize; 3] {
+        std::array::from_fn(|i| self.max[i] - self.min[i] + 1)
+    }
+}
+
+/// A texture made from a region of the cube, and the downsampling it took.
+#[derive(Clone)]
+struct VolumeTexture {
+    handle: Handle<Image>,
+    dims: [usize; 3],
+    factors: [usize; 3],
+}
 
 #[derive(Resource)]
 struct Dataset {
@@ -51,27 +69,33 @@ impl Dataset {
     }
 
     fn full_region(&self) -> Region {
-        ([0; 3], self.cube.dims.map(|d| d - 1))
+        Region {
+            min: [0; 3],
+            max: self.cube.dims.map(|d| d - 1),
+        }
     }
 }
 
 #[derive(Resource)]
 struct CubeState {
     material: Handle<VolumeMaterial>,
-    full_texture: Handle<Image>,
-    full_dims: [usize; 3],
-    full_factors: [usize; 3],
-    texture: Handle<Image>,
-    texture_dims: [usize; 3],
-    factors: [usize; 3],
-    crop: Option<Region>,
+    full: VolumeTexture,
+    crop: Option<(Region, VolumeTexture)>,
     selection: Option<Region>,
 }
 
 impl CubeState {
     /// The region on screen: the crop, or the whole cube.
     fn visible(&self, data: &Dataset) -> Region {
-        self.crop.unwrap_or(data.full_region())
+        self.crop
+            .as_ref()
+            .map_or(data.full_region(), |(region, _)| *region)
+    }
+
+    fn texture(&self) -> &VolumeTexture {
+        self.crop
+            .as_ref()
+            .map_or(&self.full, |(_, texture)| texture)
     }
 }
 
@@ -220,27 +244,38 @@ fn load_native() -> Dataset {
 }
 
 /// Texture for a region of the cube, downsampled to fit the configured GPU budget.
-fn region_texture(data: &Dataset, (min, max): Region) -> (Image, [usize; 3], [usize; 3]) {
-    let extent: [usize; 3] = std::array::from_fn(|i| max[i] - min[i] + 1);
-    let factors = fits::find_downsample_factors(data.config.gpu_memory_limit_mb, extent);
-    if factors == [1; 3] && extent == data.cube.dims {
-        return (volume::cube_image(extent, &data.cube.data), extent, factors);
-    }
-    let (dims, values) = fits::crop_and_downsample(
-        &data.cube,
-        min,
-        max,
-        factors,
-        data.config.max_mode_downsampling,
+fn region_texture(data: &Dataset, region: Region, images: &mut Assets<Image>) -> VolumeTexture {
+    let start = Instant::now();
+    let factors = fits::find_downsample_factors(data.config.gpu_memory_limit_mb, region.extent());
+    let (dims, image) = if region == data.full_region() && factors == [1; 3] {
+        let dims = data.cube.dims;
+        (dims, volume::cube_image(dims, &data.cube.data))
+    } else {
+        let (dims, values) = fits::crop_and_downsample(
+            &data.cube,
+            region.min,
+            region.max,
+            factors,
+            data.config.max_mode_downsampling,
+        );
+        (dims, volume::cube_image(dims, &values))
+    };
+    info!(
+        "Texture {dims:?} for {region:?}, downsampled by {factors:?}, in {:.2} s",
+        start.elapsed().as_secs_f32()
     );
-    (volume::cube_image(dims, &values), dims, factors)
+    VolumeTexture {
+        handle: images.add(image),
+        dims,
+        factors,
+    }
 }
 
 /// Object-space box of a voxel region, as iDaVIE's CropToRegion and highlight bounds compute it.
-fn region_bounds((min, max): Region, dims: [usize; 3]) -> (Vec3, Vec3) {
+fn region_bounds(region: Region, dims: [usize; 3]) -> (Vec3, Vec3) {
     let dims = Vec3::from_array(dims.map(|d| d as f32));
-    let min = Vec3::from_array(min.map(|v| v as f32));
-    let max = Vec3::from_array(max.map(|v| v as f32));
+    let min = Vec3::from_array(region.min.map(|v| v as f32));
+    let max = Vec3::from_array(region.max.map(|v| v as f32));
     (min / dims - 0.5, (max + 1.0) / dims - 0.5)
 }
 
@@ -257,13 +292,7 @@ fn spawn_volume(
     for entity in &old {
         commands.entity(entity).despawn();
     }
-    let start = Instant::now();
-    let (image, dims, factors) = region_texture(&data, data.full_region());
-    info!(
-        "Volume texture {dims:?} (downsampled by {factors:?}) in {:.2} s",
-        start.elapsed().as_secs_f32()
-    );
-    let texture = images.add(image);
+    let full = region_texture(&data, data.full_region(), &mut images);
 
     let config = &data.config;
     let settings = Settings {
@@ -271,16 +300,16 @@ fn spawn_volume(
             scale_min: data.cube.stats.min,
             scale_max: data.cube.stats.max,
             jitter: config.jitter,
-            max_steps: config.max_raymarching_steps as f32,
-            color_map_index: config.color_map_index() as f32,
-            scale_type: config.scaling_type_index(),
+            max_steps: config.max_raymarching_steps,
+            color_map_index: config.default_color_map.0,
+            scale_type: config.default_scaling_type.0,
             ..default()
         },
         wcs_axes: true,
     };
     let material = materials.add(VolumeMaterial {
         params: settings.params,
-        data_cube: texture.clone(),
+        data_cube: full.handle.clone(),
         color_map: images.add(volume::color_map_image()),
     });
     commands.spawn((
@@ -319,12 +348,7 @@ fn spawn_volume(
     commands.insert_resource(Gesture::default());
     commands.insert_resource(CubeState {
         material,
-        full_texture: texture.clone(),
-        full_dims: dims,
-        full_factors: factors,
-        texture,
-        texture_dims: dims,
-        factors,
+        full,
         crop: None,
         selection: None,
     });
@@ -352,5 +376,5 @@ fn update_material(
         params.highlight_saturate_factor = SELECTION_SATURATE_FACTOR;
     }
     material.params = params;
-    material.data_cube = state.texture.clone();
+    material.data_cube = state.texture().handle.clone();
 }

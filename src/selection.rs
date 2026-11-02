@@ -1,11 +1,11 @@
 //! Shift-drag region selection, and cropping the volume to it.
 
-use bevy::{platform::time::Instant, prelude::*};
+use bevy::prelude::*;
 use bevy_egui::input::EguiWantsInput;
 
 use crate::{
     CubeState, Dataset, Region, UNITY_FROM_LOCAL,
-    camera::{DEFAULT_DISTANCE, Orbit},
+    camera::{DEFAULT_DISTANCE, Orbit, pointer},
     grips::Grips,
     region_bounds, region_texture,
 };
@@ -69,26 +69,20 @@ pub fn select_region(
     let (lo, hi) = region_bounds(visible, dims);
     let plane = (lo[axis] + hi[axis]) / 2.0;
 
-    let pointer = windows
-        .single()
-        .ok()
-        .and_then(Window::cursor_position)
-        .and_then(|p| camera.viewport_to_world(camera_transform, p).ok())
-        .and_then(|ray| {
-            let origin = ray.origin * UNITY_FROM_LOCAL;
-            let direction = *ray.direction * UNITY_FROM_LOCAL;
-            let t = (plane - origin[axis]) / direction[axis];
-            (t.is_finite() && t > 0.0).then(|| {
-                let p = origin + direction * t;
-                std::array::from_fn::<i64, 3, _>(|i| ((p[i] + 0.5) * dims[i] as f32).floor() as i64)
-            })
-        });
-    let clamp_to = |v: [i64; 3], (min, max): Region| -> [usize; 3] {
-        std::array::from_fn(|i| v[i].clamp(min[i] as i64, max[i] as i64) as usize)
+    let voxel = pointer(&windows, camera, camera_transform).and_then(|ray| {
+        let t = (plane - ray.origin[axis]) / ray.direction[axis];
+        (t.is_finite() && t > 0.0).then(|| {
+            let p = ray.origin + ray.direction * t;
+            std::array::from_fn::<i64, 3, _>(|i| ((p[i] + 0.5) * dims[i] as f32).floor() as i64)
+        })
+    });
+    let clamp_to = |v: [i64; 3], r: Region| -> [usize; 3] {
+        std::array::from_fn(|i| v[i].clamp(r.min[i] as i64, r.max[i] as i64) as usize)
     };
-    let inside =
-        |v: &[i64; 3]| (0..3).all(|i| v[i] >= visible.0[i] as i64 && v[i] <= visible.1[i] as i64);
-    hover.0 = pointer
+    let inside = |v: &[i64; 3]| {
+        (0..3).all(|i| v[i] >= visible.min[i] as i64 && v[i] <= visible.max[i] as i64)
+    };
+    hover.0 = voxel
         .filter(|v| inside(v) && !egui.wants_pointer_input())
         .map(|v| clamp_to(v, visible));
 
@@ -98,22 +92,24 @@ pub fn select_region(
         && !egui.wants_pointer_input()
         && grips.drag.is_none()
         && matches!(*gesture, Gesture::Idle)
-        && let Some(v) = pointer
+        && let Some(v) = voxel
     {
         let depth = state.selection.unwrap_or(visible);
         *gesture = Gesture::Select(Drag {
             axis,
             start: clamp_to(v, visible),
-            depth: [depth.0[axis], depth.1[axis]],
+            depth: [depth.min[axis], depth.max[axis]],
         });
     }
-    if let (Gesture::Select(Drag { axis, start, depth }), Some(v)) = (*gesture, pointer) {
+    if let (Gesture::Select(Drag { axis, start, depth }), Some(v)) = (*gesture, voxel) {
         let end = clamp_to(v, visible);
-        let mut min: [usize; 3] = std::array::from_fn(|i| start[i].min(end[i]));
-        let mut max: [usize; 3] = std::array::from_fn(|i| start[i].max(end[i]));
-        (min[axis], max[axis]) = (depth[0], depth[1]);
-        if state.selection != Some((min, max)) {
-            state.selection = Some((min, max));
+        let mut selection = Region {
+            min: std::array::from_fn(|i| start[i].min(end[i])),
+            max: std::array::from_fn(|i| start[i].max(end[i])),
+        };
+        (selection.min[axis], selection.max[axis]) = (depth[0], depth[1]);
+        if state.selection != Some(selection) {
+            state.selection = Some(selection);
         }
     }
 
@@ -134,6 +130,7 @@ pub fn select_region(
     }
 }
 
+/// Cropping keeps the selection, as iDaVIE's CropToFeature does, so a reset still shows where the crop was.
 pub fn apply_crop(
     mut commands: MessageReader<CropCommand>,
     data: Res<Dataset>,
@@ -142,30 +139,18 @@ pub fn apply_crop(
     mut orbits: Query<&mut Orbit>,
 ) {
     for command in commands.read() {
-        let region = match command {
-            CropCommand::ToSelection => match state.selection.take() {
-                Some(region) => Some(region),
-                None => continue,
-            },
+        state.crop = match command {
+            CropCommand::ToSelection => {
+                let Some(region) = state.selection else {
+                    continue;
+                };
+                if state.crop.as_ref().is_some_and(|(crop, _)| *crop == region) {
+                    continue;
+                }
+                Some((region, region_texture(&data, region, &mut images)))
+            }
             CropCommand::Reset => None,
         };
-        if let Some(region) = region {
-            let start = Instant::now();
-            let (image, dims, factors) = region_texture(&data, region);
-            info!(
-                "Cropped to {region:?}: texture {dims:?}, downsampled by {factors:?}, {:.2} s",
-                start.elapsed().as_secs_f32()
-            );
-            (state.texture, state.texture_dims, state.factors) = (images.add(image), dims, factors);
-        } else {
-            (state.texture, state.texture_dims, state.factors) = (
-                state.full_texture.clone(),
-                state.full_dims,
-                state.full_factors,
-            );
-        }
-        state.crop = region;
-
         let (lo, hi) = region_bounds(state.visible(&data), data.cube.dims);
         for mut orbit in &mut orbits {
             orbit.target = (lo + hi) / 2.0 * UNITY_FROM_LOCAL;

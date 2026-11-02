@@ -38,20 +38,28 @@ const mb = n => `${(n / 1048576).toFixed(1)} MB`;
 // after it started.
 let latest;
 
+// Reads into one buffer sized from Content-Length, so the file is held once rather than as chunks plus a copy.
 async function download(url, signal) {
   const res = await fetch(url, { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const total = Number(res.headers.get("Content-Length"));
+  // With a Content-Encoding it's the compressed size, so the buffer grows instead.
+  const total = res.headers.get("Content-Encoding") ? 0 : Number(res.headers.get("Content-Length"));
   const reader = res.body.getReader();
-  const chunks = [];
-  for (let got = 0; ;) {
+  let bytes = new Uint8Array(total || 1 << 20);
+  let got = 0;
+  for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    chunks.push(value);
+    if (got + value.length > bytes.length) {
+      const grown = new Uint8Array(Math.max(2 * bytes.length, got + value.length));
+      grown.set(bytes.subarray(0, got));
+      bytes = grown;
+    }
+    bytes.set(value, got);
     got += value.length;
     status.textContent = `Downloading ${mb(got)}${total ? ` of ${mb(total)}` : ""}`;
   }
-  return new Blob(chunks).bytes();
+  return bytes.subarray(0, got);
 }
 
 async function load(name, getBytes) {

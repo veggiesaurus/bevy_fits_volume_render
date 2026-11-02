@@ -1,6 +1,8 @@
 use std::io::{ErrorKind, Read};
 use std::str::FromStr;
 
+use bevy::tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool};
+
 const BLOCK: usize = 2880;
 const CHUNK: usize = 4 << 20;
 
@@ -254,37 +256,40 @@ pub fn crop_and_downsample(
         min[i] + o * factors[i]..(min[i] + (o + 1) * factors[i]).min(max[i] + 1)
     };
     let [width, height, _] = cube.dims;
-    let mut out = Vec::with_capacity(dims.iter().product());
-    if factors == [1; 3] {
-        for z in min[2]..=max[2] {
-            for y in min[1]..=max[1] {
-                let row = (z * height + y) * width;
-                out.extend_from_slice(&cube.data[row + min[0]..=row + max[0]]);
+    let row = |z: usize, y: usize| &cube.data[(z * height + y) * width..];
+    // One output plane per task, as iDaVIE splits over z. On wasm the pool runs them in turn.
+    let fill_plane = |oz: usize, plane: &mut [f32]| {
+        if factors == [1; 3] {
+            for (out, y) in plane.chunks_mut(dims[0]).zip(min[1]..) {
+                out.copy_from_slice(&row(min[2] + oz, y)[min[0]..=max[0]]);
             }
+            return;
         }
-        return (dims, out);
-    }
-    for oz in 0..dims[2] {
-        for oy in 0..dims[1] {
-            for ox in 0..dims[0] {
+        for (oy, out) in plane.chunks_mut(dims[0]).enumerate() {
+            for (ox, out) in out.iter_mut().enumerate() {
                 let (mut acc, mut count) = (if max_mode { f32::MIN } else { 0.0 }, 0);
                 for z in block(2, oz) {
                     for y in block(1, oy) {
-                        let row = &cube.data[(z * height + y) * width..];
-                        for &v in row[block(0, ox)].iter().filter(|v| !v.is_nan()) {
+                        for &v in row(z, y)[block(0, ox)].iter().filter(|v| !v.is_nan()) {
                             acc = if max_mode { acc.max(v) } else { acc + v };
                             count += 1;
                         }
                     }
                 }
-                out.push(match count {
+                *out = match count {
                     0 => f32::NAN,
                     _ if max_mode => acc,
                     _ => acc / count as f32,
-                });
+                };
             }
         }
-    }
+    };
+    let mut out = vec![0.0; dims.iter().product()];
+    out.par_chunk_map_mut(
+        ComputeTaskPool::get_or_init(TaskPool::default),
+        dims[0] * dims[1],
+        fill_plane,
+    );
     (dims, out)
 }
 
@@ -378,6 +383,15 @@ mod tests {
         let (_, mean) = crop_and_downsample(&cube, [1, 0, 0], [4, 2, 1], [3, 2, 2], false);
         assert_eq!(mean[..3], [683.0 / 11.0, 59.0, 72.0]);
         assert!(mean[3].is_nan());
+
+        let (new_dims, full) = crop_and_downsample(&cube, [1, 1, 0], [3, 2, 1], [1; 3], true);
+        assert_eq!(new_dims, [3, 2, 2]);
+        assert_eq!(
+            full,
+            [
+                11., 12., 13., 21., 22., 23., 111., 112., 113., 121., 122., 123.
+            ]
+        );
     }
 
     #[test]

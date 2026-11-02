@@ -134,8 +134,9 @@ pub fn update_outlines(
     };
     *transform = box_transform(selection, data.cube.dims);
     // iDaVIE colours the region white when cropping to it would load at full resolution, yellow otherwise.
-    let extent = std::array::from_fn(|i| selection.1[i] - selection.0[i] + 1);
-    let full_res = fits::find_downsample_factors(data.config.gpu_memory_limit_mb, extent) == [1; 3];
+    let full_res =
+        fits::find_downsample_factors(data.config.gpu_memory_limit_mb, selection.extent())
+            == [1; 3];
     material.0 = if full_res {
         outline_materials.white.clone()
     } else {

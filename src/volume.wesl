@@ -15,14 +15,14 @@ struct VolumeParams {
     highlight_max: vec3<f32>,
     scale_max: f32,
     jitter: f32,
-    color_map_index: f32,
-    num_color_maps: f32,
+    color_map_index: u32,
+    num_color_maps: u32,
     scale_type: u32,
     scale_alpha: f32,
     scale_gamma: f32,
     scale_bias: f32,
     scale_contrast: f32,
-    max_steps: f32,
+    max_steps: u32,
     highlight_saturate_factor: f32,
     projection_mode: u32,
 };
@@ -152,9 +152,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // iDaVIE takes the square root of max_length here, which leaves max_steps short of the longest rays.
     let max_length = length(params.slice_max - params.slice_min);
-    let step_length = max_length / floor(params.max_steps);
+    let step_length = max_length / f32(params.max_steps);
     let step_vector = normalize(ray_delta);
-    let required_steps = i32(clamp(total_length / step_length, 0.0, params.max_steps));
+    let required_steps = i32(clamp(total_length / step_length, 0.0, f32(params.max_steps)));
 
     // Unity's _Time.xy is (t / 20, t)
     let rand_vector = nrand(in.position.xy + vec2(globals.time / 20.0, globals.time)) * step_vector * step_length * params.jitter;
@@ -188,7 +188,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var ray_value = (ray.value - params.scale_min) / max(params.scale_max - params.scale_min, 1e-30);
     ray_value = clamp(ray_value, params.threshold_min, params.threshold_max);
     // Unity's v axis points up the atlas, wgpu's points down, so no "1.0 -" here.
-    let color_map_offset = (0.5 + params.color_map_index) / params.num_color_maps;
+    let color_map_offset = (0.5 + f32(params.color_map_index)) / f32(params.num_color_maps);
     var x = (ray_value - params.threshold_min) / max(params.threshold_max - params.threshold_min, 1e-6);
 
     if params.scale_type == SQUARE {

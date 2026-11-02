@@ -8,7 +8,7 @@ use bevy::{
 };
 use bevy_egui::input::EguiWantsInput;
 
-use crate::{grips::Grips, selection::Gesture};
+use crate::{UNITY_FROM_LOCAL, grips::Grips, selection::Gesture};
 
 pub const DEFAULT_DISTANCE: f32 = 2.0;
 
@@ -33,6 +33,27 @@ impl Default for Orbit {
             distance: DEFAULT_DISTANCE,
         }
     }
+}
+
+/// The cursor's window position, and the ray under it in iDaVIE (Unity) object space.
+pub struct Pointer {
+    pub cursor: Vec2,
+    pub origin: Vec3,
+    pub direction: Vec3,
+}
+
+pub fn pointer(
+    windows: &Query<&Window>,
+    camera: &Camera,
+    view: &GlobalTransform,
+) -> Option<Pointer> {
+    let cursor = windows.single().ok()?.cursor_position()?;
+    let ray = camera.viewport_to_world(view, cursor).ok()?;
+    Some(Pointer {
+        cursor,
+        origin: ray.origin * UNITY_FROM_LOCAL,
+        direction: *ray.direction * UNITY_FROM_LOCAL,
+    })
 }
 
 pub fn spawn_camera(mut commands: Commands) {
@@ -79,7 +100,8 @@ pub fn orbit_camera(
     {
         *gesture = Gesture::Orbit;
     }
-    if matches!(*gesture, Gesture::Orbit) {
+    // A tap can press and release in one frame, which shouldn't turn that frame's pointer motion into an orbit.
+    if matches!(*gesture, Gesture::Orbit) && buttons.pressed(MouseButton::Left) {
         orbit.yaw -= motion.delta.x * 0.005;
         orbit.pitch = (orbit.pitch - motion.delta.y * 0.005).clamp(-1.55, 1.55);
     }

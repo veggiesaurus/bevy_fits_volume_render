@@ -27,7 +27,7 @@ default_scaling_type = "Linear" # Linear, Log, Sqrt, Square, Power or Gamma
 jitter = 1.0
 ```
 
-Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping reloads that region from the full resolution data, the same as iDaVIE, clears the selection, and the panel shows the downsampling factors before and after.
+Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping reloads that region from the full resolution data and keeps the selection, the same as iDaVIE, and the panel shows the downsampling factors before and after.
 
 `SCREENSHOT=out.png` saves a frame once rendering has settled and exits, which is handy for side by side comparisons with iDaVIE.
 
@@ -40,7 +40,7 @@ python3 -m http.server -d web 8000
 
 Then open http://localhost:8000 and pick a file, or pass `?file=<url>` for one served from the same origin. `?hdu=N` picks an HDU, any other query parameter overrides a config key (`?file=cube.fits&default_color_map=Viridis`), and a `config.toml` next to `index.html` is read if there is one. It needs a WebGPU browser; it's been tested in Chrome on macOS only.
 
-The build needs rustup's toolchain with the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` 0.2.130, matching the `wasm-bindgen` in `Cargo.lock`. The script puts `~/.cargo/bin` first on `PATH` because Homebrew's Rust has no wasm32 standard library. A cold release build takes over ten minutes and the wasm is about 70 MB; `wasm-opt` runs if it's installed.
+The build needs rustup's toolchain with the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` 0.2.130, matching the `wasm-bindgen` in `Cargo.lock`. The script puts `~/.cargo/bin` first on `PATH` because Homebrew's Rust has no wasm32 standard library. A cold release build is slow, and the wasm is about 41 MB once `wasm-opt` (from Homebrew's `binaryen`) has run; the script skips it if it isn't installed.
 
 starlink-ast is Rust apart from the PAL, ERFA and WCSLIB routines it still vendors as C. `wasm32-unknown-unknown` has no libc headers to compile those against, so the script uses Homebrew's `llvm` clang with the musl headers from Homebrew's `emscripten` (headers only, nothing is built with emcc). The C only needs libm and `strcmp`, which Rust's `compiler_builtins` already provides on wasm, so WCS works the same in the browser as natively.
 

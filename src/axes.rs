@@ -22,7 +22,8 @@ pub fn update_axes(
     state: Res<CubeState>,
     axes: Option<Res<AxisAnnotation>>,
 ) {
-    let region @ (min, max) = state.visible(&data);
+    let region = state.visible(&data);
+    let Region { min, max } = region;
     if !data.is_changed() && axes.map_or(data.wcs.is_none(), |a| a.region == region) {
         return;
     }

@@ -8,7 +8,7 @@ use bevy_egui::{EguiContexts, egui};
 
 use crate::{
     CubeState, Dataset, Region, Settings,
-    config::{COLOR_MAPS, JITTER, RAYMARCHING_STEPS, SCALING_TYPES},
+    config::{COLOR_MAPS, GAMMA, JITTER, RAYMARCHING_STEPS, SCALING_TYPES},
     selection::{CropCommand, Hover},
 };
 
@@ -20,7 +20,7 @@ pub fn format_dims(d: [usize; 3]) -> String {
 }
 
 /// 1-based inclusive ranges, as iDaVIE displays them.
-pub fn format_region((min, max): Region) -> String {
+pub fn format_region(Region { min, max }: Region) -> String {
     format!(
         "x {}..{}, y {}..{}, z {}..{}",
         min[0] + 1,
@@ -114,23 +114,26 @@ pub fn cube_section(
         );
         row("Non-finite voxels", stats.non_finite.to_string());
         row("Load time", format!("{:.2} s", data.load_seconds));
-        let [fx, fy, fz] = state.factors;
-        let resolution = if state.factors == [1; 3] {
+        let texture = state.texture();
+        let [fx, fy, fz] = texture.factors;
+        let resolution = if texture.factors == [1; 3] {
             "full resolution".to_string()
         } else {
             format!("downsampled {fx} x {fy} x {fz}")
         };
-        let mb = state.texture_dims.iter().product::<usize>() as f64 * 4.0 / 1e6;
+        let mb = texture.dims.iter().product::<usize>() as f64 * 4.0 / 1e6;
         row(
             "Texture",
-            format!(
-                "{} ({mb:.0} MB), {resolution}",
-                format_dims(state.texture_dims)
-            ),
+            format!("{} ({mb:.0} MB), {resolution}", format_dims(texture.dims)),
         );
         row(
             "Showing",
-            state.crop.map_or("entire cube".to_string(), format_region),
+            state
+                .crop
+                .as_ref()
+                .map_or("entire cube".to_string(), |(region, _)| {
+                    format_region(*region)
+                }),
         );
         if let Some(selection) = state.selection {
             row("Selection", format_region(selection));
@@ -172,7 +175,7 @@ pub fn rendering_section(ui: &mut egui::Ui, data: &Dataset, settings: &mut ResMu
         .selected_text(COLOR_MAPS[p.color_map_index as usize])
         .show_ui(ui, |ui| {
             for (i, name) in COLOR_MAPS.iter().enumerate() {
-                ui.selectable_value(&mut p.color_map_index, i as f32, *name);
+                ui.selectable_value(&mut p.color_map_index, i as u32, *name);
             }
         });
     egui::ComboBox::from_label("Scaling")
@@ -182,7 +185,7 @@ pub fn rendering_section(ui: &mut egui::Ui, data: &Dataset, settings: &mut ResMu
                 ui.selectable_value(&mut p.scale_type, i as u32, *name);
             }
         });
-    if SCALING_TYPES[p.scale_type as usize] == "Gamma" {
+    if p.scale_type == GAMMA {
         ui.add(egui::Slider::new(&mut p.scale_gamma, 0.0..=5.0).text("Gamma"));
     }
     let value = |t: f32| p.scale_min + t * (p.scale_max - p.scale_min);
@@ -201,12 +204,7 @@ pub fn rendering_section(ui: &mut egui::Ui, data: &Dataset, settings: &mut ResMu
         ui.label("intensity projection");
     });
     ui.add(egui::Slider::new(&mut p.jitter, JITTER).text("Jitter"));
-    let steps = *RAYMARCHING_STEPS.start() as f32..=*RAYMARCHING_STEPS.end() as f32;
-    ui.add(
-        egui::Slider::new(&mut p.max_steps, steps)
-            .step_by(1.0)
-            .text("Ray-marching steps"),
-    );
+    ui.add(egui::Slider::new(&mut p.max_steps, RAYMARCHING_STEPS).text("Ray-marching steps"));
     if data.wcs.is_some() {
         ui.checkbox(&mut s.wcs_axes, "WCS axes");
     }

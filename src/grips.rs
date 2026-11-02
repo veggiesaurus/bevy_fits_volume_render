@@ -3,7 +3,11 @@
 use bevy::prelude::*;
 use bevy_egui::input::EguiWantsInput;
 
-use crate::{CubeState, Dataset, Region, UNITY_FROM_LOCAL, camera::Orbit, region_bounds};
+use crate::{
+    CubeState, Dataset, Region, UNITY_FROM_LOCAL,
+    camera::{Orbit, Pointer, pointer},
+    region_bounds,
+};
 
 /// A grip on the selection box, as -1 (low face), 0 (middle) or +1 (high face) per axis: one non-zero
 /// component is a face grip and three a corner grip.
@@ -85,19 +89,16 @@ pub fn drag_grips(
     if !buttons.pressed(MouseButton::Left) {
         grips.drag = None;
     }
-    let Some(cursor) = windows.single().ok().and_then(Window::cursor_position) else {
+    let Some(Pointer {
+        cursor,
+        origin,
+        direction,
+    }) = pointer(&windows, camera, camera_transform)
+    else {
         return;
     };
     let dims = data.cube.dims;
-    let screen = |p: Vec3| {
-        camera
-            .world_to_viewport(camera_transform, p * UNITY_FROM_LOCAL)
-            .ok()
-    };
-    let ray = camera
-        .viewport_to_world(camera_transform, cursor)
-        .ok()
-        .map(|r| (r.origin * UNITY_FROM_LOCAL, *r.direction * UNITY_FROM_LOCAL));
+    let screen = |p: Vec3| camera.world_to_viewport(camera_transform, p).ok();
     let forward = camera_transform.forward().as_vec3() * UNITY_FROM_LOCAL;
     let eye = camera_transform.translation() * UNITY_FROM_LOCAL;
 
@@ -108,24 +109,24 @@ pub fn drag_grips(
     }) = grips.drag
     {
         let anchor = grip_position(grip, region_bounds(start, dims));
-        let Some(hit) = ray.and_then(|(origin, dir)| grip_hit(grip, anchor, origin, dir, forward))
-        else {
+        let Some(hit) = grip_hit(grip, anchor, origin, direction, forward) else {
             return;
         };
         let target = anchor + hit - start_hit;
         let visible = state.visible(&data);
-        let (mut min, mut max) = start;
+        let Region { mut min, mut max } = start;
         for i in (0..3).filter(|&i| grip[i] != 0) {
             // Voxel boundary nearest the target: object coordinate o is boundary (o + 0.5) * dim.
             let boundary = ((target[i] + 0.5) * dims[i] as f32).round() as i64;
             if grip[i] > 0 {
-                max[i] = (boundary - 1).clamp(min[i] as i64, visible.1[i] as i64) as usize;
+                max[i] = (boundary - 1).clamp(min[i] as i64, visible.max[i] as i64) as usize;
             } else {
-                min[i] = boundary.clamp(visible.0[i] as i64, max[i] as i64) as usize;
+                min[i] = boundary.clamp(visible.min[i] as i64, max[i] as i64) as usize;
             }
         }
-        if state.selection != Some((min, max)) {
-            state.selection = Some((min, max));
+        let selection = Region { min, max };
+        if state.selection != Some(selection) {
+            state.selection = Some(selection);
         }
         return;
     }
@@ -136,11 +137,13 @@ pub fn drag_grips(
             grip_ids()
                 .filter_map(|g| {
                     let at = grip_position(g, bounds);
+                    let p = screen(at * UNITY_FROM_LOCAL)?;
                     // A face grip is its whole arrow; a corner grip is a point.
                     let distance = if is_face(g) {
-                        distance_to_segment(cursor, screen(at)?, screen(arrow_tip(g, at, eye))?)
+                        let tip = screen(arrow_tip(g, at, eye) * UNITY_FROM_LOCAL)?;
+                        cursor.distance(Segment2d::new(p, tip).closest_point(cursor))
                     } else {
-                        screen(at)?.distance(cursor)
+                        p.distance(cursor)
                     };
                     Some((g, distance))
                 })
@@ -151,8 +154,13 @@ pub fn drag_grips(
         .flatten();
     if buttons.just_pressed(MouseButton::Left)
         && let Some(grip) = grips.hovered
-        && let Some((origin, dir)) = ray
-        && let Some(start_hit) = grip_hit(grip, grip_position(grip, bounds), origin, dir, forward)
+        && let Some(start_hit) = grip_hit(
+            grip,
+            grip_position(grip, bounds),
+            origin,
+            direction,
+            forward,
+        )
     {
         grips.drag = Some(GripDrag {
             grip,
@@ -174,13 +182,11 @@ pub fn draw_grips(
     let (Some(selection), Ok((camera, transform))) = (state.selection, cameras.single()) else {
         return;
     };
-    let cursor = windows
-        .single()
-        .ok()
-        .and_then(Window::cursor_position)
-        .filter(|_| !egui.wants_pointer_input());
     // The local transform is already this frame's orbit; GlobalTransform may not be propagated yet.
     let view = GlobalTransform::from(*transform);
+    let cursor = pointer(&windows, camera, &view)
+        .map(|p| p.cursor)
+        .filter(|_| !egui.wants_pointer_input());
     let screen = |p: Vec3| camera.world_to_viewport(&view, p).ok();
     let bounds = region_bounds(selection, data.cube.dims);
     let active = grips.drag.map(|d| d.grip).or(grips.hovered);
@@ -199,7 +205,7 @@ pub fn draw_grips(
             let tip = arrow_tip(grip, at, eye) * UNITY_FROM_LOCAL;
             // Arrows stay faint until the pointer comes within about 20 pixels of them.
             let near = match (cursor, screen(p), screen(tip)) {
-                (Some(c), Some(a), Some(b)) => distance_to_segment(c, a, b),
+                (Some(c), Some(a), Some(b)) => c.distance(Segment2d::new(a, b).closest_point(c)),
                 _ => f32::MAX,
             };
             let alpha = if Some(grip) == active {
@@ -217,12 +223,6 @@ pub fn draw_grips(
             );
         }
     }
-}
-
-pub fn distance_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
-    let ab = b - a;
-    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-6)).clamp(0.0, 1.0);
-    p.distance(a + ab * t)
 }
 
 #[cfg(test)]
