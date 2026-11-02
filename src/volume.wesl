@@ -92,8 +92,9 @@ fn in_box(position: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> bool {
 // Point filtering with Repeat wrapping, which is what iDaVIE's `new Texture3D` gets by default.
 fn sample_cube(position: vec3<f32>) -> f32 {
     let size = vec3<i32>(textureDimensions(data_cube));
-    let texel = vec3<i32>(floor(position * vec3<f32>(size)));
-    return textureLoad(data_cube, ((texel % size) + size) % size, 0).r;
+    // fract can round up to 1.0 just below a whole number, hence the min.
+    let texel = min(vec3<i32>(fract(position) * vec3<f32>(size)), size - 1);
+    return textureLoad(data_cube, texel, 0).r;
 }
 
 struct Ray {
