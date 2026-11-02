@@ -308,25 +308,42 @@ impl Moments {
         max: f64::NEG_INFINITY,
     };
 
-    /// Two passes over a chunk that's still in cache: a single running sum of squares loses precision on
-    /// data with a large pedestal.
+    /// Two passes over a chunk that's still in cache, the mean and then the squared deviations from it, since
+    /// a running sum of squares loses precision on a large pedestal. Sixteen lanes, filled without branches,
+    /// let LLVM vectorise both passes, and they're combined in a fixed order so every run gives the same result.
     fn of(values: &[f32]) -> Self {
-        let finite = || values.iter().filter(|v| v.is_finite()).map(|&v| v as f64);
-        let (mut n, mut sum, mut min, mut max) = (0, 0.0, f64::INFINITY, f64::NEG_INFINITY);
-        for v in finite() {
-            n += 1;
-            sum += v;
-            min = min.min(v);
-            max = max.max(v);
+        const LANES: usize = 16;
+        let (blocks, rest) = values.as_chunks::<LANES>();
+        let tail: [f32; LANES] = std::array::from_fn(|i| rest.get(i).copied().unwrap_or(f32::NAN));
+        let blocks = || blocks.iter().chain([&tail]);
+        // A lane counts a sixteenth of the voxels, so u32 holds any slice that fits in memory.
+        let (mut n, mut sum) = ([0u32; LANES], [0f64; LANES]);
+        // In f32, which is exact, since comparisons never round.
+        let (mut min, mut max) = ([f32::INFINITY; LANES], [f32::NEG_INFINITY; LANES]);
+        for block in blocks() {
+            for i in 0..LANES {
+                let (v, finite) = (block[i], block[i].is_finite());
+                n[i] += finite as u32;
+                sum[i] += if finite { v as f64 } else { 0.0 };
+                min[i] = if finite { min[i].min(v) } else { min[i] };
+                max[i] = if finite { max[i].max(v) } else { max[i] };
+            }
         }
-        let mean = sum / n as f64;
-        let m2 = finite().map(|v| (v - mean) * (v - mean)).sum();
+        let n = n.iter().map(|&n| n as usize).sum::<usize>();
+        let mean = sum.iter().sum::<f64>() / n as f64;
+        let mut m2 = [0f64; LANES];
+        for block in blocks() {
+            for i in 0..LANES {
+                let d = block[i] as f64 - mean;
+                m2[i] += if block[i].is_finite() { d * d } else { 0.0 };
+            }
+        }
         Self {
             n,
             mean,
-            m2,
-            min,
-            max,
+            m2: m2.iter().sum(),
+            min: min.into_iter().fold(f32::INFINITY, f32::min) as f64,
+            max: max.into_iter().fold(f32::NEG_INFINITY, f32::max) as f64,
         }
     }
 
@@ -537,26 +554,37 @@ mod tests {
     }
 
     #[test]
-    fn merged_chunk_moments_match_the_whole() {
-        // A large pedestal is what the running sum of squares got wrong, and 500..515 holds an all-NaN chunk.
-        let data: Vec<f32> = (0..1000)
+    fn merged_chunk_moments_match_a_direct_calculation() {
+        // A large pedestal is what a running sum of squares gets wrong, and 500..515 holds an all-NaN chunk.
+        let pedestal: Vec<f32> = (0..1000)
             .map(|i| match i {
                 500..515 => f32::NAN,
                 _ if i % 97 == 0 => f32::INFINITY,
                 _ => 1e4 + (i % 5) as f32 * 0.25,
             })
             .collect();
-        let whole = Moments::of(&data);
-        let merged = data
-            .chunks(7)
-            .map(Moments::of)
-            .fold(Moments::EMPTY, Moments::merge);
-        assert_eq!(
-            (merged.n, merged.min, merged.max),
-            (whole.n, whole.min, whole.max)
-        );
-        assert!((merged.mean - whole.mean).abs() < 1e-9);
-        assert!((merged.m2 - whole.m2).abs() < 1e-9 * whole.m2);
+        // And a noise pixel far above everything else.
+        let mut noisy = pedestal.clone();
+        noisy[70] = 1e30;
+        for data in [pedestal, noisy] {
+            let finite: Vec<f64> = (data.iter().filter(|v| v.is_finite()))
+                .map(|&v| v as f64)
+                .collect();
+            let mean = finite.iter().sum::<f64>() / finite.len() as f64;
+            let m2: f64 = finite.iter().map(|v| (v - mean) * (v - mean)).sum();
+            let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs();
+            let merged = data
+                .chunks(7)
+                .map(Moments::of)
+                .fold(Moments::EMPTY, Moments::merge);
+            for m in [Moments::of(&data), merged] {
+                assert_eq!(m.n, finite.len());
+                assert!(
+                    close(m.mean, mean) && close(m.m2, m2),
+                    "{m:?} against {mean}, {m2}"
+                );
+            }
+        }
 
         let constant = [3.0f32; 10]
             .chunks(3)
