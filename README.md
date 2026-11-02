@@ -5,6 +5,8 @@
 
 A highly experimental proof of concept port of iDaVIE's volume renderer to Rust and Bevy 0.20. It loads a FITS cube, downsamples it to fit a GPU memory budget and renders it with a port of iDaVIE's ray-marching shader (`BasicVolume.cginc`), on the desktop or in a browser over WebGPU. There's no VR.
 
+I'm one of the original authors of [iDaVIE](https://github.com/idia-astro/iDaVIE), and this port has the iDaVIE team's blessing.
+
 ## Running
 
 ```
