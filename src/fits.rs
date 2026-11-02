@@ -118,15 +118,20 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
                     "HDU {index} is not an image with three non-empty axes"
                 ));
             }
-            let dims = [axes[0] as usize, axes[1] as usize, axes[2] as usize];
-            let (data, stats) = read_data(
-                source,
-                offset,
-                &cards,
-                bitpix,
-                width as usize,
-                dims.iter().product(),
-            )?;
+            let len = checked_product(&axes[..3])
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or(format!("HDU {index}: image too large"))?;
+            // Each axis is at most `len`, which fits.
+            let dims = [0, 1, 2].map(|i| axes[i] as usize);
+            // Checked before allocating, so a header can't claim more memory than its file backs.
+            if (len as u64)
+                .checked_mul(width)
+                .and_then(|bytes| bytes.checked_add(offset))
+                .is_none_or(|end| end > size)
+            {
+                return Err(format!("HDU {index}: data truncated"));
+            }
+            let (data, stats) = read_data(source, offset, &cards, bitpix, width as usize, len)?;
             return Ok(Cube {
                 dims,
                 data,
@@ -138,17 +143,28 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
 
         let pcount: u64 = num(&cards, "PCOUNT")?.unwrap_or(0);
         let gcount: u64 = num(&cards, "GCOUNT")?.unwrap_or(1);
-        let bytes = match &axes[..] {
-            [] => 0,
-            [_, rest @ ..] if groups => width * gcount * (pcount + rest.iter().product::<u64>()),
-            all => width * gcount * (pcount + all.iter().product::<u64>()),
+        // Checked, so a crafted size can't wrap the offset back to an earlier header and loop forever.
+        let padded_bytes = |values: &[u64]| {
+            (checked_product(values)?.checked_add(pcount)?)
+                .checked_mul(gcount)?
+                .checked_mul(width)?
+                .checked_next_multiple_of(BLOCK as u64)
         };
-        offset += bytes.div_ceil(BLOCK as u64) * BLOCK as u64;
-        if offset > size {
-            return Err(format!("HDU {index}: data truncated"));
-        }
+        let padded = match &axes[..] {
+            [] => Some(0),
+            [_, rest @ ..] if groups => padded_bytes(rest),
+            all => padded_bytes(all),
+        };
+        offset = padded
+            .and_then(|padded| offset.checked_add(padded))
+            .filter(|&end| end <= size)
+            .ok_or(format!("HDU {index}: data truncated"))?;
         index += 1;
     }
+}
+
+fn checked_product(values: &[u64]) -> Option<u64> {
+    values.iter().try_fold(1u64, |n, &v| n.checked_mul(v))
 }
 
 /// Reads the header starting at `offset` and moves it past the header. Returns None at a clean end of file.
@@ -575,6 +591,28 @@ mod tests {
         assert_eq!((cube.stats.min, cube.stats.max), (0.0, 999.0));
         assert!((cube.stats.mean - whole.mean).abs() < 1e-9);
         assert!((cube.stats.std - whole.std).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_headers_that_claim_more_than_the_file_holds() {
+        let cube = |n: u64| {
+            header(&[
+                "SIMPLE  =                    T",
+                "BITPIX  =                  -32",
+                "NAXIS   =                    3",
+                &format!("NAXIS1  = {n:>20}"),
+                &format!("NAXIS2  = {n:>20}"),
+                &format!("NAXIS3  = {:>20}", 100),
+            ])
+        };
+        // 400 MB claimed with no data behind it fails before anything is allocated.
+        let err = read_fits(&cube(1000)[..], None).err().unwrap();
+        assert!(err.contains("HDU 0: data truncated"), "{err}");
+        // A size that overflows in a skipped HDU stops there, rather than wrapping the offset around.
+        let mut file = cube(1 << 32);
+        file.extend(cube(1));
+        let err = read_fits(&file[..], Some(1)).err().unwrap();
+        assert!(err.contains("HDU 0: data truncated"), "{err}");
     }
 
     #[test]
