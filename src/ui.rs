@@ -48,7 +48,7 @@ pub fn ui(
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     egui::Window::new("iDaVIE volume renderer")
-        .default_width(340.0)
+        .default_width(420.0)
         .show(ctx, |ui| {
             let smoothed = |path: &DiagnosticPath| {
                 diagnostics
