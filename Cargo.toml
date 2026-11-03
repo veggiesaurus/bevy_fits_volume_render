@@ -34,7 +34,7 @@ wasm-bindgen = "0.2"
 # Bevy systems take their resources and queries as arguments, as Bevy's own crates allow.
 too_many_arguments = "allow"
 
-# Thin LTO for the web build and anything shipped; `--release` stays quick to rebuild while developing.
+# Thin LTO for a native build to ship; `--release` stays quick to rebuild, and build-web.sh uses it.
 [profile.dist]
 inherits = "release"
 lto = "thin"

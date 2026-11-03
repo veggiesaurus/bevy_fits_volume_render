@@ -8,31 +8,49 @@ on:
 permissions:
   contents: read
 
+# A cancelled build saves no cache, so finish the running one; a newer push replaces any queued run.
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
-    # build-web.sh takes its wasm32 clang and musl headers from Homebrew.
     runs-on: macos-latest
+    env:
+      # The image's Homebrew llvm@20, and Emscripten's musl headers fetched below, instead of installing both.
+      WASM_LLVM: /opt/homebrew/opt/llvm@20/bin
+      WASM_MUSL: ${{ github.workspace }}/emscripten/system/lib/libc/musl
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: emscripten-core/emscripten
+          ref: e13ee988ce3d87a738dd8f3661d02223308c412a # 6.0.13
+          path: emscripten
+          sparse-checkout: |
+            system/lib/libc/musl/include
+            system/lib/libc/musl/arch/emscripten
+            system/lib/libc/musl/arch/generic
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # build-web.sh's C toolchain isn't otherwise in the key, and an exact hit never saves again.
+          env-vars: WASM_LLVM WASM_MUSL
       - name: Find the wasm-bindgen version in Cargo.lock
         run: echo "WASM_BINDGEN=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')" >> "$GITHUB_ENV"
       - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: wasm-bindgen@${{ env.WASM_BINDGEN }}
-      - name: Install llvm, emscripten and binaryen
-        run: brew install llvm emscripten binaryen
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: 1
-          HOMEBREW_NO_INSTALL_CLEANUP: 1
+      - name: Install binaryen
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fsSLO https://github.com/WebAssembly/binaryen/releases/download/version_133/binaryen-version_133-arm64-macos.tar.gz
+          echo "ad66da82ac13f163e424b1643f16c6dfcccc98b5966296b43e52d3cab04f84a8  binaryen-version_133-arm64-macos.tar.gz" | shasum -a 256 -c
+          tar xzf binaryen-version_133-arm64-macos.tar.gz
+          echo "$PWD/binaryen-version_133/bin" >> "$GITHUB_PATH"
       - run: ./build-web.sh
       - uses: actions/upload-pages-artifact@v4
         with:
