@@ -16,7 +16,7 @@ cargo run --release -- --help
 
 `--config PATH` picks a config file, `--hdu N` picks an HDU (0 is the primary; by default it takes the first image with two or more axes) and any config key can be overridden as `--key value`, e.g. `--gpu-memory-limit-mb 128 --default-color-map Viridis`.
 
-The config lives at `$XDG_CONFIG_HOME/idavie-bevy/config.toml` (`~/.config/idavie-bevy/config.toml` when that's unset) and is written with the defaults on first run. The keys are the rendering subset of iDaVIE's `config.json`, with the same defaults, plus `jitter`, which iDaVIE sets on the material:
+The config lives at `$XDG_CONFIG_HOME/idavie-bevy/config.toml` (`~/.config/idavie-bevy/config.toml` when that's unset) and is written with the defaults on first run. The keys are the rendering subset of iDaVIE's `config.json`, with the same defaults, plus `jitter`, which iDaVIE sets on the material, and the starting thresholds, which iDaVIE always starts at 0 and 1:
 
 ```toml
 gpu_memory_limit_mb = 384       # texture budget; the cube is downsampled to fit, as in iDaVIE
@@ -25,6 +25,8 @@ max_raymarching_steps = 384
 default_color_map = "Inferno"   # any name from iDaVIE's ColorMapEnum
 default_scaling_type = "Linear" # Linear, Log, Sqrt, Square, Power or Gamma
 jitter = 1.0
+threshold_min = 0.0             # where the colour map starts and ends, as fractions of the data range
+threshold_max = 1.0
 ```
 
 The view only redraws on input (and while a crop is being built), so an idle window leaves the GPU alone. Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping reloads that region from the full resolution data in the background and keeps the selection, the same as iDaVIE, and the panel shows the downsampling factors before and after.

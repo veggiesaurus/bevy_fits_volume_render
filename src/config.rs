@@ -15,6 +15,8 @@ pub struct Config {
     pub default_color_map: ColorMap,
     pub default_scaling_type: Scaling,
     pub jitter: f32,
+    pub threshold_min: f32,
+    pub threshold_max: f32,
 }
 
 impl Default for Config {
@@ -26,6 +28,8 @@ impl Default for Config {
             default_color_map: ColorMap::try_from("Inferno".to_string()).unwrap(),
             default_scaling_type: Scaling::try_from("Linear".to_string()).unwrap(),
             jitter: 1.0,
+            threshold_min: 0.0,
+            threshold_max: 1.0,
         }
     }
 }
@@ -117,6 +121,12 @@ pub fn from_toml(text: Option<&str>, overrides: &[(String, String)]) -> Result<C
         return Err(format!(
             "jitter must be in {JITTER:?}, got {}",
             config.jitter
+        ));
+    }
+    let (min, max) = (config.threshold_min, config.threshold_max);
+    if !(0.0 <= min && min <= max && max <= 1.0) {
+        return Err(format!(
+            "threshold_min and threshold_max must satisfy 0 <= min <= max <= 1, got {min} and {max}"
         ));
     }
     if config.gpu_memory_limit_mb == 0 {

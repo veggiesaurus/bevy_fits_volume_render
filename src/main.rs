@@ -149,6 +149,8 @@ impl Settings {
                 scale_min: data.cube.stats.min,
                 scale_max: data.cube.stats.max,
                 jitter: config.jitter,
+                threshold_min: config.threshold_min,
+                threshold_max: config.threshold_max,
                 max_steps: config.max_raymarching_steps,
                 color_map_index: config.default_color_map.0,
                 scale_type: config.default_scaling_type.0,
