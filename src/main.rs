@@ -1,10 +1,10 @@
 mod axes;
 mod camera;
 mod config;
-mod fits;
 mod grips;
 mod outline;
 mod selection;
+mod source;
 mod ui;
 mod upload;
 mod volume;
@@ -12,7 +12,7 @@ mod wcs;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use bevy::{
     diagnostic::FrameTimeDiagnosticsPlugin,
@@ -27,11 +27,14 @@ use bevy::{
 };
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
+use fits_core as fits;
+
 use axes::AxisAnnotation;
 use camera::Orbit;
 use config::Config;
-use fits::{Cube, Region};
+use fits::{Cube, FileInfo, Region};
 use selection::{CropRequest, Gesture, Hover, PendingCrop};
+use source::{DataSource, Event, Request};
 use upload::{UploadPlugin, Uploads};
 use volume::{VolumeMaterial, VolumeParams, VolumePlugin};
 
@@ -49,33 +52,11 @@ struct VolumeTexture {
     factors: [usize; 3],
 }
 
-/// A VolumeTexture's bytes, built off the main thread and then uploaded a slab at a time.
-struct TextureBytes {
-    region: Region,
-    bytes: Vec<u8>,
-    dims: [usize; 3],
-    factors: [usize; 3],
-}
-
-impl TextureBytes {
-    /// The texture is empty until `uploads` has filled it.
-    fn upload(self, images: &mut Assets<Image>, uploads: &mut Uploads) -> VolumeTexture {
-        let handle = images.add(volume::empty_cube_image(self.dims));
-        uploads.push(handle.id(), self.dims, self.bytes);
-        VolumeTexture {
-            region: self.region,
-            handle,
-            dims: self.dims,
-            factors: self.factors,
-        }
-    }
-}
-
 #[derive(Resource)]
 struct Dataset {
     name: String,
-    // Shared with crops being built in the background.
-    cube: Arc<Cube>,
+    info: FileInfo,
+    source: DataSource,
     config: Config,
     wcs: Option<wcs::Wcs>,
     load_seconds: f32,
@@ -83,24 +64,52 @@ struct Dataset {
 
 impl Dataset {
     fn new(name: String, cube: Cube, config: Config, start: Instant) -> Self {
-        let wcs = wcs::Wcs::from_cards(&cube.cards, cube.axes);
+        let Cube { info, data } = cube;
         Self {
             name,
-            cube: Arc::new(cube),
+            wcs: wcs::Wcs::from_cards(&info.cards, info.axes),
+            source: DataSource::local(data, info.dims),
+            info,
             config,
-            wcs,
             load_seconds: start.elapsed().as_secs_f32(),
+        }
+    }
+
+    /// A region of the cube downsampled to fit the configured GPU budget. The texture is empty until the source
+    /// has sent its voxels and `uploads` has filled it.
+    fn texture(
+        &self,
+        region: Region,
+        images: &mut Assets<Image>,
+        uploads: &mut Uploads,
+    ) -> VolumeTexture {
+        let factors =
+            fits::find_downsample_factors(self.config.gpu_memory_limit_mb, region.extent());
+        let dims = fits::downsampled_dims(region, factors);
+        let handle = images.add(volume::empty_cube_image(dims));
+        uploads.expect(handle.id(), dims);
+        self.source.send(Request::Texture {
+            image: handle.id(),
+            region,
+            factors,
+            max_mode: self.config.max_mode_downsampling,
+        });
+        VolumeTexture {
+            region,
+            handle,
+            dims,
+            factors,
         }
     }
 
     /// What was loaded, for the terminal or the browser console.
     fn summary(&self) -> String {
-        let s = self.cube.stats;
+        let s = self.info.stats;
         let mut summary = format!(
             "Loaded {} (HDU {}): {} in {:.2} s\nRange {} .. {}, mean {:.4e}, std {:.4e}, {} non-finite voxels",
             self.name,
-            self.cube.hdu,
-            ui::format_dims(self.cube.dims),
+            self.info.hdu,
+            ui::format_dims(self.info.dims),
             self.load_seconds,
             s.min,
             s.max,
@@ -108,7 +117,7 @@ impl Dataset {
             s.std,
             s.non_finite
         );
-        if let Some(planes) = self.cube.other_planes() {
+        if let Some(planes) = self.info.other_planes() {
             summary.push_str(&format!("\nWarning: showing plane {planes}"));
         }
         summary
@@ -146,8 +155,8 @@ impl Settings {
         let config = &data.config;
         Self {
             params: VolumeParams {
-                scale_min: data.cube.stats.min,
-                scale_max: data.cube.stats.max,
+                scale_min: data.info.stats.min,
+                scale_max: data.info.stats.max,
                 jitter: config.jitter,
                 threshold_min: config.threshold_min,
                 threshold_max: config.threshold_max,
@@ -204,6 +213,7 @@ fn main() {
     .init_resource::<PendingCrop>()
     .add_message::<CropRequest>()
     .add_systems(Startup, camera::spawn_camera)
+    .add_systems(PreUpdate, receive.run_if(resource_exists::<Dataset>))
     .add_systems(
         Update,
         (
@@ -240,7 +250,8 @@ fn main() {
         )
             .chain(),
     )
-    .add_systems(Update, keep_redrawing)
+    // Last, so that it sees the requests this frame's systems sent.
+    .add_systems(Last, keep_redrawing)
     .add_systems(
         EguiPrimaryContextPass,
         (
@@ -270,9 +281,20 @@ fn main() {
     app.run();
 }
 
-/// Frames otherwise only come with input, so keep asking for them while something is still settling: a crop
-/// being built, or a new texture still on its way to the screen.
+/// Takes what the data source has sent since the last frame.
+fn receive(data: Res<Dataset>, mut uploads: ResMut<Uploads>, mut hover: ResMut<Hover>) {
+    for event in data.source.drain() {
+        match event {
+            Event::Texture { image, data } => uploads.fill(image, data),
+            Event::PixelValue { id, value } => hover.receive(id, value),
+        }
+    }
+}
+
+/// Frames otherwise only come with input, so keep asking for them while something is still settling: a request
+/// to the data source, a crop on its way, or a new texture still on its way to the screen.
 fn keep_redrawing(
+    data: Option<Res<Dataset>>,
     pending: Res<PendingCrop>,
     uploads: Res<Uploads>,
     state: Option<Res<CubeState>>,
@@ -282,7 +304,8 @@ fn keep_redrawing(
     if state.is_some_and(|state| state.is_changed()) {
         *settle_until = Some(Instant::now() + Duration::from_secs(1));
     }
-    if pending.0.is_some()
+    if data.is_some_and(|data| data.source.busy())
+        || pending.0.is_some()
         || !uploads.is_empty()
         || settle_until.is_some_and(|until| Instant::now() < until)
     {
@@ -292,9 +315,15 @@ fn keep_redrawing(
 
 /// `SCREENSHOT=out.png` saves the window once rendering has settled, then exits.
 #[cfg(not(target_arch = "wasm32"))]
-fn screenshot_and_exit(path: String) -> impl FnMut(Commands, Local<u32>, MessageWriter<AppExit>) {
+fn screenshot_and_exit(
+    path: String,
+) -> impl FnMut(Commands, Res<Uploads>, Local<u32>, MessageWriter<AppExit>) {
     use bevy::render::view::screenshot::{Screenshot, save_to_disk};
-    move |mut commands, mut frames, mut exit| {
+    move |mut commands, uploads, mut frames, mut exit| {
+        // Frames count from when the textures are in, however long the source took to build them.
+        if !uploads.is_empty() {
+            return;
+        }
         *frames += 1;
         if *frames == 60 {
             commands
@@ -352,25 +381,6 @@ fn load_native() -> Dataset {
     dataset
 }
 
-/// Texture for a region of the cube, downsampled to fit the configured GPU budget.
-fn region_bytes(cube: &Cube, config: &Config, region: Region) -> TextureBytes {
-    let start = Instant::now();
-    let factors = fits::find_downsample_factors(config.gpu_memory_limit_mb, region.extent());
-    let (dims, bytes) =
-        fits::crop_and_downsample(cube, region, factors, config.max_mode_downsampling);
-    let texture = TextureBytes {
-        region,
-        bytes,
-        dims,
-        factors,
-    };
-    info!(
-        "Texture {dims:?} for {region:?}, downsampled by {factors:?}, in {:.2} s",
-        start.elapsed().as_secs_f32()
-    );
-    texture
-}
-
 /// Object-space box of a voxel region, as iDaVIE's CropToRegion and highlight bounds compute it.
 fn region_bounds(region: Region, dims: [usize; 3]) -> (Vec3, Vec3) {
     let dims = Vec3::from_array(dims.map(|d| d as f32));
@@ -393,8 +403,7 @@ fn spawn_volume(
     for entity in &old {
         commands.entity(entity).despawn();
     }
-    let full = region_bytes(&data.cube, &data.config, Region::whole(data.cube.dims))
-        .upload(&mut images, &mut uploads);
+    let full = data.texture(Region::whole(data.info.dims), &mut images, &mut uploads);
 
     let settings = Settings::new(&data);
     let material = materials.add(VolumeMaterial {
@@ -414,6 +423,7 @@ fn spawn_volume(
     commands.insert_resource(settings);
     commands.insert_resource(Gesture::default());
     commands.insert_resource(PendingCrop::default());
+    commands.insert_resource(Hover::default());
     commands.insert_resource(CubeState {
         material,
         full,
@@ -433,9 +443,9 @@ fn update_material(
         return;
     };
     let mut params = settings.params;
-    (params.slice_min, params.slice_max) = region_bounds(state.visible(), data.cube.dims);
+    (params.slice_min, params.slice_max) = region_bounds(state.visible(), data.info.dims);
     if let Some(selection) = state.selection {
-        (params.highlight_min, params.highlight_max) = region_bounds(selection, data.cube.dims);
+        (params.highlight_min, params.highlight_max) = region_bounds(selection, data.info.dims);
         params.highlight_saturate_factor = SELECTION_SATURATE_FACTOR;
     }
     material.params = params;
@@ -447,9 +457,12 @@ fn show_volume(
     uploads: Res<Uploads>,
     mut volume: Query<&mut Visibility, With<MeshMaterial3d<VolumeMaterial>>>,
 ) {
-    if !uploads.is_filling(state.full.handle.id()) {
-        for mut visibility in &mut volume {
-            visibility.set_if_neq(Visibility::Inherited);
-        }
+    let shown = if uploads.is_filling(state.texture().handle.id()) {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    for mut visibility in &mut volume {
+        visibility.set_if_neq(shown);
     }
 }

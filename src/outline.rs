@@ -183,7 +183,7 @@ pub fn update_outlines(
     >,
 ) {
     for mut transform in &mut visible_outline {
-        *transform = box_transform(state.visible(), data.cube.dims);
+        *transform = box_transform(state.visible(), data.info.dims);
     }
     let Ok((mut transform, mut visibility, mut material, mut outline)) =
         selection_outline.single_mut()
@@ -194,7 +194,7 @@ pub fn update_outlines(
         *visibility = Visibility::Hidden;
         return;
     };
-    *transform = box_transform(selection, data.cube.dims);
+    *transform = box_transform(selection, data.info.dims);
     // iDaVIE colours the region white, with tinted axes, when cropping to it would load at full resolution, and
     // yellow otherwise.
     let full_res =

@@ -1,0 +1,9 @@
+[package]
+name = "fits-core"
+version = "0.1.0"
+edition = "2024"
+
+# Bevy-free so the server and the browser's worker can share it: only Bevy's task pools.
+[dependencies]
+bytemuck = "1"
+bevy_tasks = { version = "0.20", features = ["multi_threaded"] }

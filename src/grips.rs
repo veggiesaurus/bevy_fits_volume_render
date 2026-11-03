@@ -105,7 +105,7 @@ pub fn drag_grips(
     let Some(Pointer { cursor, ray }) = pointer(&window, camera, camera_transform) else {
         return;
     };
-    let dims = data.cube.dims;
+    let dims = data.info.dims;
     let screen = |p: Vec3| camera.world_to_viewport(camera_transform, p).ok();
     let forward = camera_transform.forward().as_vec3() * UNITY_FROM_LOCAL;
     let eye = camera_transform.translation() * UNITY_FROM_LOCAL;
@@ -186,7 +186,7 @@ pub fn draw_grips(
         .map(|p| p.cursor)
         .filter(|_| !egui.wants_pointer_input());
     let screen = |p: Vec3| camera.world_to_viewport(&view, p).ok();
-    let bounds = region_bounds(selection, data.cube.dims);
+    let bounds = region_bounds(selection, data.info.dims);
     let active = match *gesture {
         Gesture::Grip(drag) => Some(drag.grip),
         _ => grips.hovered,

@@ -3,38 +3,49 @@
 use bevy::prelude::*;
 use bevy_egui::input::EguiWantsInput;
 
-use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future::poll_once};
-
 use crate::{
-    CubeState, Dataset, TextureBytes, UNITY_FROM_LOCAL, VolumeTexture,
+    CubeState, Dataset, UNITY_FROM_LOCAL, VolumeTexture,
     camera::{DEFAULT_DISTANCE, Orbit, pointer},
     fits::Region,
     grips::GripDrag,
     outline::box_transform,
-    region_bounds, region_bytes,
+    region_bounds,
+    source::{DataSource, Request},
     upload::Uploads,
 };
 
+/// The voxel under the cursor, and its value once the data source has sent it.
 #[derive(Resource, Default)]
-pub struct Hover(pub Option<[usize; 3]>);
-
-/// A crop on its way: its texture built in the background, then uploaded over a few frames.
-#[derive(Resource, Default)]
-pub struct PendingCrop(pub Option<CropStage>);
-
-pub enum CropStage {
-    Building(Region, Task<TextureBytes>),
-    Uploading(VolumeTexture),
+pub struct Hover {
+    pub voxel: Option<[usize; 3]>,
+    /// The latest value sent back, and the voxel it's for.
+    pub value: Option<([usize; 3], f32)>,
+    asked: Option<(u32, [usize; 3])>,
 }
 
-impl CropStage {
-    fn region(&self) -> Region {
-        match self {
-            CropStage::Building(region, _) => *region,
-            CropStage::Uploading(texture) => texture.region,
+impl Hover {
+    fn ask(&mut self, source: &DataSource, voxel: [usize; 3]) {
+        if self.asked.is_some_and(|(_, asked)| asked == voxel) {
+            return;
+        }
+        let id = self.asked.map_or(0, |(id, _)| id.wrapping_add(1));
+        source.send(Request::PixelValue { id, voxel });
+        self.asked = Some((id, voxel));
+    }
+
+    /// A value for a voxel the cursor has since left is dropped.
+    pub fn receive(&mut self, id: u32, value: f32) {
+        if let Some((asked, voxel)) = self.asked
+            && asked == id
+        {
+            self.value = Some((voxel, value));
         }
     }
 }
+
+/// A crop on its way: its texture built in the background, then uploaded over a few frames.
+#[derive(Resource, Default)]
+pub struct PendingCrop(pub Option<VolumeTexture>);
 
 #[derive(Message)]
 pub enum CropRequest {
@@ -89,7 +100,7 @@ pub fn select_region(
     mut gesture: ResMut<Gesture>,
 ) {
     let (camera, camera_transform) = *camera;
-    let dims = data.cube.dims;
+    let dims = data.info.dims;
     let visible = state.visible();
     let axis = match *gesture {
         Gesture::Select(drag) => drag.axis,
@@ -115,9 +126,12 @@ pub fn select_region(
     let inside = |v: &[i64; 3]| {
         (0..3).all(|i| v[i] >= visible.min[i] as i64 && v[i] <= visible.max[i] as i64)
     };
-    hover.0 = voxel
+    hover.voxel = voxel
         .filter(|v| inside(v) && !egui.wants_pointer_input())
         .map(|v| clamp_to(v, visible));
+    if let Some(v) = hover.voxel {
+        hover.ask(&data.source, v);
+    }
 
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     if shift
@@ -189,36 +203,30 @@ pub fn apply_crop(
                     continue;
                 };
                 let shown = state.crop.as_ref().map(|crop| crop.region);
-                let on_its_way = pending.0.as_ref().map(CropStage::region);
+                let on_its_way = pending.0.as_ref().map(|crop| crop.region);
                 if shown == Some(region) || on_its_way == Some(region) {
                     continue;
                 }
-                let (cube, config) = (data.cube.clone(), data.config.clone());
-                let task = AsyncComputeTaskPool::get()
-                    .spawn(async move { region_bytes(&cube, &config, region) });
-                pending.0 = Some(CropStage::Building(region, task));
+                let crop = data.texture(region, &mut images, &mut uploads);
+                if let Some(superseded) = pending.0.replace(crop) {
+                    data.source.cancel(superseded.handle.id());
+                }
             }
             CropRequest::Reset => {
-                pending.0 = None;
+                if let Some(superseded) = pending.0.take() {
+                    data.source.cancel(superseded.handle.id());
+                }
                 state.crop = None;
                 framed = true;
             }
         }
     }
-    pending.0 = match pending.0.take() {
-        Some(CropStage::Building(region, mut task)) => Some(match block_on(poll_once(&mut task)) {
-            Some(bytes) => CropStage::Uploading(bytes.upload(&mut images, &mut uploads)),
-            None => CropStage::Building(region, task),
-        }),
-        Some(CropStage::Uploading(texture)) if !uploads.is_filling(texture.handle.id()) => {
-            state.crop = Some(texture);
-            framed = true;
-            None
-        }
-        pending => pending,
-    };
+    if (pending.0.as_ref()).is_some_and(|crop| !uploads.is_filling(crop.handle.id())) {
+        state.crop = pending.0.take();
+        framed = true;
+    }
     if framed {
-        let visible = box_transform(state.visible(), data.cube.dims);
+        let visible = box_transform(state.visible(), data.info.dims);
         orbit.target = visible.translation;
         orbit.distance = DEFAULT_DISTANCE * visible.scale.max_element();
     }

@@ -27,7 +27,8 @@ const SLAB_BYTES: usize = 32 << 20;
 struct Upload {
     image: AssetId<Image>,
     dims: [usize; 3],
-    bytes: Arc<Vec<u8>>,
+    /// None until the data source has sent them.
+    voxels: Option<Arc<Vec<f32>>>,
     planes_written: Arc<AtomicUsize>,
 }
 
@@ -37,19 +38,28 @@ impl Upload {
     }
 }
 
-/// R32Float textures created empty and still being filled, oldest first.
+/// R32Float textures created empty and still to be filled, oldest first.
 #[derive(Resource, Clone, Default, ExtractResource)]
 #[extract_app(RenderApp)]
 pub struct Uploads(Vec<Upload>);
 
 impl Uploads {
-    pub fn push(&mut self, image: AssetId<Image>, dims: [usize; 3], bytes: Vec<u8>) {
+    /// `image` counts as filling from now, though its voxels come later through `fill`.
+    pub fn expect(&mut self, image: AssetId<Image>, dims: [usize; 3]) {
         self.0.push(Upload {
             image,
             dims,
-            bytes: Arc::new(bytes),
+            voxels: None,
             planes_written: Arc::default(),
         });
+    }
+
+    /// Dropped if the image went before its voxels arrived.
+    pub fn fill(&mut self, image: AssetId<Image>, voxels: Vec<f32>) {
+        if let Some(upload) = self.0.iter_mut().find(|upload| upload.image == image) {
+            debug_assert_eq!(voxels.len(), upload.dims.iter().product::<usize>());
+            upload.voxels = Some(Arc::new(voxels));
+        }
     }
 
     pub fn is_filling(&self, image: AssetId<Image>) -> bool {
@@ -88,7 +98,7 @@ fn write_slabs(
 ) {
     let mut budget = SLAB_BYTES;
     for upload in &uploads.0 {
-        let Some(gpu_image) = gpu_images.get(upload.image) else {
+        let (Some(gpu_image), Some(voxels)) = (gpu_images.get(upload.image), &upload.voxels) else {
             continue;
         };
         let [width, height, depth] = upload.dims;
@@ -109,7 +119,7 @@ fn write_slabs(
                 },
                 aspect: TextureAspect::All,
             },
-            &upload.bytes[start * plane..end * plane],
+            &bytemuck::cast_slice(voxels)[start * plane..end * plane],
             TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(width as u32 * 4),

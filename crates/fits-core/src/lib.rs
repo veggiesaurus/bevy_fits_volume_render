@@ -2,8 +2,8 @@ use std::io::{self, ErrorKind};
 use std::str::FromStr;
 
 #[cfg(not(target_arch = "wasm32"))]
-use bevy::tasks::ParallelSlice;
-use bevy::tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool};
+use bevy_tasks::ParallelSlice;
+use bevy_tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool};
 
 const BLOCK: usize = 2880;
 /// Voxels read, decoded and summarised per task: 4 MB of output, small enough to stay in cache.
@@ -84,21 +84,23 @@ impl Region {
 }
 
 pub struct Cube {
+    pub info: FileInfo,
+    pub data: Vec<f32>,
+}
+
+/// Everything about a cube but its voxels, which is what a viewer is sent when it opens one.
+#[derive(Clone, Debug)]
+pub struct FileInfo {
     pub dims: [usize; 3],
     /// The FITS axes (0-based) shown as x, y and z. One past NAXIS pads a 2D image.
     pub axes: [usize; 3],
-    pub data: Vec<f32>,
     pub cards: Vec<String>,
     pub hdu: usize,
     pub stats: Stats,
     pub histogram: Histogram,
 }
 
-impl Cube {
-    pub fn value_at(&self, voxel: [usize; 3]) -> f32 {
-        self.data[voxel[0] + self.dims[0] * (voxel[1] + self.dims[1] * voxel[2])]
-    }
-
+impl FileInfo {
     /// The data unit from BUNIT, e.g. "Jy/beam" (or CASA's "beam-1 Jy").
     pub fn unit(&self) -> Option<String> {
         Some(value(&self.cards, "BUNIT")?.trim_start().to_string()).filter(|u| !u.is_empty())
@@ -205,13 +207,15 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
             let (data, stats, histogram) =
                 read_data(source, offset, &cards, bitpix, width as usize, len)?;
             return Ok(Cube {
-                dims,
-                axes: picked,
+                info: FileInfo {
+                    dims,
+                    axes: picked,
+                    cards,
+                    hdu: index,
+                    stats,
+                    histogram,
+                },
                 data,
-                cards,
-                hdu: index,
-                stats,
-                histogram,
             });
         }
 
@@ -405,7 +409,7 @@ fn read_data<S: Source + ?Sized>(
     };
     // A pool of its own with a thread per core, since Bevy's compute pool only gets some of them.
     #[cfg(not(target_arch = "wasm32"))]
-    let pool = bevy::tasks::TaskPoolBuilder::new()
+    let pool = bevy_tasks::TaskPoolBuilder::new()
         .num_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
         .build();
     #[cfg(not(target_arch = "wasm32"))]
@@ -480,6 +484,9 @@ fn count(values: &[f32], min: f32, max: f32, bins: usize) -> Vec<u64> {
         .map(|b| tables.iter().map(|t| u64::from(t[b])).sum())
         .collect()
 }
+
+/// CARTA's clip presets, for `Histogram::clip`.
+pub const PERCENTILES: [f64; 8] = [90.0, 95.0, 99.0, 99.5, 99.9, 99.95, 99.99, 100.0];
 
 /// Cumulative counts of the finite voxels in equal bins from `Stats::min` to `Stats::max`.
 #[derive(Clone, Debug)]
@@ -620,33 +627,39 @@ pub fn find_downsample_factors(gpu_memory_limit_mb: u64, extent: [usize; 3]) -> 
     [fx as usize, fy as usize, fz as usize]
 }
 
-/// Each block of `factors` becomes its maximum or mean, ignoring NaN, and NaN when it's all NaN. Returns
-/// (new_dims, bytes): the R32Float texture data, x fastest.
+/// The dims of `region` downsampled by `factors`, where a block cut short at the far edge still counts.
+pub fn downsampled_dims(region: Region, factors: [usize; 3]) -> [usize; 3] {
+    let extent = region.extent();
+    std::array::from_fn(|i| extent[i].div_ceil(factors[i]))
+}
+
+/// Each block of `factors` in `data`, a cube of `dims`, becomes its maximum or mean, ignoring NaN, and NaN when
+/// it's all NaN. Returns the new dims and the R32Float texture data, x fastest.
 pub fn crop_and_downsample(
-    cube: &Cube,
+    data: &[f32],
+    dims: [usize; 3],
     region: Region,
     factors: [usize; 3],
     max_mode: bool,
-) -> ([usize; 3], Vec<u8>) {
+) -> ([usize; 3], Vec<f32>) {
     let Region { min, max } = region;
     assert!(
-        (0..3).all(|i| min[i] <= max[i] && max[i] < cube.dims[i] && factors[i] > 0),
+        (0..3).all(|i| min[i] <= max[i] && max[i] < dims[i] && factors[i] > 0),
         "invalid crop or factors"
     );
-    let extent = region.extent();
-    let dims: [usize; 3] = std::array::from_fn(|i| extent[i].div_ceil(factors[i]));
+    let out_dims = downsampled_dims(region, factors);
     let block = |i: usize, o: usize| {
         min[i] + o * factors[i]..(min[i] + (o + 1) * factors[i]).min(max[i] + 1)
     };
-    let [width, height, _] = cube.dims;
-    let row = |z: usize, y: usize| &cube.data[(z * height + y) * width..][min[0]..=max[0]];
+    let [width, height, _] = dims;
+    let row = |z: usize, y: usize| &data[(z * height + y) * width..][min[0]..=max[0]];
     // One output plane per task, as iDaVIE splits over z, built a row of blocks at a time. On wasm the pool
     // runs them in turn.
-    let fill_plane = |oz: usize, plane: &mut [u8]| {
-        let (mut acc, mut count) = (vec![0f32; dims[0]], vec![0u32; dims[0]]);
-        for (oy, out) in plane.chunks_mut(dims[0] * 4).enumerate() {
+    let fill_plane = |oz: usize, plane: &mut [f32]| {
+        let (mut acc, mut count) = (vec![0f32; out_dims[0]], vec![0u32; out_dims[0]]);
+        for (oy, out) in plane.chunks_mut(out_dims[0]).enumerate() {
             if factors == [1; 3] {
-                out.copy_from_slice(bytemuck::cast_slice(row(min[2] + oz, min[1] + oy)));
+                out.copy_from_slice(row(min[2] + oz, min[1] + oy));
                 continue;
             }
             // f32::max ignores a NaN operand, so starting from NaN leaves an all-NaN block NaN.
@@ -674,21 +687,36 @@ pub fn crop_and_downsample(
                     *a = if n == 0 { f32::NAN } else { *a / n as f32 };
                 }
             }
-            out.copy_from_slice(bytemuck::cast_slice(&acc));
+            out.copy_from_slice(&acc);
         }
     };
-    let mut out = vec![0u8; dims.iter().product::<usize>() * 4];
+    let mut out = vec![0f32; out_dims.iter().product::<usize>()];
     out.par_chunk_map_mut(
         ComputeTaskPool::get_or_init(TaskPool::default),
-        dims[0] * dims[1] * 4,
+        out_dims[0] * out_dims[1],
         fill_plane,
     );
-    (dims, out)
+    (out_dims, out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cube of `data` with no header and no statistics.
+    fn cube(dims: [usize; 3], data: Vec<f32>) -> Cube {
+        Cube {
+            info: FileInfo {
+                dims,
+                axes: [0, 1, 2],
+                cards: vec![],
+                hdu: 0,
+                stats: Moments::EMPTY.stats(0),
+                histogram: Histogram(vec![0]),
+            },
+            data,
+        }
+    }
 
     fn pad(mut bytes: Vec<u8>, fill: u8) -> Vec<u8> {
         bytes.resize(bytes.len().div_ceil(BLOCK) * BLOCK, fill);
@@ -738,7 +766,10 @@ mod tests {
             file.extend(pad(bytes, 0));
 
             let cube = read_fits(&file[..], None).unwrap();
-            assert_eq!((cube.hdu, cube.dims, cube.data.len()), (1, [3, 2, 2], 12));
+            assert_eq!(
+                (cube.info.hdu, cube.info.dims, cube.data.len()),
+                (1, [3, 2, 2], 12)
+            );
             for (i, v) in cube.data.iter().enumerate() {
                 if i == 5 {
                     assert!(v.is_nan())
@@ -746,15 +777,16 @@ mod tests {
                     assert_eq!(*v, 10.0 + 0.5 * i as f32)
                 }
             }
-            assert_eq!(cube.cards.len(), image.len());
-            assert_eq!(cube.cards[0], format!("{:<80}", image[0]));
-            assert_eq!(cube.unit().as_deref(), Some("Jy/beam"));
+            let info = &cube.info;
+            assert_eq!(info.cards.len(), image.len());
+            assert_eq!(info.cards[0], format!("{:<80}", image[0]));
+            assert_eq!(info.unit().as_deref(), Some("Jy/beam"));
             assert_eq!(
-                (cube.stats.min, cube.stats.max, cube.stats.non_finite),
+                (info.stats.min, info.stats.max, info.stats.non_finite),
                 (10.0, 15.5, 1)
             );
             assert!(read_fits(&file[..], Some(0)).is_err());
-            assert_eq!(read_fits(&file[..], Some(1)).unwrap().dims, [3, 2, 2]);
+            assert_eq!(read_fits(&file[..], Some(1)).unwrap().info.dims, [3, 2, 2]);
         }
     }
 
@@ -767,29 +799,17 @@ mod tests {
         for i in [1, 14, 29] {
             data[i] = f32::NAN;
         }
-        let cube = Cube {
-            dims,
-            axes: [0, 1, 2],
-            data,
-            cards: vec![],
-            hdu: 0,
-            stats: Moments::EMPTY.stats(0),
-            histogram: Histogram(vec![0]),
-        };
 
-        let floats = |(dims, bytes): ([usize; 3], Vec<u8>)| {
-            (dims, bytemuck::pod_collect_to_vec::<u8, f32>(&bytes))
-        };
         let crop = Region {
             min: [1, 0, 0],
             max: [4, 2, 1],
         };
-        let (new_dims, max) = floats(crop_and_downsample(&cube, crop, [3, 2, 2], true));
+        let (new_dims, max) = crop_and_downsample(&data, dims, crop, [3, 2, 2], true);
         assert_eq!(new_dims, [2, 2, 1]);
         assert_eq!(max[..3], [113.0, 114.0, 123.0]);
         assert!(max[3].is_nan());
 
-        let (_, mean) = floats(crop_and_downsample(&cube, crop, [3, 2, 2], false));
+        let (_, mean) = crop_and_downsample(&data, dims, crop, [3, 2, 2], false);
         assert_eq!(mean[..3], [683.0 / 11.0, 59.0, 72.0]);
         assert!(mean[3].is_nan());
 
@@ -797,7 +817,7 @@ mod tests {
             min: [1, 1, 0],
             max: [3, 2, 1],
         };
-        let (new_dims, full) = floats(crop_and_downsample(&cube, crop, [1; 3], true));
+        let (new_dims, full) = crop_and_downsample(&data, dims, crop, [1; 3], true);
         assert_eq!(new_dims, [3, 2, 2]);
         assert_eq!(
             full,
@@ -811,7 +831,7 @@ mod tests {
     fn downsampling_matches_a_voxel_at_a_time_reference() {
         let dims = [37, 29, 11];
         let mut seed = 12345u32;
-        let data = (0..dims.iter().product::<usize>())
+        let data: Vec<f32> = (0..dims.iter().product::<usize>())
             .map(|_| {
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
                 if seed.is_multiple_of(7) {
@@ -821,15 +841,6 @@ mod tests {
                 }
             })
             .collect();
-        let cube = Cube {
-            dims,
-            axes: [0, 1, 2],
-            data,
-            cards: vec![],
-            hdu: 0,
-            stats: Moments::EMPTY.stats(0),
-            histogram: Histogram(vec![0]),
-        };
         // The plain version that the row-at-a-time one replaced: each output voxel's block in z, y, x order.
         let reference = |min: [usize; 3], max: [usize; 3], f: [usize; 3], max_mode: bool| {
             let mut out = vec![];
@@ -840,7 +851,7 @@ mod tests {
                         for z in z0..(z0 + f[2]).min(max[2] + 1) {
                             for y in y0..(y0 + f[1]).min(max[1] + 1) {
                                 for x in x0..(x0 + f[0]).min(max[0] + 1) {
-                                    let v = cube.data[(z * dims[1] + y) * dims[0] + x];
+                                    let v = data[(z * dims[1] + y) * dims[0] + x];
                                     if !v.is_nan() {
                                         acc = if max_mode { acc.max(v) } else { acc + v };
                                         n += 1;
@@ -868,9 +879,8 @@ mod tests {
         ] {
             for (min, max) in [([0; 3], [36, 28, 10]), ([3, 5, 1], [30, 20, 9])] {
                 for max_mode in [true, false] {
-                    let (_, bytes) =
-                        crop_and_downsample(&cube, Region { min, max }, factors, max_mode);
-                    let got = bytemuck::pod_collect_to_vec::<u8, f32>(&bytes);
+                    let (_, got) =
+                        crop_and_downsample(&data, dims, Region { min, max }, factors, max_mode);
                     let want = reference(min, max, factors, max_mode);
                     assert!(
                         got.len() == want.len()
@@ -947,9 +957,10 @@ mod tests {
             "voxels out of place across a chunk boundary"
         );
         let whole = Moments::of(&cube.data).stats(len);
-        assert_eq!((cube.stats.min, cube.stats.max), (0.0, 999.0));
-        assert!((cube.stats.mean - whole.mean).abs() < 1e-9);
-        assert!((cube.stats.std - whole.std).abs() < 1e-9);
+        let stats = cube.info.stats;
+        assert_eq!((stats.min, stats.max), (0.0, 999.0));
+        assert!((stats.mean - whole.mean).abs() < 1e-9);
+        assert!((stats.std - whole.std).abs() < 1e-9);
     }
 
     #[test]
@@ -986,7 +997,7 @@ mod tests {
             values.iter().flat_map(|v| v.to_be_bytes()).collect(),
             0,
         ));
-        let histogram = read_fits(&file[..], None).unwrap().histogram;
+        let histogram = read_fits(&file[..], None).unwrap().info.histogram;
 
         let mut finite: Vec<f64> = (values.iter().filter(|v| v.is_finite()))
             .map(|&v| v.into())
@@ -1003,7 +1014,7 @@ mod tests {
         // Interpolating within a bin keeps every rank within about a twentieth of a bin here; without it, they'd be
         // off by up to a whole bin.
         let bin = 1.0 / histogram.0.len() as f64;
-        for percent in crate::ui::PERCENTILES {
+        for percent in PERCENTILES {
             let tail = (100.0 - percent) / 200.0;
             let (lo, hi) = histogram.clip(percent);
             for (got, want) in [(lo, exact(tail)), (hi, exact(1.0 - tail))] {
@@ -1078,11 +1089,11 @@ mod tests {
             0,
         ));
 
-        let cube = read_fits(&file[..], None).unwrap();
-        assert_eq!((cube.hdu, cube.dims), (1, [2, 1, 1]));
+        let info = read_fits(&file[..], None).unwrap().info;
+        assert_eq!((info.hdu, info.dims), (1, [2, 1, 1]));
         assert!(read_fits(&file[..], Some(0)).is_err());
         // An infinite voxel stays out of the range, which would otherwise scale everything to zero.
-        assert_eq!((cube.stats.max, cube.stats.non_finite), (1.0, 1));
+        assert_eq!((info.stats.max, info.stats.non_finite), (1.0, 1));
     }
 
     #[test]
@@ -1112,29 +1123,26 @@ mod tests {
         // CASA's RA, DEC, STOKES(1), FREQ order.
         let casa = image(&[2, 2, 1, 4]);
         assert_eq!(
-            (casa.dims, casa.axes, casa.other_planes()),
+            (casa.info.dims, casa.info.axes, casa.info.other_planes()),
             ([2, 2, 4], [0, 1, 3], None)
         );
         assert_eq!(casa.data, (0..16).map(|v| v as f32).collect::<Vec<_>>());
         let flat = image(&[3, 2]);
         assert_eq!(
-            (flat.dims, flat.axes, flat.data.len()),
+            (flat.info.dims, flat.info.axes, flat.data.len()),
             ([3, 2, 1], [0, 1, 2], 6)
         );
         let stokes = image(&[2, 2, 2, 3]);
-        assert_eq!((stokes.dims, stokes.data.len()), ([2, 2, 2], 8));
+        assert_eq!((stokes.info.dims, stokes.data.len()), ([2, 2, 2], 8));
         assert_eq!(
-            stokes.other_planes().as_deref(),
+            stokes.info.other_planes().as_deref(),
             Some("1 of 3 along STOKES")
         );
     }
 
     #[test]
     fn reads_quoted_and_continued_strings() {
-        let cube = Cube {
-            dims: [1; 3],
-            axes: [0, 1, 2],
-            data: vec![],
+        let info = FileInfo {
             cards: [
                 "BUNIT   = '  K ''per'' &'      / doubled quotes, continued",
                 "CONTINUE  'beam'               / unit",
@@ -1143,13 +1151,11 @@ mod tests {
             ]
             .map(|c| format!("{c:<80}"))
             .into(),
-            hdu: 0,
-            stats: Moments::EMPTY.stats(0),
-            histogram: Histogram(vec![0]),
+            ..cube([1; 3], vec![]).info
         };
-        assert_eq!(cube.unit().as_deref(), Some("K 'per' beam"));
-        assert_eq!(value(&cube.cards, "OBJECT").as_deref(), Some("AT&T"));
-        assert_eq!(num::<f64>(&cube.cards, "BSCALE"), Ok(None));
+        assert_eq!(info.unit().as_deref(), Some("K 'per' beam"));
+        assert_eq!(value(&info.cards, "OBJECT").as_deref(), Some("AT&T"));
+        assert_eq!(num::<f64>(&info.cards, "BSCALE"), Ok(None));
     }
 
     #[test]
@@ -1177,13 +1183,13 @@ mod tests {
                 "BUNIT   = 'Jy/beam '",
             ]));
             file.extend(pad(vec![0; 8], 0));
-            read_fits(&file[..], None).unwrap()
+            read_fits(&file[..], None).unwrap().info
         };
-        let cube = extension("INHERIT =                    T");
-        assert_eq!(cube.unit().as_deref(), Some("Jy/beam"));
-        assert_eq!(value(&cube.cards, "SPECSYS").as_deref(), Some("BARYCENT"));
-        assert_eq!(value(&cube.cards, "BITPIX").as_deref(), Some("-32"));
-        assert_eq!(cube.cards.len(), 9 + 2);
+        let info = extension("INHERIT =                    T");
+        assert_eq!(info.unit().as_deref(), Some("Jy/beam"));
+        assert_eq!(value(&info.cards, "SPECSYS").as_deref(), Some("BARYCENT"));
+        assert_eq!(value(&info.cards, "BITPIX").as_deref(), Some("-32"));
+        assert_eq!(info.cards.len(), 9 + 2);
         assert_eq!(extension("INHERIT =                    F").cards.len(), 9);
     }
 }

@@ -64,7 +64,7 @@ pub fn draw_axes(
     let (camera, transform) = *camera;
     // The local transform is already this frame's orbit; GlobalTransform may not be propagated yet.
     let view = GlobalTransform::from(*transform);
-    let (lo, hi) = region_bounds(axes.visible, data.cube.dims);
+    let (lo, hi) = region_bounds(axes.visible, data.info.dims);
     let local = |u: [f32; 3]| (lo + (hi - lo) * Vec3::from_array(u)) * UNITY_FROM_LOCAL;
     let screen = |p: Vec3| camera.world_to_viewport(&view, p).ok();
     let centre = local([0.5; 3]);

@@ -9,12 +9,9 @@ use bevy_egui::{EguiContexts, egui};
 use crate::{
     CubeState, Dataset, Settings,
     config::{COLOR_MAPS, GAMMA, JITTER, RAYMARCHING_STEPS, SCALING_TYPES},
-    fits::Region,
+    fits::{PERCENTILES, Region},
     selection::{CropRequest, Hover},
 };
-
-/// CARTA's clip presets.
-pub const PERCENTILES: [f64; 8] = [90.0, 95.0, 99.0, 99.5, 99.9, 99.95, 99.99, 100.0];
 
 const HELP: &str = "Drag: orbit. Right or middle drag: pan. Scroll: zoom. Shift+drag: select region. \
     Drag a blue arrow or corner: resize. C or Enter: crop to selection. R: reset crop. Esc: clear selection.";
@@ -70,7 +67,7 @@ pub fn ui(
             egui::CollapsingHeader::new("Cube")
                 .default_open(true)
                 .show(ui, |ui| {
-                    cube_section(ui, &data, &state, hover.0, &mut crop_requests)
+                    cube_section(ui, &data, &state, &hover, &mut crop_requests)
                 });
             if let Some(wcs) = &data.wcs {
                 egui::CollapsingHeader::new("WCS").show(ui, |ui| {
@@ -92,25 +89,25 @@ fn cube_section(
     ui: &mut egui::Ui,
     data: &Dataset,
     state: &CubeState,
-    hover: Option<[usize; 3]>,
+    hover: &Hover,
     crop_requests: &mut MessageWriter<CropRequest>,
 ) {
-    let cube = &data.cube;
-    let stats = cube.stats;
-    let gb = (cube.data.len() * size_of::<f32>()) as f64 / 1e9;
-    let unit = cube.unit().map_or(String::new(), |u| format!(" {u}"));
+    let info = &data.info;
+    let stats = info.stats;
+    let gb = (info.dims.iter().product::<usize>() * size_of::<f32>()) as f64 / 1e9;
+    let unit = info.unit().map_or(String::new(), |u| format!(" {u}"));
     egui::Grid::new("cube").num_columns(2).show(ui, |ui| {
         let mut row = |name: &str, value: String| {
             ui.label(name);
             ui.label(value);
             ui.end_row();
         };
-        row("File", format!("{} (HDU {})", data.name, cube.hdu));
+        row("File", format!("{} (HDU {})", data.name, info.hdu));
         row(
             "Dimensions",
-            format!("{} ({gb:.2} GB)", format_dims(cube.dims)),
+            format!("{} ({gb:.2} GB)", format_dims(info.dims)),
         );
-        if let Some(planes) = cube.other_planes() {
+        if let Some(planes) = info.other_planes() {
             row("Plane", planes);
         }
         row(
@@ -145,8 +142,8 @@ fn cube_section(
         if let Some(selection) = state.selection {
             row("Selection", format_region(selection));
         }
-        if let Some(v) = hover {
-            let value = cube.value_at(v);
+        // Until the source answers, the readout stays on the last voxel it answered for.
+        if let Some((v, value)) = hover.voxel.and(hover.value) {
             row(
                 "Cursor",
                 format!(
@@ -196,7 +193,7 @@ fn rendering_section(ui: &mut egui::Ui, data: &Dataset, settings: &mut ResMut<Se
     }
     ui.horizontal_wrapped(|ui| {
         for percent in PERCENTILES {
-            let clip = data.cube.histogram.clip(percent);
+            let clip = data.info.histogram.clip(percent);
             let button = ui
                 .selectable_label(
                     (p.threshold_min, p.threshold_max) == clip,
