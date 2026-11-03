@@ -25,12 +25,16 @@ struct VolumeParams {
     max_steps: u32,
     highlight_saturate_factor: f32,
     projection_mode: u32,
+    empty_space_skipping: u32,
 };
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> params: VolumeParams;
 @group(constants::MATERIAL_BIND_GROUP) @binding(1) var data_cube: texture_3d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(3) var color_map: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var color_map_sampler: sampler;
+// Min and max of each BRICK³ block of data_cube texels (min > max when all NaN), from volume.rs brick_image.
+@group(constants::MATERIAL_BIND_GROUP) @binding(5) var brick_range: texture_3d<f32>;
+const BRICK = 8u;
 
 const LOG: u32 = 1u;
 const SQRT: u32 = 2u;
@@ -95,6 +99,16 @@ fn sample_cube(position: vec3<f32>) -> f32 {
     // fract can round up to 1.0 just below a whole number, hence the min.
     let texel = min(vec3<i32>(fract(position) * vec3<f32>(size)), size - 1);
     return textureLoad(data_cube, texel, 0).r;
+}
+
+// Samples left in a brick from `position`, counting this one. The margin keeps rounding from skipping a
+// sample that lands just past the brick.
+fn samples_in_brick(position: vec3<f32>, step: vec3<f32>, brick: vec3<u32>, size: vec3<f32>) -> i32 {
+    let lo = vec3<f32>(brick * BRICK) / size;
+    let hi = min(vec3<f32>((brick + 1u) * BRICK), size) / size;
+    let along = select(lo, hi, step > vec3(0.0)) - position;
+    let t = select(vec3(3.402823466e+38), along / step, step != vec3(0.0));
+    return i32(floor(min(min(t.x, t.y), t.z) - 0.01)) + 1;
 }
 
 struct Ray {
@@ -171,9 +185,36 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let highlight_max = (params.highlight_max + region_offset + 0.5) * region_scale;
 
     var ray = Ray(select(-3.402823466e+38, 0.0, params.projection_mode == 1u), 0.0, false, false);
-    for (var i = 0; i < required_steps; i++) {
-        ray = accumulate(ray, position, step_length, highlight_min, highlight_max);
-        position += adjusted_step_vector;
+    if params.empty_space_skipping == 0u {
+        for (var i = 0; i < required_steps; i++) {
+            ray = accumulate(ray, position, step_length, highlight_min, highlight_max);
+            position += adjusted_step_vector;
+        }
+    } else {
+        // A brick at a time: take none of its samples if none can change the result (all NaN, or for the
+        // maximum all below the ray's maximum so far, or equal to it while no selection is shown, since a tie
+        // only matters for the selection highlight). Stepping over them one by one keeps the positions.
+        let ties_skip = params.highlight_saturate_factor >= 1.0;
+        let size = vec3<f32>(textureDimensions(data_cube));
+        var i = 0;
+        while i < required_steps {
+            var samples = 1;
+            var skip = false;
+            if all(position >= vec3(0.0)) && all(position < vec3(1.0)) {
+                let brick = vec3<u32>(position * size) / BRICK;
+                samples = clamp(samples_in_brick(position, adjusted_step_vector, brick, size), 1, required_steps - i);
+                let range = textureLoad(brick_range, brick, 0).rg;
+                let below = range.y < ray.value || (ties_skip && range.y == ray.value);
+                skip = range.x > range.y || (params.projection_mode == 0u && below);
+            }
+            for (var j = 0; j < samples; j++) {
+                if !skip {
+                    ray = accumulate(ray, position, step_length, highlight_min, highlight_max);
+                }
+                position += adjusted_step_vector;
+            }
+            i += samples;
+        }
     }
     let remaining_step_length = total_length - f32(required_steps + 1) * step_length - length(rand_vector);
     position += step_vector * remaining_step_length * region_scale;

@@ -25,6 +25,7 @@ max_raymarching_steps = 384
 default_color_map = "Inferno"   # any name from iDaVIE's ColorMapEnum
 default_scaling_type = "Linear" # Linear, Log, Sqrt, Square, Power or Gamma
 jitter = 1.0
+empty_space_skipping = false    # experimental: skip blocks of texels that can't change a ray
 ```
 
 The view only redraws on input (and while a crop is being built), so an idle window leaves the GPU alone. Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping reloads that region from the full resolution data in the background and keeps the selection, the same as iDaVIE, and the panel shows the downsampling factors before and after.
@@ -63,6 +64,7 @@ The shader is a line for line port. The Unity specifics are translated rather th
 - the near plane follows the camera in, so a small crop doesn't end up behind it
 - the step count is capped at about two per texel along the texture's diagonal, so a small crop or a heavily downsampled cube takes fewer than `max_raymarching_steps`. Voxel edges can shift by a fraction of a voxel compared with iDaVIE
 - the view only redraws on input, so the jitter noise holds still while nothing changes; iDaVIE renders every frame
+- `empty_space_skipping` (off by default) skips 8-texel bricks whose range can't change a ray. The image is identical, but so far it's only faster on sparse data with a constant background; on noisy cubes it's slower
 
 WCS comes from [starlink-ast](https://github.com/Starlink/starlink-ast-rs), the Rust port of AST, with spectral axes shown in MHz or km/s. The port doesn't include AST's `Plot3D`, so the WCS ticks on the bounding box are our own. Each axis is labelled on the box edge that's on the silhouette, at round values found with AST's transforms and formatted with AST's `Format`. The tick spacing is chosen by hand because `astGap` isn't ported either.
 

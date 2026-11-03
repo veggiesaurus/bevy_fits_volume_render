@@ -9,6 +9,7 @@ use bevy::{
         SpecializedMeshPipelineError, TextureDimension, TextureFormat,
     },
     shader::ShaderRef,
+    tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool},
 };
 
 use crate::config::COLOR_MAPS;
@@ -46,6 +47,7 @@ pub struct VolumeParams {
     pub max_steps: u32,
     pub highlight_saturate_factor: f32,
     pub projection_mode: u32,
+    pub empty_space_skipping: u32,
 }
 
 impl Default for VolumeParams {
@@ -71,6 +73,7 @@ impl Default for VolumeParams {
             max_steps: 384,
             highlight_saturate_factor: 1.0,
             projection_mode: 0,
+            empty_space_skipping: 0,
         }
     }
 }
@@ -85,6 +88,8 @@ pub struct VolumeMaterial {
     #[texture(3)]
     #[sampler(4)]
     pub color_map: Handle<Image>,
+    #[texture(5, dimension = "3d", sample_type = "float", filterable = false)]
+    pub brick_range: Handle<Image>,
 }
 
 impl Material for VolumeMaterial {
@@ -141,6 +146,47 @@ pub fn cube_image(dims: [usize; 3], data: &[f32]) -> Image {
         TextureDimension::D3,
         bytes,
         TextureFormat::R32Float,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+}
+
+/// Texels per brick edge in `brick_image`, as BRICK in volume.wesl.
+pub const BRICK: usize = 8;
+
+/// The min and max of each BRICK³ block of texels, ignoring NaN (so min > max when a block is all NaN),
+/// which lets the shader skip blocks that can't change a ray's result.
+pub fn brick_image(dims: [usize; 3], data: &[f32]) -> Image {
+    let bricks = dims.map(|d| d.div_ceil(BRICK));
+    let layer = bricks[0] * bricks[1];
+    let mut ranges = vec![[f32::INFINITY, f32::NEG_INFINITY]; layer * bricks[2]];
+    ranges.par_chunk_map_mut(
+        ComputeTaskPool::get_or_init(TaskPool::default),
+        layer,
+        |bz, out| {
+            for z in bz * BRICK..((bz + 1) * BRICK).min(dims[2]) {
+                for y in 0..dims[1] {
+                    let row = &data[(z * dims[1] + y) * dims[0]..][..dims[0]];
+                    let out = &mut out[y / BRICK * bricks[0]..][..bricks[0]];
+                    for (range, texels) in out.iter_mut().zip(row.chunks(BRICK)) {
+                        for &v in texels {
+                            range[0] = range[0].min(v);
+                            range[1] = range[1].max(v);
+                        }
+                    }
+                }
+            }
+        },
+    );
+    let size = Extent3d {
+        width: bricks[0] as u32,
+        height: bricks[1] as u32,
+        depth_or_array_layers: bricks[2] as u32,
+    };
+    Image::new(
+        size,
+        TextureDimension::D3,
+        bytemuck::cast_slice(&ranges).to_vec(),
+        TextureFormat::Rg32Float,
         RenderAssetUsages::RENDER_WORLD,
     )
 }

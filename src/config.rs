@@ -15,6 +15,7 @@ pub struct Config {
     pub default_color_map: ColorMap,
     pub default_scaling_type: Scaling,
     pub jitter: f32,
+    pub empty_space_skipping: bool,
 }
 
 impl Default for Config {
@@ -26,6 +27,7 @@ impl Default for Config {
             default_color_map: ColorMap::try_from("Inferno".to_string()).unwrap(),
             default_scaling_type: Scaling::try_from("Linear".to_string()).unwrap(),
             jitter: 1.0,
+            empty_space_skipping: false,
         }
     }
 }

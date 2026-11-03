@@ -51,17 +51,19 @@ impl Region {
     }
 }
 
-/// A texture made from a region of the cube, and the downsampling it took.
+/// A texture made from a region of the cube, its brick ranges, and the downsampling it took.
 #[derive(Clone)]
 struct VolumeTexture {
     handle: Handle<Image>,
+    bricks: Handle<Image>,
     dims: [usize; 3],
     factors: [usize; 3],
 }
 
-/// A VolumeTexture's image before it's added as an asset, so they can be built off the main thread.
+/// A VolumeTexture's images before they're added as assets, so they can be built off the main thread.
 struct TextureImages {
     data: Image,
+    bricks: Image,
     dims: [usize; 3],
     factors: [usize; 3],
 }
@@ -70,6 +72,7 @@ impl TextureImages {
     fn add(self, images: &mut Assets<Image>) -> VolumeTexture {
         VolumeTexture {
             handle: images.add(self.data),
+            bricks: images.add(self.bricks),
             dims: self.dims,
             factors: self.factors,
         }
@@ -130,6 +133,7 @@ impl CubeState {
 struct Settings {
     params: VolumeParams,
     wcs_axes: bool,
+    skip_empty_space: bool,
 }
 
 #[derive(Component)]
@@ -301,7 +305,7 @@ fn load_native() -> Dataset {
     dataset
 }
 
-/// Texture for a region of the cube, downsampled to fit the configured GPU budget.
+/// Texture and brick ranges for a region of the cube, downsampled to fit the configured GPU budget.
 fn region_images(cube: &Cube, config: &Config, region: Region) -> TextureImages {
     let start = Instant::now();
     let factors = fits::find_downsample_factors(config.gpu_memory_limit_mb, region.extent());
@@ -319,6 +323,7 @@ fn region_images(cube: &Cube, config: &Config, region: Region) -> TextureImages 
     };
     let images = TextureImages {
         data: volume::cube_image(dims, &values),
+        bricks: volume::brick_image(dims, &values),
         dims,
         factors,
     };
@@ -364,10 +369,12 @@ fn spawn_volume(
             ..default()
         },
         wcs_axes: true,
+        skip_empty_space: config.empty_space_skipping,
     };
     let material = materials.add(VolumeMaterial {
         params: settings.params,
         data_cube: full.handle.clone(),
+        brick_range: full.bricks.clone(),
         color_map: images.add(volume::color_map_image()),
     });
     commands.spawn((
@@ -434,6 +441,8 @@ fn update_material(
         (params.highlight_min, params.highlight_max) = region_bounds(selection, data.cube.dims);
         params.highlight_saturate_factor = SELECTION_SATURATE_FACTOR;
     }
+    params.empty_space_skipping = settings.skip_empty_space.into();
     material.params = params;
     material.data_cube = state.texture().handle.clone();
+    material.brick_range = state.texture().bricks.clone();
 }
