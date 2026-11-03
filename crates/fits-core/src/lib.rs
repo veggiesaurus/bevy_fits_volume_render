@@ -1,9 +1,12 @@
 use std::io::{self, ErrorKind};
 use std::str::FromStr;
 
+use bevy_tasks::{ComputeTaskPool, TaskPool};
 #[cfg(not(target_arch = "wasm32"))]
-use bevy_tasks::ParallelSlice;
-use bevy_tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool};
+use bevy_tasks::{ParallelSlice, ParallelSliceMut};
+
+mod cubelet;
+pub use cubelet::{CUBELET, Cubelet, Level, Levels, Voxels, cubelet, levels};
 
 const BLOCK: usize = 2880;
 /// Voxels read, decoded and summarised per task: 4 MB of output, small enough to stay in cache.
@@ -86,6 +89,46 @@ impl Region {
 pub struct Cube {
     pub info: FileInfo,
     pub data: Vec<f32>,
+}
+
+impl Cube {
+    /// The noise σ: from the median absolute deviation of the quietest channels, sampled on a grid, leaving out
+    /// channels where it's zero, such as zero-filled or flagged ones. Where every channel is like that, the
+    /// histogram's IQR / 1.349, as for heavily quantised data. None when the cube has no finite voxels.
+    pub fn sigma(&self) -> Option<f64> {
+        // About 64 x 64 voxels a channel, stepping x and y apart so that the step can't alias with the width.
+        const GRID: usize = 64;
+        let [width, height, _] = self.info.dims;
+        let (step_x, step_y) = (width.div_ceil(GRID), height.div_ceil(GRID));
+        let mut mads: Vec<f32> = (self.data.chunks(width * height))
+            .filter_map(|channel| {
+                let mut values: Vec<f32> = (channel.chunks(width).step_by(step_y))
+                    .flat_map(|row| row.iter().step_by(step_x))
+                    .copied()
+                    .filter(|v| v.is_finite())
+                    .collect();
+                let centre = median(&mut values)?;
+                values.iter_mut().for_each(|v| *v = (*v - centre).abs());
+                median(&mut values).filter(|&mad| mad > 0.0)
+            })
+            .collect();
+        mads.sort_by(f32::total_cmp);
+        // The middle of the quietest quarter, so that neither emission nor a few unusually flat channels set it.
+        if let Some(&mad) = mads.get(mads.len().div_ceil(4) / 2) {
+            return Some(1.4826 * f64::from(mad));
+        }
+        let Stats { min, max, .. } = self.info.stats;
+        let range = f64::from(max) - f64::from(min);
+        range.is_finite().then(|| {
+            let (lo, hi) = self.info.histogram.clip(50.0);
+            f64::from(hi - lo) * range / 1.349
+        })
+    }
+}
+
+fn median(values: &mut [f32]) -> Option<f32> {
+    let middle = values.len() / 2;
+    (!values.is_empty()).then(|| *values.select_nth_unstable_by(middle, f32::total_cmp).1)
 }
 
 /// Everything about a cube but its voxels, which is what a viewer is sent when it opens one.
@@ -615,7 +658,8 @@ pub fn find_downsample_factors(gpu_memory_limit_mb: u64, extent: [usize; 3]) -> 
     while z.div_ceil(fz) > 2048 {
         fz += 1;
     }
-    let max_elements = gpu_memory_limit_mb * 1_000_000 / 4;
+    // At least one, so that a budget of zero still ends.
+    let max_elements = (gpu_memory_limit_mb.saturating_mul(1_000_000) / 4).max(1);
     while x.div_ceil(fx) * y.div_ceil(fy) * z.div_ceil(fz) > max_elements {
         if z / fz > x / fx || z / fz > y / fy {
             fz += 1;
@@ -633,8 +677,9 @@ pub fn downsampled_dims(region: Region, factors: [usize; 3]) -> [usize; 3] {
     std::array::from_fn(|i| extent[i].div_ceil(factors[i]))
 }
 
-/// Each block of `factors` in `data`, a cube of `dims`, becomes its maximum or mean, ignoring NaN, and NaN when
-/// it's all NaN. Returns the new dims and the R32Float texture data, x fastest.
+/// Each block of `factors` in `data`, a cube of `dims`, becomes its maximum, ignoring NaN, or its mean, ignoring
+/// every non-finite voxel, and NaN when there's nothing else. Factors of one copy the voxels as they are. Returns
+/// the new dims and the R32Float texture data, x fastest.
 pub fn crop_and_downsample(
     data: &[f32],
     dims: [usize; 3],
@@ -642,24 +687,44 @@ pub fn crop_and_downsample(
     factors: [usize; 3],
     max_mode: bool,
 ) -> ([usize; 3], Vec<f32>) {
+    let (dims, data, _) = downsample(data, dims, None, region, factors, max_mode, false);
+    (dims, data)
+}
+
+/// `crop_and_downsample` over any level held in memory. A mean weighs each voxel by `weights`, when given, and
+/// with `keep_counts` also returns the weight behind each mean, so that the result can be downsampled again exactly.
+fn downsample(
+    data: &[f32],
+    dims: [usize; 3],
+    weights: Option<&[u32]>,
+    region: Region,
+    factors: [usize; 3],
+    max_mode: bool,
+    keep_counts: bool,
+) -> ([usize; 3], Vec<f32>, Vec<u32>) {
     let Region { min, max } = region;
     assert!(
         (0..3).all(|i| min[i] <= max[i] && max[i] < dims[i] && factors[i] > 0),
         "invalid crop or factors"
     );
+    assert!(!(max_mode && keep_counts), "a maximum has no counts");
     let out_dims = downsampled_dims(region, factors);
     let block = |i: usize, o: usize| {
         min[i] + o * factors[i]..(min[i] + (o + 1) * factors[i]).min(max[i] + 1)
     };
-    let [width, height, _] = dims;
-    let row = |z: usize, y: usize| &data[(z * height + y) * width..][min[0]..=max[0]];
+    let row = |z: usize, y: usize| {
+        let start = (z * dims[1] + y) * dims[0];
+        start + min[0]..=start + max[0]
+    };
     // One output plane per task, as iDaVIE splits over z, built a row of blocks at a time. On wasm the pool
     // runs them in turn.
-    let fill_plane = |oz: usize, plane: &mut [f32]| {
+    let fill_plane = |oz: usize, plane: &mut [f32], plane_counts: &mut [u32]| {
         let (mut acc, mut count) = (vec![0f32; out_dims[0]], vec![0u32; out_dims[0]]);
+        // The weights of an unweighted mean.
+        let ones = vec![1u32; factors[0]];
         for (oy, out) in plane.chunks_mut(out_dims[0]).enumerate() {
-            if factors == [1; 3] {
-                out.copy_from_slice(row(min[2] + oz, min[1] + oy));
+            if factors == [1; 3] && !keep_counts {
+                out.copy_from_slice(&data[row(min[2] + oz, min[1] + oy)]);
                 continue;
             }
             // f32::max ignores a NaN operand, so starting from NaN leaves an all-NaN block NaN.
@@ -667,16 +732,22 @@ pub fn crop_and_downsample(
             count.fill(0);
             for z in block(2, oz) {
                 for y in block(1, oy) {
-                    let blocks = row(z, y).chunks(factors[0]);
+                    let blocks = data[row(z, y)].chunks(factors[0]);
                     if max_mode {
                         for (a, values) in acc.iter_mut().zip(blocks) {
                             *a = values.iter().fold(*a, |a, &v| a.max(v));
                         }
                     } else {
-                        for ((a, n), values) in acc.iter_mut().zip(&mut count).zip(blocks) {
-                            for &v in values.iter().filter(|v| !v.is_nan()) {
-                                *a += v;
-                                *n += 1;
+                        let weights = weights.map(|w| &w[row(z, y)]);
+                        for (b, ((a, n), values)) in
+                            acc.iter_mut().zip(&mut count).zip(blocks).enumerate()
+                        {
+                            let weights = weights.map_or(&ones[..], |w| &w[b * factors[0]..]);
+                            for (&v, &w) in
+                                values.iter().zip(weights).filter(|(v, _)| v.is_finite())
+                            {
+                                *a += v * w as f32;
+                                *n += w;
                             }
                         }
                     }
@@ -688,15 +759,23 @@ pub fn crop_and_downsample(
                 }
             }
             out.copy_from_slice(&acc);
+            if keep_counts {
+                plane_counts[oy * out_dims[0]..][..out_dims[0]].copy_from_slice(&count);
+            }
         }
     };
-    let mut out = vec![0f32; out_dims.iter().product::<usize>()];
-    out.par_chunk_map_mut(
-        ComputeTaskPool::get_or_init(TaskPool::default),
-        out_dims[0] * out_dims[1],
-        fill_plane,
-    );
-    (out_dims, out)
+    let fill_plane = &fill_plane;
+    let plane_len = out_dims[0] * out_dims[1];
+    let mut out = vec![0f32; plane_len * out_dims[2]];
+    let mut counts = vec![0u32; if keep_counts { out.len() } else { 0 }];
+    let mut count_planes = counts.chunks_mut(plane_len);
+    ComputeTaskPool::get_or_init(TaskPool::default).scope(|s| {
+        for (oz, plane) in out.chunks_mut(plane_len).enumerate() {
+            let plane_counts = count_planes.next().unwrap_or_default();
+            s.spawn(async move { fill_plane(oz, plane, plane_counts) });
+        }
+    });
+    (out_dims, out, counts)
 }
 
 #[cfg(test)]
@@ -704,7 +783,7 @@ mod tests {
     use super::*;
 
     /// A cube of `data` with no header and no statistics.
-    fn cube(dims: [usize; 3], data: Vec<f32>) -> Cube {
+    pub(crate) fn cube(dims: [usize; 3], data: Vec<f32>) -> Cube {
         Cube {
             info: FileInfo {
                 dims,
@@ -852,7 +931,7 @@ mod tests {
                             for y in y0..(y0 + f[1]).min(max[1] + 1) {
                                 for x in x0..(x0 + f[0]).min(max[0] + 1) {
                                     let v = data[(z * dims[1] + y) * dims[0] + x];
-                                    if !v.is_nan() {
+                                    if if max_mode { !v.is_nan() } else { v.is_finite() } {
                                         acc = if max_mode { acc.max(v) } else { acc + v };
                                         n += 1;
                                     }
@@ -1027,6 +1106,33 @@ mod tests {
     }
 
     #[test]
+    fn sigma_comes_from_the_channels_without_emission() {
+        // σ = 0.5 on a pedestal, with emission over most of the middle channels, one channel all NaN and the last
+        // eight zero-filled, more than the quietest quarter's middle.
+        let dims = [64, 64, 40];
+        let mut seed = 12345u32;
+        let mut uniform = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        let data = (0..dims.iter().product::<usize>())
+            .map(|i| {
+                let (z, x) = (i / 4096, i % 64);
+                let noise = 0.5 * ((0..12).map(|_| uniform()).sum::<f32>() - 6.0);
+                match z {
+                    3 => f32::NAN,
+                    32.. => 0.0,
+                    8..32 if x < 40 => 100.0 + noise + 5.0,
+                    _ => 100.0 + noise,
+                }
+            })
+            .collect();
+        let sigma = cube(dims, data).sigma().unwrap();
+        assert!((sigma - 0.5).abs() < 0.025, "{sigma}");
+        assert_eq!(cube([2, 2, 2], vec![f32::NAN; 8]).sigma(), None);
+    }
+
+    #[test]
     fn rejects_headers_that_claim_more_than_the_file_holds() {
         let cube = |n: u64| {
             header(&[
@@ -1054,6 +1160,8 @@ mod tests {
         assert_eq!(find_downsample_factors(64, [512, 512, 2000]), [3, 3, 8]);
         // 4097 / 2 rounds up to 2049, over the 3D texture limit.
         assert_eq!(find_downsample_factors(384, [4097, 10, 10]), [3, 3, 1]);
+        // A budget of zero still ends, at one voxel.
+        assert_eq!(find_downsample_factors(0, [3, 2, 2]), [3, 3, 2]);
     }
 
     #[test]
