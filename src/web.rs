@@ -1,30 +1,16 @@
 //! Loading files handed over by web/index.html.
 
 use std::{
-    cell::RefCell,
     io::{self, ErrorKind},
     sync::Mutex,
 };
 
-use bevy::{
-    platform::time::Instant,
-    prelude::*,
-    winit::{EventLoopProxy, EventLoopProxyWrapper, WinitUserEvent},
-};
+use bevy::{platform::time::Instant, prelude::*};
 use js_sys::Uint8Array;
 
-use crate::{Dataset, config, fits};
+use crate::{Dataset, config, fits, wake};
 
 static PENDING: Mutex<Option<Dataset>> = Mutex::new(None);
-
-thread_local! {
-    // The app only updates on input, so a file handed over by the page has to wake it.
-    static WAKE: RefCell<Option<EventLoopProxy<WinitUserEvent>>> = const { RefCell::new(None) };
-}
-
-pub fn keep_wake_proxy(proxy: Res<EventLoopProxyWrapper>) {
-    WAKE.with(|wake| *wake.borrow_mut() = Some((*proxy).clone()));
-}
 
 /// The page's copy of the file, read a chunk at a time so it's never copied whole into wasm memory.
 struct JsBytes(Uint8Array);
@@ -71,11 +57,8 @@ pub fn load_fits(
     let dataset = Dataset::new(name, cube, config, start);
     info!("{}", dataset.summary());
     *PENDING.lock().unwrap() = Some(dataset);
-    WAKE.with(|wake| {
-        wake.borrow()
-            .as_ref()
-            .map(|proxy| proxy.send_event(WinitUserEvent::WakeUp))
-    });
+    // The app only updates on input, so a file handed over by the page has to wake it.
+    wake();
     Ok(())
 }
 

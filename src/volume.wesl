@@ -34,6 +34,11 @@ struct VolumeParams {
     grid_cells: vec3<u32>,
     // 1 when the texture has a NaN.
     has_nan: u32,
+    // The texture's box, which the clip box (slice_min, slice_max) lies in, and where the grid's first cell
+    // starts before the texture, in texture coordinates with z in layers.
+    texture_min: vec3<f32>,
+    texture_max: vec3<f32>,
+    grid_offset: vec3<f32>,
 };
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> params: VolumeParams;
@@ -41,7 +46,7 @@ struct VolumeParams {
 @group(constants::MATERIAL_BIND_GROUP) @binding(2) var data_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(3) var color_map: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var color_map_sampler: sampler;
-// volume.rs Grid: a cell to an entry, 1 if it holds a NaN and then its max (-inf for nothing but NaN).
+// volume.rs grid_buffer: a cubelet to an entry, 1 if it holds a NaN and then its max (-inf for nothing but NaN).
 @group(constants::MATERIAL_BIND_GROUP) @binding(5) var<storage, read> grid: array<vec2<u32>>;
 
 const LOG: u32 = 1u;
@@ -234,8 +239,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Unity's _Time.xy is (t / 20, t)
     let rand_vector = nrand(in.position.xy + vec2(globals.time / 20.0, globals.time)) * step_vector * step_length * params.jitter;
 
-    let region_scale = 1.0 / (params.slice_max - params.slice_min);
-    let region_offset = -(params.slice_min + 0.5);
+    let region_scale = 1.0 / (params.texture_max - params.texture_min);
+    let region_offset = -(params.texture_min + 0.5);
     var position = (p_near + rand_vector + region_offset) * region_scale;
     let s = step_vector * step_length * region_scale;
     let h_min = (params.highlight_min + region_offset + 0.5) * region_scale;
@@ -295,11 +300,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     } else {
         // Front to back a grid cell at a time, stepping over a cell that can't raise the max.
         let inv_da = 1.0 / da;
+        let go = params.grid_offset;
         var k = 1;
         while k < required_steps {
             let a = start + f32(k) * da;
-            let cell = clamp(floor(a / params.cell_size), vec3(0.0), vec3<f32>(params.grid_cells - 1u));
-            let lo = cell * params.cell_size;
+            let cell = clamp(floor((a + go) / params.cell_size), vec3(0.0), vec3<f32>(params.grid_cells - 1u));
+            let lo = cell * params.cell_size - go;
             let hi = min(lo + params.cell_size, zs);
             let t = select(vec3(F32_MAX), (select(lo, hi, da > vec3(0.0)) - start) * inv_da, da != vec3(0.0));
             let k_exit = clamp(i32(ceil(min(min(min(t.x, t.y), t.z), f32(required_steps)))), k + 1, required_steps);

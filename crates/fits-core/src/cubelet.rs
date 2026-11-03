@@ -1,6 +1,6 @@
 //! Cubes travel as cubelets of up to CUBELET³ voxels, cut from a fixed list of levels per file.
 
-use bevy_tasks::{ComputeTaskPool, TaskPool};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{Cube, Region, downsample, downsampled_dims, find_downsample_factors};
 
@@ -33,14 +33,15 @@ pub fn levels(dims: [usize; 3], gpu_memory_limit_mb: u64, max_depth: usize) -> L
     }
 }
 
-/// A cubelet at its true size, which is smaller than CUBELET³ at the cube's far edges.
+/// A cubelet at its true size, which is smaller than CUBELET³ at the cube's far edges, and its `Cell`.
 #[derive(Debug)]
 pub struct Cubelet {
     pub dims: [usize; 3],
     pub voxels: Voxels,
+    pub cell: Cell,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Voxels {
     AllNan,
     Constant(f32),
@@ -48,7 +49,7 @@ pub enum Voxels {
 }
 
 impl Cubelet {
-    fn new(dims: [usize; 3], data: Vec<f32>) -> Self {
+    fn new(dims: [usize; 3], data: Vec<f32>, cell: Cell) -> Self {
         let voxels = if data.iter().all(|v| v.is_nan()) {
             Voxels::AllNan
         } else if data.iter().all(|v| v.to_bits() == data[0].to_bits()) {
@@ -56,13 +57,13 @@ impl Cubelet {
         } else {
             Voxels::Data(data)
         };
-        Self { dims, voxels }
+        Self { dims, voxels, cell }
     }
 }
 
 /// What the cubelet at `at` of a cube of `dims` downsampled by `factors` covers of it, or None when `at` is outside
 /// that level's grid of cubelets.
-fn cubelet_region(dims: [usize; 3], factors: [usize; 3], at: [usize; 3]) -> Option<Region> {
+pub fn cubelet_region(dims: [usize; 3], factors: [usize; 3], at: [usize; 3]) -> Option<Region> {
     let mut region = Region::whole(dims);
     for i in 0..3 {
         let span = CUBELET.checked_mul(factors[i]).filter(|&span| span > 0)?;
@@ -85,6 +86,14 @@ fn copy(data: &[f32], dims: [usize; 3], region: Region) -> Vec<f32> {
     out
 }
 
+/// `region` grown by `by` each side, clamped to `dims`.
+pub fn grow(region: Region, dims: [usize; 3], by: [usize; 3]) -> Region {
+    Region {
+        min: std::array::from_fn(|i| region.min[i].saturating_sub(by[i])),
+        max: std::array::from_fn(|i| (region.max[i] + by[i]).min(dims[i] - 1)),
+    }
+}
+
 /// The cubelet at `at` of level 0 downsampled by `factors`, cut straight from level 0, or None when `at` is outside
 /// that level's grid.
 pub fn cubelet(
@@ -95,55 +104,54 @@ pub fn cubelet(
 ) -> Option<Cubelet> {
     let dims = cube.info.dims;
     let region = cubelet_region(dims, factors, at)?;
-    Some(if factors == [1; 3] {
-        Cubelet::new(region.extent(), copy(&cube.data, dims, region))
-    } else {
-        let (dims, data, _) = downsample(&cube.data, dims, None, region, factors, max_mode, false);
-        Cubelet::new(dims, data)
-    })
+    if factors == [1; 3] {
+        let cell = Cell::of(&cube.data, dims, grow(region, dims, [1; 3]));
+        return Some(Cubelet::new(
+            region.extent(),
+            copy(&cube.data, dims, region),
+            cell,
+        ));
+    }
+    // A texel more each side for the cell, then the cubelet from inside that.
+    let grown = grow(region, dims, factors);
+    let (grown_dims, data, _) = downsample(&cube.data, dims, None, grown, factors, max_mode, false);
+    let min: [usize; 3] = std::array::from_fn(|i| (region.min[i] - grown.min[i]) / factors[i]);
+    let extent = downsampled_dims(region, factors);
+    let inner = Region {
+        min,
+        max: std::array::from_fn(|i| min[i] + extent[i] - 1),
+    };
+    let cell = Cell::of(&data, grown_dims, Region::whole(grown_dims));
+    Some(Cubelet::new(extent, copy(&data, grown_dims, inner), cell))
 }
 
-/// The largest value in a cell of a texture, ignoring NaN (-inf when there's nothing else), and whether it has a NaN.
+/// The largest value in a cubelet, ignoring NaN (-inf when there's nothing else), and whether it has a NaN. Both take
+/// in a voxel past its faces as well, for samples that round across them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cell {
     pub max: f32,
     pub has_nan: bool,
 }
 
-/// A `Cell` for each block of `edge`³ voxels of `voxels`, a cube of `dims`, x fastest. Each takes in a voxel past
-/// its faces as well, for samples that round across them. One pass in memory order, a task per layer of cells.
-pub fn cell_summary(voxels: &[f32], dims: [usize; 3], edge: usize) -> Vec<Cell> {
-    let cells = dims.map(|d| d.div_ceil(edge));
-    // The voxels along an axis of `len` that cell `c` takes in.
-    let span =
-        move |c: usize, len: usize| (c * edge).saturating_sub(1)..((c + 1) * edge + 1).min(len);
-    let [width, height, depth] = dims;
-    let layer = cells[0] * cells[1];
-    let empty = Cell {
-        max: f32::NEG_INFINITY,
-        has_nan: false,
-    };
-    let mut out = vec![empty; layer * cells[2]];
-    ComputeTaskPool::get_or_init(TaskPool::default).scope(|s| {
-        for (cz, layer_cells) in out.chunks_mut(layer).enumerate() {
-            s.spawn(async move {
-                for z in span(cz, depth) {
-                    for (cy, row_cells) in layer_cells.chunks_mut(cells[0]).enumerate() {
-                        for y in span(cy, height) {
-                            let row = &voxels[(z * height + y) * width..][..width];
-                            for (cx, cell) in row_cells.iter_mut().enumerate() {
-                                for &v in &row[span(cx, width)] {
-                                    cell.has_nan |= v.is_nan();
-                                    cell.max = cell.max.max(v);
-                                }
-                            }
-                        }
-                    }
+impl Cell {
+    /// Over `region` of `data`, a level of `dims`.
+    pub fn of(data: &[f32], dims: [usize; 3], region: Region) -> Self {
+        let Region { min, max } = region;
+        let mut cell = Cell {
+            max: f32::NEG_INFINITY,
+            has_nan: false,
+        };
+        for z in min[2]..=max[2] {
+            for y in min[1]..=max[1] {
+                let start = (z * dims[1] + y) * dims[0];
+                for &v in &data[start + min[0]..=start + max[0]] {
+                    cell.has_nan |= v.is_nan();
+                    cell.max = cell.max.max(v);
                 }
-            });
+            }
         }
-    });
-    out
+        cell
+    }
 }
 
 /// A whole level held in memory, so that its cubelets are copies and a coarser level takes one pass over it. Level 0
@@ -202,12 +210,43 @@ impl Level {
         }
     }
 
+    /// The levels at `factors`, finest first, the first built from the cube and each of the rest from the one before,
+    /// or None once `cancel` is set, which is checked between levels. A mean's counts go once the next level is built
+    /// from them.
+    pub fn pyramid(
+        cube: &Cube,
+        factors: &[[usize; 3]],
+        max_mode: bool,
+        cancel: &AtomicBool,
+    ) -> Option<Vec<Self>> {
+        let mut levels: Vec<Self> = Vec::with_capacity(factors.len());
+        for &f in factors {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let level = match levels.last_mut() {
+                None => Self::new(cube, f, max_mode),
+                Some(finer) => {
+                    let level = finer.chain(f);
+                    finer.counts = Vec::new();
+                    level
+                }
+            };
+            levels.push(level);
+        }
+        if let Some(last) = levels.last_mut() {
+            last.counts = Vec::new();
+        }
+        Some(levels)
+    }
+
     /// The cubelet at `at` in this level's grid, or None when `at` is outside it.
     pub fn cubelet(&self, at: [usize; 3]) -> Option<Cubelet> {
         let region = cubelet_region(self.dims, [1; 3], at)?;
         Some(Cubelet::new(
             region.extent(),
             copy(&self.data, self.dims, region),
+            Cell::of(&self.data, self.dims, grow(region, self.dims, [1; 3])),
         ))
     }
 }
@@ -265,6 +304,14 @@ mod tests {
     #[test]
     fn cells_reach_a_voxel_past_their_faces() {
         let cell = |max, has_nan| Cell { max, has_nan };
+        let cell_summary = |voxels: &[f32], dims: [usize; 3]| -> Vec<Cell> {
+            let cube = cube(dims, voxels.to_vec());
+            let [x, y, z] = dims.map(|d| d.div_ceil(CUBELET));
+            (0..z)
+                .flat_map(|z| (0..y).flat_map(move |y| (0..x).map(move |x| [x, y, z])))
+                .map(|at| cubelet(&cube, [1; 3], at, true).unwrap().cell)
+                .collect()
+        };
         // Two cells along x, the second 6 voxels wide; all NaN apart from the voxels named below.
         let dims = [70, 2, 1];
         let mut voxels = vec![f32::NAN; 140];
@@ -274,16 +321,13 @@ mod tests {
         // Cell 1's first voxel, which cell 0 takes in across the face.
         voxels[at(64, 0)] = 7.0;
         voxels[at(66, 0)] = 3.0;
-        let summary = cell_summary(&voxels, dims, CUBELET);
+        let summary = cell_summary(&voxels, dims);
         assert_eq!(summary, [cell(7.0, true), cell(7.0, true)]);
         voxels[at(63, 1)] = f32::NAN;
         voxels[at(64, 0)] = f32::NAN;
-        let summary = cell_summary(&voxels, dims, CUBELET);
+        let summary = cell_summary(&voxels, dims);
         assert_eq!(summary, [cell(f32::NEG_INFINITY, true), cell(3.0, true)]);
-        assert_eq!(
-            cell_summary(&[1.0; 140], dims, CUBELET),
-            [cell(1.0, false); 2]
-        );
+        assert_eq!(cell_summary(&[1.0; 140], dims), [cell(1.0, false); 2]);
 
         // The same in y and z, on zeros: 9 on a y face, 5 on a z face, and a NaN that only its own cell takes in.
         let dims = [1, 66, 66];
@@ -292,7 +336,7 @@ mod tests {
         voxels[at(64, 10)] = 9.0;
         voxels[at(30, 63)] = 5.0;
         voxels[at(65, 65)] = f32::NAN;
-        let summary = cell_summary(&voxels, dims, CUBELET);
+        let summary = cell_summary(&voxels, dims);
         let want = [
             cell(9.0, false),
             cell(9.0, false),
@@ -381,6 +425,9 @@ mod tests {
                         cubelet(&cube, level.factors, at, max_mode).unwrap(),
                     );
                     assert_eq!(ours.dims, cut.dims);
+                    if max_mode {
+                        assert_eq!(ours.cell, cut.cell, "{:?} {at:?}", level.factors);
+                    }
                     let voxels = |c: Cubelet| match c.voxels {
                         Voxels::AllNan => vec![f32::NAN; c.dims.iter().product()],
                         Voxels::Constant(v) => vec![v; c.dims.iter().product()],

@@ -9,8 +9,8 @@ use bevy::{
     render::{
         render_resource::{
             AsBindGroup, CompareFunction, Extent3d, Face, RenderPipelineDescriptor, ShaderType,
-            SpecializedMeshPipelineError, TextureDimension, TextureFormat, TextureViewDescriptor,
-            TextureViewDimension,
+            SpecializedMeshPipelineError, TextureDimension, TextureFormat, TextureUsages,
+            TextureViewDescriptor, TextureViewDimension,
         },
         storage::ShaderBuffer,
     },
@@ -26,8 +26,7 @@ pub struct VolumePlugin;
 impl Plugin for VolumePlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "volume.wesl");
-        app.add_plugins(MaterialPlugin::<VolumeMaterial>::default())
-            .add_systems(Startup, insert_no_grid);
+        app.add_plugins(MaterialPlugin::<VolumeMaterial>::default());
     }
 }
 
@@ -59,6 +58,9 @@ pub struct VolumeParams {
     pub layers: f32,
     pub grid_cells: UVec3,
     pub has_nan: u32,
+    pub texture_min: Vec3,
+    pub texture_max: Vec3,
+    pub grid_offset: Vec3,
 }
 
 impl Default for VolumeParams {
@@ -90,6 +92,9 @@ impl Default for VolumeParams {
             layers: 1.0,
             grid_cells: UVec3::ONE,
             has_nan: 0,
+            texture_min: Vec3::splat(-0.5),
+            texture_max: Vec3::splat(0.5),
+            grid_offset: Vec3::ZERO,
         }
     }
 }
@@ -97,57 +102,42 @@ impl Default for VolumeParams {
 impl VolumeParams {
     /// iDaVIE's step, sqrt(max_length) / max_steps, with the step count lifted so the longest rays (sqrt(3) on
     /// the full cube) reach the far side rather than stopping at max_steps. Capped at about two steps per texel
-    /// along the texture's diagonal, so a small texture (a crop, or a heavily downsampled cube) costs less.
-    /// Then the texture's grid, or `NoGrid`'s one cell over all of it while the grid is still to come.
-    pub fn set_texture(&mut self, dims: [usize; 3], grid: Option<&Grid>) {
+    /// along the diagonal of the `visible` texels, those inside the clip box, so a small crop or a heavily
+    /// downsampled cube costs less. Then the texture's grid: `cells` cubelets, the first starting `offset` texels
+    /// before the texture.
+    pub fn set_texture(
+        &mut self,
+        dims: [usize; 3],
+        visible: Vec3,
+        cells: [usize; 3],
+        offset: [usize; 3],
+        has_nan: bool,
+    ) {
         let texels = Vec3::from_array(dims.map(|d| d as f32));
         let max_length = (self.slice_max - self.slice_min).length();
         self.step_count =
-            (max_length.sqrt() * self.max_steps as f32).min((2.0 * texels.length()).ceil());
+            (max_length.sqrt() * self.max_steps as f32).min((2.0 * visible.length()).ceil());
         self.step_length = max_length / self.step_count;
         self.layers = texels.z;
         let edge = fits::CUBELET as f32;
-        (self.cell_size, self.grid_cells, self.has_nan) = match grid {
-            Some(grid) => (
-                Vec3::new(edge / texels.x, edge / texels.y, edge),
-                UVec3::from_array(dims.map(|d| d.div_ceil(fits::CUBELET) as u32)),
-                grid.has_nan as u32,
-            ),
-            None => (Vec3::new(1.0, 1.0, texels.z), UVec3::ONE, 1),
-        };
+        self.cell_size = Vec3::new(edge / texels.x, edge / texels.y, edge);
+        self.grid_cells = UVec3::from_array(cells.map(|c| c as u32));
+        let offset = Vec3::from_array(offset.map(|o| o as f32));
+        self.grid_offset = offset / Vec3::new(texels.x, texels.y, 1.0);
+        self.has_nan = has_nan as u32;
     }
 }
 
-/// A texture's `fits::cell_summary` on the GPU, a cell of 64³ texels to an entry: 1 if it has a NaN, then its max,
-/// so a Maximum ray can step over the cell or leave out the NaN test.
-#[derive(Clone)]
-pub struct Grid {
-    pub buffer: Handle<ShaderBuffer>,
-    pub has_nan: bool,
-}
-
-impl Grid {
-    pub fn new(cells: &[fits::Cell], buffers: &mut Assets<ShaderBuffer>) -> Self {
-        let entries: Vec<[u32; 2]> = (cells.iter())
-            .map(|cell| [cell.has_nan as u32, cell.max.to_bits()])
-            .collect();
-        Self {
-            buffer: buffers.add(ShaderBuffer::new(entries, RenderAssetUsages::RENDER_WORLD)),
-            has_nan: cells.iter().any(|cell| cell.has_nan),
-        }
-    }
-}
-
-/// One cell that never skips, with a NaN and a max of +inf, for a texture whose grid is still to come.
-#[derive(Resource)]
-pub struct NoGrid(pub Handle<ShaderBuffer>);
-
-fn insert_no_grid(mut commands: Commands, mut buffers: ResMut<Assets<ShaderBuffer>>) {
-    let never_skips = fits::Cell {
-        max: f32::INFINITY,
-        has_nan: true,
-    };
-    commands.insert_resource(NoGrid(Grid::new(&[never_skips], &mut buffers).buffer));
+/// A texture's cubelet cells on the GPU, an entry each: 1 if it has a NaN, then its max, so a Maximum ray can step
+/// over the cell or leave out the NaN test.
+pub fn grid_buffer(
+    cells: &[fits::Cell],
+    buffers: &mut Assets<ShaderBuffer>,
+) -> Handle<ShaderBuffer> {
+    let entries: Vec<[u32; 2]> = (cells.iter())
+        .map(|cell| [cell.has_nan as u32, cell.max.to_bits()])
+        .collect();
+    buffers.add(ShaderBuffer::new(entries, RenderAssetUsages::RENDER_WORLD))
 }
 
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
@@ -207,9 +197,9 @@ impl Material for VolumeMaterial {
     }
 }
 
-/// An R32Float 2D array texture with a layer per channel and no data yet, which `Uploads` fills. A 2D array
-/// sample issues faster than a 3D one.
-pub fn empty_cube_image(dims: [usize; 3]) -> Image {
+/// An R32Float 2D array texture with a layer per channel and no data yet, which `Uploads` fills, and with `storage`
+/// an `Upsample` too. A 2D array sample issues faster than a 3D one.
+pub fn empty_cube_image(dims: [usize; 3], storage: bool) -> Image {
     let size = Extent3d {
         width: dims[0] as u32,
         height: dims[1] as u32,
@@ -221,6 +211,9 @@ pub fn empty_cube_image(dims: [usize; 3]) -> Image {
         TextureFormat::R32Float,
         RenderAssetUsages::RENDER_WORLD,
     );
+    if storage {
+        image.texture_descriptor.usage |= TextureUsages::STORAGE_BINDING;
+    }
     // Without this a single channel would be a plain 2D texture.
     image.texture_view_descriptor = Some(TextureViewDescriptor {
         dimension: Some(TextureViewDimension::D2Array),

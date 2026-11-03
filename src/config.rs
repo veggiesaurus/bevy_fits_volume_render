@@ -10,26 +10,28 @@ pub const RAYMARCHING_STEPS: RangeInclusive<u32> = 16..=512;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub gpu_memory_limit_mb: u64,
-    pub max_mode_downsampling: bool,
     pub max_raymarching_steps: u32,
     pub default_color_map: ColorMap,
     pub default_scaling_type: Scaling,
     pub jitter: f32,
     pub threshold_min: f32,
     pub threshold_max: f32,
+    /// Gone, now that each projection mode reads its own pyramid, but still read so that older files parse.
+    #[serde(skip_serializing)]
+    max_mode_downsampling: serde::de::IgnoredAny,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             gpu_memory_limit_mb: 384,
-            max_mode_downsampling: true,
             max_raymarching_steps: 384,
             default_color_map: ColorMap::try_from("Inferno".to_string()).unwrap(),
             default_scaling_type: Scaling::try_from("Linear".to_string()).unwrap(),
             jitter: 1.0,
             threshold_min: 0.0,
             threshold_max: 1.0,
+            max_mode_downsampling: serde::de::IgnoredAny,
         }
     }
 }
@@ -240,8 +242,8 @@ mod tests {
                 "512",
                 "--default-color-map",
                 "viridis",
-                "--max-mode-downsampling",
-                "false",
+                "--threshold-max",
+                "0.75",
             ]
             .map(String::from)
             .into_iter(),
@@ -256,10 +258,10 @@ mod tests {
         assert_eq!(
             (
                 config.gpu_memory_limit_mb,
-                config.max_mode_downsampling,
+                config.threshold_max,
                 config.jitter
             ),
-            (512, false, 0.5)
+            (512, 0.75, 0.5)
         );
         assert_eq!(
             (config.default_color_map, config.default_scaling_type),
@@ -268,5 +270,8 @@ mod tests {
 
         let err = from_toml(None, &[("max_steps".into(), "100".into())]).unwrap_err();
         assert!(err.contains("max_steps"), "{err}");
+        // A key that's gone, which the default file used to have.
+        let config = from_toml(Some("max_mode_downsampling = true"), &[]).unwrap();
+        assert!(!toml::to_string(&config).unwrap().contains("max_mode"));
     }
 }

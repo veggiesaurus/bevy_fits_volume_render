@@ -1,8 +1,6 @@
 //! The box outlines around the visible region and the selection, drawn as opaque line meshes.
 
-use bevy::{
-    asset::RenderAssetUsages, mesh::PrimitiveTopology, prelude::*, render::renderer::RenderDevice,
-};
+use bevy::{asset::RenderAssetUsages, mesh::PrimitiveTopology, prelude::*};
 
 use crate::{
     CubeState, Dataset, DatasetEntity, UNITY_FROM_LOCAL, camera::Orbit, fits::Region, region_bounds,
@@ -180,10 +178,9 @@ pub fn update_outlines(
         ),
         With<SelectionOutline>,
     >,
-    device: Res<RenderDevice>,
 ) {
     for mut transform in &mut visible_outline {
-        *transform = box_transform(state.visible(), data.info.dims);
+        *transform = box_transform(state.visible, data.info.dims);
     }
     let Ok((mut transform, mut visibility, mut material, mut outline)) =
         selection_outline.single_mut()
@@ -197,7 +194,7 @@ pub fn update_outlines(
     *transform = box_transform(selection, data.info.dims);
     // iDaVIE colours the region white, with tinted axes, when cropping to it would load at full resolution, and
     // yellow otherwise.
-    let full_res = data.factors(selection, &device) == [1; 3];
+    let full_res = state.levels.for_region(selection) == 0;
     outline.axes = full_res;
     material.0 = if full_res {
         outline_materials.white.clone()

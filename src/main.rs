@@ -7,12 +7,13 @@ mod selection;
 mod source;
 mod ui;
 mod upload;
+mod view;
 mod volume;
 mod wcs;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
-use std::time::Duration;
+use std::{sync::OnceLock, time::Duration};
 
 use bevy::{
     diagnostic::FrameTimeDiagnosticsPlugin,
@@ -25,7 +26,7 @@ use bevy::{
         storage::ShaderBuffer,
     },
     window::RequestRedraw,
-    winit::WinitSettings,
+    winit::{EventLoopProxy, EventLoopProxyWrapper, WinitSettings, WinitUserEvent},
 };
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
@@ -35,10 +36,11 @@ use axes::AxisAnnotation;
 use camera::Orbit;
 use config::Config;
 use fits::{Cube, FileInfo, Region};
-use selection::{CropRequest, Gesture, Hover, PendingCrop};
-use source::{DataSource, Event, Request};
-use upload::{UploadPlugin, Uploads};
-use volume::{NoGrid, VolumeMaterial, VolumeParams, VolumePlugin};
+use selection::{CropRequest, Gesture, Hover};
+use source::{DataSource, Event, Mode};
+use upload::{UploadPlugin, Uploads, Upsamples};
+use view::{CubeState, Levels, VolumeTexture};
+use volume::{VolumeMaterial, VolumeParams, VolumePlugin};
 
 /// Bevy's local space is right-handed; iDaVIE's (Unity) object space mirrors z. Its own inverse, so it
 /// converts either way.
@@ -46,14 +48,17 @@ const UNITY_FROM_LOCAL: Vec3 = Vec3::new(1.0, 1.0, -1.0);
 /// iDaVIE's VolumeDataSetRenderer.SelectionSaturateFactor.
 const SELECTION_SATURATE_FACTOR: f32 = 0.7;
 
-/// A texture made from a region of the cube, and the downsampling it took.
-struct VolumeTexture {
-    region: Region,
-    handle: Handle<Image>,
-    dims: [usize; 3],
-    factors: [usize; 3],
-    /// None until the source has sent the voxels.
-    grid: Option<volume::Grid>,
+static WAKE: OnceLock<EventLoopProxy<WinitUserEvent>> = OnceLock::new();
+
+/// Wakes the app from its reactive wait, from any thread: the data source has something for it.
+pub fn wake() {
+    if let Some(proxy) = WAKE.get() {
+        let _ = proxy.send_event(WinitUserEvent::WakeUp);
+    }
+}
+
+fn keep_wake_proxy(proxy: Res<EventLoopProxyWrapper>) {
+    let _ = WAKE.set((**proxy).clone());
 }
 
 #[derive(Resource)]
@@ -68,49 +73,14 @@ struct Dataset {
 
 impl Dataset {
     fn new(name: String, cube: Cube, config: Config, start: Instant) -> Self {
-        let Cube { info, data } = cube;
         Self {
             name,
-            wcs: wcs::Wcs::from_cards(&info.cards, info.axes),
-            source: DataSource::local(data, info.dims),
-            info,
+            wcs: wcs::Wcs::from_cards(&cube.info.cards, cube.info.axes),
+            info: cube.info.clone(),
+            source: DataSource::local(cube),
             config,
             load_seconds: start.elapsed().as_secs_f32(),
         }
-    }
-
-    /// A region of the cube downsampled to fit the configured GPU budget. The texture is empty until the source
-    /// has sent its voxels and `uploads` has filled it.
-    fn texture(
-        &self,
-        region: Region,
-        device: &RenderDevice,
-        images: &mut Assets<Image>,
-        uploads: &mut Uploads,
-    ) -> VolumeTexture {
-        let factors = self.factors(region, device);
-        let dims = fits::downsampled_dims(region, factors);
-        let handle = images.add(volume::empty_cube_image(dims));
-        uploads.expect(handle.id(), dims);
-        self.source.send(Request::Texture {
-            image: handle.id(),
-            region,
-            factors,
-            max_mode: self.config.max_mode_downsampling,
-        });
-        VolumeTexture {
-            region,
-            handle,
-            dims,
-            factors,
-            grid: None,
-        }
-    }
-
-    /// The downsampling `region` takes to fit the GPU budget and the device's layers, up to iDaVIE's 2048.
-    fn factors(&self, region: Region, device: &RenderDevice) -> [usize; 3] {
-        let layers = device.limits().max_texture_array_layers.min(2048) as usize;
-        fits::find_downsample_factors(self.config.gpu_memory_limit_mb, region.extent(), layers)
     }
 
     /// What was loaded, for the terminal or the browser console.
@@ -132,25 +102,6 @@ impl Dataset {
             summary.push_str(&format!("\nWarning: showing plane {planes}"));
         }
         summary
-    }
-}
-
-#[derive(Resource)]
-struct CubeState {
-    material: Handle<VolumeMaterial>,
-    full: VolumeTexture,
-    crop: Option<VolumeTexture>,
-    selection: Option<Region>,
-}
-
-impl CubeState {
-    fn texture(&self) -> &VolumeTexture {
-        self.crop.as_ref().unwrap_or(&self.full)
-    }
-
-    /// The region on screen: the crop, or the whole cube.
-    fn visible(&self) -> Region {
-        self.texture().region
     }
 }
 
@@ -177,6 +128,15 @@ impl Settings {
                 ..default()
             },
             wcs_axes: true,
+        }
+    }
+
+    /// The pyramid the projection mode reads.
+    fn mode(&self) -> Mode {
+        if self.params.projection_mode == 1 {
+            Mode::Mean
+        } else {
+            Mode::Max
         }
     }
 }
@@ -221,9 +181,8 @@ fn main() {
     .init_resource::<Hover>()
     .init_resource::<grips::Grips>()
     .init_resource::<Gesture>()
-    .init_resource::<PendingCrop>()
     .add_message::<CropRequest>()
-    .add_systems(Startup, camera::spawn_camera)
+    .add_systems(Startup, (camera::spawn_camera, keep_wake_proxy))
     .add_systems(PreUpdate, receive.run_if(resource_exists::<Dataset>))
     .add_systems(
         Update,
@@ -237,6 +196,7 @@ fn main() {
                 selection::select_region,
                 selection::selection_keys,
                 selection::apply_crop,
+                view::refine,
             )
                 .chain()
                 .run_if(resource_exists::<CubeState>),
@@ -261,8 +221,7 @@ fn main() {
         )
             .chain(),
     )
-    // Last, to see the requests this frame's systems sent. Before retire_uploads, so that a finished upload still
-    // asks for the frame that shows its texture.
+    // Before retire_uploads, so that a finished upload still asks for the frame that shows its texture.
     .add_systems(Last, keep_redrawing.before(upload::retire_uploads))
     .add_systems(
         EguiPrimaryContextPass,
@@ -280,45 +239,37 @@ fn main() {
     }
 
     #[cfg(target_arch = "wasm32")]
-    app.add_systems(Startup, web::keep_wake_proxy)
-        .add_systems(PreUpdate, web::poll);
+    app.add_systems(PreUpdate, web::poll);
     #[cfg(not(target_arch = "wasm32"))]
     {
         app.insert_resource(dataset);
         if let Ok(path) = std::env::var("SCREENSHOT") {
-            app.add_systems(Update, screenshot_and_exit(path));
+            // Frames count from when the view is in, however long the source took to cut it.
+            let settled = |state: Option<Res<CubeState>>, uploads: Res<Uploads>| {
+                state.is_some_and(|state| state.settled(&uploads))
+            };
+            app.add_systems(Update, screenshot_and_exit(path).run_if(settled));
         }
     }
 
     app.run();
 }
 
-/// Takes what the data source has sent since the last frame.
+/// Takes what the data source has sent since the last frame. Only `view::refine` marks the state changed, once a
+/// frame at most.
 fn receive(
     data: Res<Dataset>,
     mut uploads: ResMut<Uploads>,
     mut hover: ResMut<Hover>,
     mut state: Option<ResMut<CubeState>>,
-    mut pending: ResMut<PendingCrop>,
-    mut buffers: ResMut<Assets<ShaderBuffer>>,
 ) {
     for event in data.source.drain() {
         match event {
-            Event::Texture { image, data, cells } => {
-                uploads.fill(image, data);
-                // Mutable access only for the texture it's for, so nothing else counts as changed.
-                let is = |texture: &VolumeTexture| texture.handle.id() == image;
-                let shown = state
-                    .as_deref()
-                    .map(|state| (is(&state.full), state.crop.as_ref().is_some_and(is)));
-                let texture = match shown {
-                    Some((true, _)) => state.as_mut().map(|state| &mut state.full),
-                    Some((_, true)) => state.as_mut().and_then(|state| state.crop.as_mut()),
-                    _ if pending.0.as_ref().is_some_and(is) => pending.0.as_mut(),
-                    _ => None,
-                };
-                if let Some(texture) = texture {
-                    texture.grid = Some(volume::Grid::new(&cells, &mut buffers));
+            Event::Cubelet { id, cubelet } => {
+                if let Some(state) = state.as_mut() {
+                    state
+                        .bypass_change_detection()
+                        .receive(id, cubelet, &mut uploads);
                 }
             }
             Event::PixelValue { id, value } => hover.receive(id, value),
@@ -326,21 +277,18 @@ fn receive(
     }
 }
 
-/// Frames otherwise only come with input, so keep asking for them while something is still settling: a request
-/// to the data source, a crop on its way, or a new texture still on its way to the screen.
+/// Frames otherwise only come with input or when the data source wakes the app, so keep asking for them while a
+/// texture is still being written or upsampled, or still on its way to the screen.
 fn keep_redrawing(
-    data: Option<Res<Dataset>>,
-    pending: Res<PendingCrop>,
     uploads: Res<Uploads>,
     state: Option<Res<CubeState>>,
     mut settle_until: Local<Option<Instant>>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
-    if state.is_some_and(|state| state.is_changed()) {
+    if state.as_ref().is_some_and(|state| state.is_changed()) {
         *settle_until = Some(Instant::now() + Duration::from_secs(1));
     }
-    if data.is_some_and(|data| data.source.busy())
-        || pending.0.is_some()
+    if state.is_some_and(|state| state.next.is_some())
         || !uploads.is_empty()
         || settle_until.is_some_and(|until| Instant::now() < until)
     {
@@ -350,15 +298,9 @@ fn keep_redrawing(
 
 /// `SCREENSHOT=out.png` saves the window once rendering has settled, then exits.
 #[cfg(not(target_arch = "wasm32"))]
-fn screenshot_and_exit(
-    path: String,
-) -> impl FnMut(Commands, Res<Uploads>, Local<u32>, MessageWriter<AppExit>) {
+fn screenshot_and_exit(path: String) -> impl FnMut(Commands, Local<u32>, MessageWriter<AppExit>) {
     use bevy::render::view::screenshot::{Screenshot, save_to_disk};
-    move |mut commands, uploads, mut frames, mut exit| {
-        // Frames count from when the textures are in, however long the source took to build them.
-        if !uploads.is_empty() {
-            return;
-        }
+    move |mut commands, mut frames, mut exit| {
         *frames += 1;
         if *frames == 60 {
             commands
@@ -424,6 +366,8 @@ fn region_bounds(region: Region, dims: [usize; 3]) -> (Vec3, Vec3) {
     (min / dims - 0.5, (max + 1.0) / dims - 0.5)
 }
 
+/// The whole cube starts as the coarsest level's one cubelet, which the source can cut at once, and `view::refine`
+/// then upsamples that into the whole cube's level.
 fn spawn_volume(
     mut commands: Commands,
     data: Res<Dataset>,
@@ -432,19 +376,29 @@ fn spawn_volume(
     mut materials: ResMut<Assets<VolumeMaterial>>,
     mut line_materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut uploads: ResMut<Uploads>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
+    mut upsamples: ResMut<Upsamples>,
     mut orbit: Single<&mut Orbit>,
     device: Res<RenderDevice>,
-    no_grid: Res<NoGrid>,
 ) {
     for entity in &old {
         commands.entity(entity).despawn();
     }
-    let full = data.texture(
-        Region::whole(data.info.dims),
-        &device,
+    // The old cube's requests went with its source, but an upsample still to run would keep its texture forever.
+    upsamples.0.clear();
+    let dims = data.info.dims;
+    // iDaVIE's 2048 layers at most.
+    let layers = device.limits().max_texture_array_layers.min(2048) as usize;
+    let levels = Levels::new(dims, data.config.gpu_memory_limit_mb, layers);
+    data.source.open(levels.factors.clone(), levels.chain);
+    let full = VolumeTexture::new(
+        &levels,
+        Region::whole(dims),
+        levels.coarsest(),
+        false,
+        None,
         &mut images,
-        &mut uploads,
+        &mut buffers,
     );
 
     let settings = Settings::new(&data);
@@ -452,7 +406,7 @@ fn spawn_volume(
         params: settings.params,
         data_cube: full.handle.clone(),
         color_map: images.add(volume::color_map_image()),
-        grid: no_grid.0.clone(),
+        grid: full.grid.clone(),
     });
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
@@ -465,14 +419,8 @@ fn spawn_volume(
     outline::spawn_outlines(&mut commands, &mut meshes, &mut line_materials);
     commands.insert_resource(settings);
     commands.insert_resource(Gesture::default());
-    commands.insert_resource(PendingCrop::default());
     commands.insert_resource(Hover::default());
-    commands.insert_resource(CubeState {
-        material,
-        full,
-        crop: None,
-        selection: None,
-    });
+    commands.insert_resource(CubeState::new(material, levels, full, dims));
     **orbit = Orbit::default();
 }
 
@@ -480,38 +428,37 @@ fn update_material(
     settings: Res<Settings>,
     state: Res<CubeState>,
     data: Res<Dataset>,
-    no_grid: Res<NoGrid>,
     mut materials: ResMut<Assets<VolumeMaterial>>,
 ) {
     let Some(mut material) = materials.get_mut(&state.material) else {
         return;
     };
+    let dims = data.info.dims;
     let mut params = settings.params;
-    (params.slice_min, params.slice_max) = region_bounds(state.visible(), data.info.dims);
+    (params.slice_min, params.slice_max) = region_bounds(state.visible, dims);
     if let Some(selection) = state.selection {
-        (params.highlight_min, params.highlight_max) = region_bounds(selection, data.info.dims);
+        (params.highlight_min, params.highlight_max) = region_bounds(selection, dims);
         params.highlight_saturate_factor = SELECTION_SATURATE_FACTOR;
     }
-    let texture = state.texture();
-    params.set_texture(texture.dims, texture.grid.as_ref());
+    let texture = state.shown();
+    (params.texture_min, params.texture_max) = texture.bounds(dims);
+    let to_vec = |v: [usize; 3]| Vec3::from_array(v.map(|v| v as f32));
+    let visible = to_vec(state.visible.extent()) / to_vec(texture.factors);
+    let (cells, offset) = (texture.cells(), texture.grid_offset());
+    params.set_texture(texture.dims(), visible, cells, offset, texture.has_nan);
     material.params = params;
     material.data_cube = texture.handle.clone();
-    material.grid = texture
-        .grid
-        .as_ref()
-        .map_or(&no_grid.0, |grid| &grid.buffer)
-        .clone();
+    material.grid = texture.grid.clone();
 }
 
 fn show_volume(
     state: Res<CubeState>,
-    uploads: Res<Uploads>,
     mut volume: Query<&mut Visibility, With<MeshMaterial3d<VolumeMaterial>>>,
 ) {
-    let shown = if uploads.is_filling(state.texture().handle.id()) {
-        Visibility::Hidden
-    } else {
+    let shown = if state.shown().drawable() {
         Visibility::Inherited
+    } else {
+        Visibility::Hidden
     };
     for mut visibility in &mut volume {
         visibility.set_if_neq(shown);

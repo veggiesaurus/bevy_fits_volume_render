@@ -120,7 +120,7 @@ pub fn drag_grips(
         let Some(hit) = grip_hit(grip, anchor, ray.origin, *ray.direction, forward) else {
             return;
         };
-        let selection = resize(start, grip, anchor + hit - start_hit, dims, state.visible());
+        let selection = resize(start, grip, anchor + hit - start_hit, dims, state.visible);
         if state.selection != Some(selection) {
             state.selection = Some(selection);
         }

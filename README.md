@@ -20,7 +20,6 @@ The config lives at `$XDG_CONFIG_HOME/idavie-bevy/config.toml` (`~/.config/idavi
 
 ```toml
 gpu_memory_limit_mb = 384       # texture budget; the cube is downsampled to fit, as in iDaVIE
-max_mode_downsampling = true    # max rather than mean when downsampling
 max_raymarching_steps = 384
 default_color_map = "Inferno"   # any name from iDaVIE's ColorMapEnum
 default_scaling_type = "Linear" # Linear, Log, Sqrt, Square, Power or Gamma
@@ -29,7 +28,7 @@ threshold_min = 0.0             # where the colour map starts and ends, as fract
 threshold_max = 1.0
 ```
 
-The view only redraws on input (and while a crop is being built), so an idle window leaves the GPU alone. Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping reloads that region from the full resolution data in the background and keeps the selection, the same as iDaVIE, and the panel shows the downsampling factors before and after.
+The view only redraws on input (and while data is still arriving), so an idle window leaves the GPU alone. Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping keeps the selection, the same as iDaVIE. A crop the texture on screen already holds finely enough is immediate; otherwise it starts from the current view and sharpens as the finer data arrives, and the panel shows the downsampling factors before and after. Every cube comes up the same way, coarse first.
 
 `SCREENSHOT=out.png` saves a frame once rendering has settled and exits, which is handy for side by side comparisons with iDaVIE.
 
@@ -57,7 +56,8 @@ The shader takes the same samples as iDaVIE's, apart from the step changes below
 - only point filtering (iDaVIE's `bilinearFiltering` is off by default)
 - uncompressed FITS only (funpack a tile-compressed `.fits.fz` first), showing the first three axes longer than 1 (a 2D image is one plane) and the first plane of any others (Stokes I of an IQU cube), and the cube is always shown with X=Y=Z proportions
 - integer BLANK values become NaN; iDaVIE turns off cfitsio's null check and shows them as `BZERO + BSCALE * BLANK`
-- downsampling a crop clamps edge blocks to the crop rather than to the full cube, which looks like a latent bug in iDaVIE's `DataCropAndDownsample`
+- the cube is downsampled to a fixed set of power-of-two levels, plus iDaVIE's factors for the whole cube when they aren't one of them, with blocks aligned to the whole cube. So a crop can get up to 2.6x fewer texels than in iDaVIE, whose factors step through 1, 2, 3, 4, 5
+- Maximum reads a max-downsampled copy and Average a mean-downsampled one, where iDaVIE's config picks one for both
 - the downsampling factors are checked against the rounded up texture size, for the memory budget as well as the 2048 texel limit. iDaVIE checks the rounded down size, which lets an axis come out at 2049 texels (over the 3D texture limit) or the texture go slightly over budget
 - the step length is iDaVIE's, the square root of the slice diagonal over `max_raymarching_steps`, but a ray can take up to that square root times `max_raymarching_steps` steps. iDaVIE stops at `max_raymarching_steps`, so on the full cube its rays longer than about 1.32 (corner-on views) jump to a single sample one step short of the far face
 - in Average mode the last sample is weighted by the length left over. iDaVIE's weight is negative, and on rays one or two steps long it can take the summed length to zero or below, so the average blows up or changes sign at the edges

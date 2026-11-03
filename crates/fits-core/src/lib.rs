@@ -6,7 +6,9 @@ use bevy_tasks::{ComputeTaskPool, TaskPool};
 use bevy_tasks::{ParallelSlice, ParallelSliceMut};
 
 mod cubelet;
-pub use cubelet::{CUBELET, Cell, Cubelet, Level, Levels, Voxels, cell_summary, cubelet, levels};
+pub use cubelet::{
+    CUBELET, Cell, Cubelet, Level, Levels, Voxels, cubelet, cubelet_region, grow, levels,
+};
 
 const BLOCK: usize = 2880;
 /// Voxels read, decoded and summarised per task: 4 MB of output, small enough to stay in cache.
@@ -96,11 +98,14 @@ impl Cube {
     /// channels where it's zero, such as zero-filled or flagged ones. Where every channel is like that, the
     /// histogram's IQR / 1.349, as for heavily quantised data. None when the cube has no finite voxels.
     pub fn sigma(&self) -> Option<f64> {
-        // About 64 x 64 voxels a channel, stepping x and y apart so that the step can't alias with the width.
+        // About 64 x 64 voxels a channel, stepping x and y apart so that the step can't alias with the width, in
+        // up to 256 channels.
         const GRID: usize = 64;
-        let [width, height, _] = self.info.dims;
+        const CHANNELS: usize = 256;
+        let [width, height, depth] = self.info.dims;
         let (step_x, step_y) = (width.div_ceil(GRID), height.div_ceil(GRID));
         let mut mads: Vec<f32> = (self.data.chunks(width * height))
+            .step_by(depth.div_ceil(CHANNELS))
             .filter_map(|channel| {
                 let mut values: Vec<f32> = (channel.chunks(width).step_by(step_y))
                     .flat_map(|row| row.iter().step_by(step_x))
@@ -647,6 +652,11 @@ impl Moments {
     }
 }
 
+/// The R32Float texels a GPU budget of `gpu_memory_limit_mb` holds, at least one so that a budget of zero still ends.
+pub fn texel_budget(gpu_memory_limit_mb: u64) -> u64 {
+    (gpu_memory_limit_mb.saturating_mul(1_000_000) / 4).max(1)
+}
+
 /// The factors that fit `extent` in the GPU budget, with no side over 2048 texels and at most `max_depth` layers.
 pub fn find_downsample_factors(
     gpu_memory_limit_mb: u64,
@@ -663,8 +673,7 @@ pub fn find_downsample_factors(
     while z.div_ceil(fz) > max_depth.max(1) as u64 {
         fz += 1;
     }
-    // At least one, so that a budget of zero still ends.
-    let max_elements = (gpu_memory_limit_mb.saturating_mul(1_000_000) / 4).max(1);
+    let max_elements = texel_budget(gpu_memory_limit_mb);
     while x.div_ceil(fx) * y.div_ceil(fy) * z.div_ceil(fz) > max_elements {
         if z / fz > x / fx || z / fz > y / fy {
             fz += 1;

@@ -1,17 +1,16 @@
 //! Shift-drag region selection, and cropping the volume to it.
 
-use bevy::{prelude::*, render::renderer::RenderDevice};
+use bevy::prelude::*;
 use bevy_egui::input::EguiWantsInput;
 
 use crate::{
-    CubeState, Dataset, UNITY_FROM_LOCAL, VolumeTexture,
+    CubeState, Dataset, UNITY_FROM_LOCAL,
     camera::{DEFAULT_DISTANCE, Orbit, pointer},
     fits::Region,
     grips::GripDrag,
     outline::box_transform,
     region_bounds,
     source::{DataSource, Request},
-    upload::Uploads,
 };
 
 /// The voxel under the cursor, and its value once the data source has sent it.
@@ -39,18 +38,6 @@ impl Hover {
             && asked == id
         {
             self.value = Some((voxel, value));
-        }
-    }
-}
-
-/// A crop on its way: its texture built in the background, then uploaded over a few frames.
-#[derive(Resource, Default)]
-pub struct PendingCrop(pub Option<VolumeTexture>);
-
-impl PendingCrop {
-    fn cancel(&mut self, source: &DataSource) {
-        if let Some(crop) = self.0.take() {
-            source.cancel(crop.handle.id());
         }
     }
 }
@@ -109,7 +96,7 @@ pub fn select_region(
 ) {
     let (camera, camera_transform) = *camera;
     let dims = data.info.dims;
-    let visible = state.visible();
+    let visible = state.visible;
     let axis = match *gesture {
         Gesture::Select(drag) => drag.axis,
         _ => (camera_transform.forward().as_vec3() * UNITY_FROM_LOCAL)
@@ -187,53 +174,30 @@ pub fn selection_keys(
         crop_requests.write(CropRequest::ToSelection);
     }
     // As the Reset button, which is disabled with no crop.
-    if keys.just_pressed(KeyCode::KeyR) && state.crop.is_some() {
+    if keys.just_pressed(KeyCode::KeyR) && state.cropped() {
         crop_requests.write(CropRequest::Reset);
     }
 }
 
-/// Cropping keeps the selection, as iDaVIE's CropToFeature does, so a reset still shows where the crop was.
-/// The crop's texture is built and uploaded in the background, and swapped in when it's ready.
+/// Cropping keeps the selection, as iDaVIE's CropToFeature does, so a reset still shows where the crop was. A crop
+/// moves the clip bounds at once, and `view::refine` brings in finer data if it needs it.
 pub fn apply_crop(
     mut requests: MessageReader<CropRequest>,
     data: Res<Dataset>,
     mut state: ResMut<CubeState>,
-    mut pending: ResMut<PendingCrop>,
-    mut images: ResMut<Assets<Image>>,
-    mut uploads: ResMut<Uploads>,
     mut orbit: Single<&mut Orbit>,
-    device: Res<RenderDevice>,
 ) {
-    let mut framed = false;
+    let mut visible = state.visible;
     for request in requests.read() {
         match request {
-            CropRequest::ToSelection => {
-                let Some(region) = state.selection else {
-                    continue;
-                };
-                if pending.0.as_ref().is_some_and(|crop| crop.region == region) {
-                    continue;
-                }
-                // Cropping back to the region on screen drops a different crop that's on its way.
-                pending.cancel(&data.source);
-                if state.crop.as_ref().is_none_or(|crop| crop.region != region) {
-                    pending.0 = Some(data.texture(region, &device, &mut images, &mut uploads));
-                }
-            }
-            CropRequest::Reset => {
-                pending.cancel(&data.source);
-                state.crop = None;
-                framed = true;
-            }
+            CropRequest::ToSelection => visible = state.selection.unwrap_or(visible),
+            CropRequest::Reset => visible = Region::whole(data.info.dims),
         }
     }
-    if (pending.0.as_ref()).is_some_and(|crop| !uploads.is_filling(crop.handle.id())) {
-        state.crop = pending.0.take();
-        framed = true;
-    }
-    if framed {
-        let visible = box_transform(state.visible(), data.info.dims);
-        orbit.target = visible.translation;
-        orbit.distance = DEFAULT_DISTANCE * visible.scale.max_element();
+    if visible != state.visible {
+        state.visible = visible;
+        let framed = box_transform(visible, data.info.dims);
+        orbit.target = framed.translation;
+        orbit.distance = DEFAULT_DISTANCE * framed.scale.max_element();
     }
 }

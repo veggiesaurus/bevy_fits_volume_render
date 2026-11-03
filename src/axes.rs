@@ -22,7 +22,7 @@ pub fn update_axes(
     state: Res<CubeState>,
     axes: Option<Res<AxisAnnotation>>,
 ) {
-    let visible = state.visible();
+    let visible = state.visible;
     if !data.is_changed() && axes.map_or(data.wcs.is_none(), |a| a.visible == visible) {
         return;
     }

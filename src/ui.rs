@@ -96,6 +96,7 @@ fn cube_section(
     let stats = info.stats;
     let gb = (info.dims.iter().product::<usize>() * size_of::<f32>()) as f64 / 1e9;
     let unit = info.unit().map_or(String::new(), |u| format!(" {u}"));
+    let cropped = state.cropped();
     egui::Grid::new("cube").num_columns(2).show(ui, |ui| {
         let mut row = |name: &str, value: String| {
             ui.label(name);
@@ -120,24 +121,26 @@ fn cube_section(
         );
         row("Non-finite voxels", stats.non_finite.to_string());
         row("Load time", format!("{:.2} s", data.load_seconds));
-        let texture = state.texture();
+        let texture = state.shown();
         let [fx, fy, fz] = texture.factors;
         let resolution = if texture.factors == [1; 3] {
             "full resolution".to_string()
         } else {
             format!("downsampled {fx} x {fy} x {fz}")
         };
-        let mb = (texture.dims.iter().product::<usize>() * size_of::<f32>()) as f64 / 1e6;
+        let dims = texture.dims();
+        let mb = (dims.iter().product::<usize>() * size_of::<f32>()) as f64 / 1e6;
         row(
             "Texture",
-            format!("{} ({mb:.0} MB), {resolution}", format_dims(texture.dims)),
+            format!("{} ({mb:.0} MB), {resolution}", format_dims(dims)),
         );
         row(
             "Showing",
-            state
-                .crop
-                .as_ref()
-                .map_or("entire cube".to_string(), |crop| format_region(crop.region)),
+            if cropped {
+                format_region(state.visible)
+            } else {
+                "entire cube".to_string()
+            },
         );
         if let Some(selection) = state.selection {
             row("Selection", format_region(selection));
@@ -165,7 +168,7 @@ fn cube_section(
         if button(ui, state.selection.is_some(), "Crop to selection").clicked() {
             crop_requests.write(CropRequest::ToSelection);
         }
-        if button(ui, state.crop.is_some(), "Reset crop").clicked() {
+        if button(ui, cropped, "Reset crop").clicked() {
             crop_requests.write(CropRequest::Reset);
         }
     });
