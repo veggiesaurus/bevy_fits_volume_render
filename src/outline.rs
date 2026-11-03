@@ -10,10 +10,21 @@ pub struct SelectionOutline;
 #[derive(Component)]
 pub struct CubeOutline;
 
-/// A box outline drawn as line meshes; `hidden` caches the last hidden-edge mask written to its colours.
+/// A box outline drawn as line meshes. `axes` tints the edges at the first voxel's corner as iDaVIE does, and
+/// `written` caches the hidden-edge mask and tint last written to its colours.
 #[derive(Component, Default)]
 pub struct Outline {
-    pub hidden: Option<u16>,
+    pub axes: bool,
+    written: Option<(u16, bool)>,
+}
+
+impl Outline {
+    pub fn with_axes() -> Self {
+        Self {
+            axes: true,
+            ..default()
+        }
+    }
 }
 
 #[derive(Resource)]
@@ -64,7 +75,21 @@ pub fn hidden_edges(eye: Vec3) -> u16 {
     })
 }
 
-/// Draws an outline's hidden edges dark grey so the box reads as solid on a flat screen.
+/// iDaVIE's X, Y and Z colours on the three edges that meet at the first voxel's corner, white elsewhere. Unity
+/// mirrors z, so that corner is at (0, 0, 1) in `edge_ends` coordinates.
+fn edge_colour(e: usize, axes: bool) -> LinearRgba {
+    let axis = e / 4;
+    let (start, _) = edge_ends(e);
+    if axes && (0..3).all(|i| i == axis || start[i] == [0.0, 0.0, 1.0][i]) {
+        let mut rgb = [0.3; 3];
+        rgb[axis] = 1.0;
+        Color::srgb_from_array(rgb).into()
+    } else {
+        LinearRgba::WHITE
+    }
+}
+
+/// Draws an outline's hidden edges dark so the box reads as solid on a flat screen.
 pub fn shade_hidden_edges(
     cameras: Query<&Transform, With<Orbit>>,
     mut outlines: Query<(&Transform, &Mesh3d, &mut Outline)>,
@@ -78,23 +103,25 @@ pub fn shade_hidden_edges(
             .compute_affine()
             .inverse()
             .transform_point3(camera.translation);
-        let hidden = hidden_edges(eye);
-        if outline.hidden == Some(hidden) {
+        let written = (hidden_edges(eye), outline.axes);
+        if outline.written == Some(written) {
             continue;
         }
         if let Some(mut mesh) = meshes.get_mut(&mesh.0) {
-            // Linear 0.1 is about 35% grey once encoded to sRGB.
             let colours: Vec<[f32; 4]> = (0..24)
                 .map(|v| {
-                    if hidden >> (v / 2) & 1 == 1 {
-                        [0.1, 0.1, 0.1, 1.0]
+                    let colour = edge_colour(v / 2, outline.axes);
+                    // Linear 0.1 is about 35% grey once encoded to sRGB.
+                    let shade = if written.0 >> (v / 2) & 1 == 1 {
+                        0.1
                     } else {
-                        [1.0; 4]
-                    }
+                        1.0
+                    };
+                    (colour * shade).with_alpha(1.0).to_f32_array()
                 })
                 .collect();
             mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
-            outline.hidden = Some(hidden);
+            outline.written = Some(written);
         }
     }
 }
@@ -115,6 +142,7 @@ pub fn update_outlines(
             &mut Transform,
             &mut Visibility,
             &mut MeshMaterial3d<StandardMaterial>,
+            &mut Outline,
         ),
         With<SelectionOutline>,
     >,
@@ -125,7 +153,8 @@ pub fn update_outlines(
     for mut transform in &mut cube {
         *transform = box_transform(state.visible(&data), data.cube.dims);
     }
-    let Ok((mut transform, mut visibility, mut material)) = outline.single_mut() else {
+    let Ok((mut transform, mut visibility, mut material, mut outline)) = outline.single_mut()
+    else {
         return;
     };
     let Some(selection) = state.selection else {
@@ -133,10 +162,12 @@ pub fn update_outlines(
         return;
     };
     *transform = box_transform(selection, data.cube.dims);
-    // iDaVIE colours the region white when cropping to it would load at full resolution, yellow otherwise.
+    // iDaVIE colours the region white, with tinted axes, when cropping to it would load at full resolution, and
+    // yellow otherwise.
     let full_res =
         fits::find_downsample_factors(data.config.gpu_memory_limit_mb, selection.extent())
             == [1; 3];
+    outline.axes = full_res;
     material.0 = if full_res {
         outline_materials.white.clone()
     } else {
@@ -157,5 +188,17 @@ mod tests {
         // Those three meet at the far corner, (-0.5, -0.5, -0.5).
         assert!((0..12).all(|e| corner >> e & 1 == 0 || edge_ends(e).0 == [0.0; 3]));
         assert_eq!(hidden_edges(Vec3::ZERO), 0xfff);
+    }
+
+    #[test]
+    fn axis_tints_meet_at_the_first_voxel() {
+        let tinted: Vec<usize> = (0..12)
+            .filter(|&e| edge_colour(e, true) != LinearRgba::WHITE)
+            .collect();
+        assert_eq!(tinted, [2, 5, 8]);
+        for e in tinted {
+            let (start, end) = edge_ends(e);
+            assert!(start == [0.0, 0.0, 1.0] || end == [0.0, 0.0, 1.0]);
+        }
     }
 }

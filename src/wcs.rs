@@ -7,18 +7,24 @@ use starlink_ast::frames::{DSBSpecFrame, FrameSet, SkyFrame, SpecFrame, SpecSyst
 use starlink_ast::prelude::*;
 use starlink_ast::{AnyObject, FitsChan};
 
-// FrameSet is Send but not Sync, and a Bevy Resource needs both.
-pub struct Wcs(Mutex<FrameSet>);
+pub struct Wcs {
+    // FrameSet is Send but not Sync, and a Bevy Resource needs both.
+    frames: Mutex<FrameSet>,
+    /// The FITS pixel axes (0-based) shown as the cube's x, y and z.
+    axes: [usize; 3],
+}
 
 impl Wcs {
     /// None when the header has no WCS; an AST error reading it is logged.
-    pub fn from_cards(cards: &[String]) -> Option<Wcs> {
+    pub fn from_cards(cards: &[String], axes: [usize; 3]) -> Option<Wcs> {
         let read = || {
             let mut chan = FitsChan::new()?;
-            // Commentary cards hold no WCS but dominate read time in long (e.g. CASA) headers.
+            // Commentary cards hold no WCS but dominate read time in long (e.g. CASA) headers. A keyword with
+            // '=' in it ("OBJECT='M42'") would make AST reject the whole header.
             let header: String = cards
                 .iter()
                 .filter(|c| !matches!(c[..8].trim_end(), "COMMENT" | "HISTORY" | ""))
+                .filter(|c| !c[..8].contains('='))
                 .map(String::as_str)
                 .collect();
             chan.put_cards(&header)?;
@@ -42,11 +48,26 @@ impl Wcs {
             // Setting Unit on the FrameSet remaps it, so transformed values come out in the new unit.
             let _ = fs.set_unit(axis, unit);
         }
-        Some(Wcs(Mutex::new(fs)))
+        Some(Wcs {
+            frames: Mutex::new(fs),
+            axes,
+        })
+    }
+
+    /// The GRID position of the cube's x, y and z `grid`, on the shown (first) plane of any other axes.
+    fn grid_point(&self, nin: usize, grid: [f64; 3]) -> Vec<f64> {
+        (0..nin)
+            .map(|p| {
+                self.axes
+                    .iter()
+                    .position(|&a| a == p)
+                    .map_or(1.0, |i| grid[i])
+            })
+            .collect()
     }
 
     pub fn summary(&self) -> Vec<String> {
-        let fs = self.0.lock().unwrap();
+        let fs = self.frames.lock().unwrap();
         let frame = fs.current();
         let mut lines = vec![frame.title().unwrap_or_default()];
         for axis in 1..=frame.naxes() {
@@ -56,7 +77,10 @@ impl Wcs {
                 None => label,
             });
             if let Some(spec) = spec_frame(frame, axis) {
-                lines.push(format!("Standard of rest: {}", spec.std_of_rest().as_str()));
+                // Without SPECSYS this is only AST's default.
+                if spec.test_std_of_rest() {
+                    lines.push(format!("Standard of rest: {}", spec.std_of_rest().as_str()));
+                }
                 if spec.test_rest_freq() {
                     lines.push(format!("Rest frequency: {:.4} MHz", spec.rest_freq() / 1e6));
                 }
@@ -66,10 +90,8 @@ impl Wcs {
     }
 
     pub fn grid_to_world(&self, grid: [f64; 3]) -> Option<Vec<String>> {
-        let fs = self.0.lock().unwrap();
-        let point: Vec<f64> = (0..fs.nin())
-            .map(|i| grid.get(i).copied().unwrap_or(1.0))
-            .collect();
+        let fs = self.frames.lock().unwrap();
+        let point = self.grid_point(fs.nin(), grid);
         let mut world = fs
             .transform(&PointSet::from_rows([point]), true)
             .ok()?
@@ -91,9 +113,10 @@ impl Wcs {
             .collect()
     }
 
-    /// "Declination", "Frequency (MHz)" and so on, for world `axis` (1-based).
-    pub fn axis_title(&self, axis: usize) -> Option<String> {
-        let fs = self.0.lock().unwrap();
+    /// "Declination", "Frequency (MHz)" and so on, for the cube's `cube_axis` (1-based x, y or z).
+    pub fn axis_title(&self, cube_axis: usize) -> Option<String> {
+        let axis = self.axes[cube_axis - 1] + 1;
+        let fs = self.frames.lock().unwrap();
         let frame = fs.current();
         if axis > frame.naxes() {
             return None;
@@ -105,27 +128,24 @@ impl Wcs {
         })
     }
 
-    /// Ticks at round values of world `axis` (1-based) along the straight GRID-space segment
-    /// `from`..`to`. Stands in for AST's Plot3D grid, which the Rust port doesn't include.
-    pub fn edge_ticks(&self, axis: usize, from: [f64; 3], to: [f64; 3]) -> Vec<Tick> {
+    /// Ticks at round values of the world axis along the cube's `cube_axis` (1-based x, y or z), on the
+    /// straight segment `from`..`to` in the cube's GRID coordinates. Stands in for AST's Plot3D grid, which
+    /// the Rust port doesn't include.
+    pub fn edge_ticks(&self, cube_axis: usize, from: [f64; 3], to: [f64; 3]) -> Vec<Tick> {
         const SAMPLES: usize = 64;
-        let fs = self.0.lock().unwrap();
+        let axis = self.axes[cube_axis - 1] + 1;
+        let fs = self.frames.lock().unwrap();
         if axis > fs.naxes() {
             return Vec::new();
         }
-        let grid: Vec<Vec<f64>> = (0..fs.nin())
-            .map(|i| {
-                (0..SAMPLES)
-                    .map(|s| match i {
-                        0..3 => from[i] + (to[i] - from[i]) * s as f64 / (SAMPLES - 1) as f64,
-                        _ => 1.0,
-                    })
-                    .collect()
-            })
-            .collect();
-        let columns: Vec<&[f64]> = grid.iter().map(Vec::as_slice).collect();
-        let Ok(world) = PointSet::from_columns(&columns).and_then(|g| fs.transform(&g, true))
-        else {
+        let grid = (0..SAMPLES).map(|s| {
+            let t = s as f64 / (SAMPLES - 1) as f64;
+            self.grid_point(
+                fs.nin(),
+                std::array::from_fn(|i| from[i] + (to[i] - from[i]) * t),
+            )
+        });
+        let Ok(world) = fs.transform(&PointSet::from_rows(grid), true) else {
             return Vec::new();
         };
         let bad = |v: f64| v == BAD_VALUE || !v.is_finite();
@@ -296,12 +316,49 @@ mod tests {
     #[test]
     fn real_cube_centre() {
         let cards: Vec<String> = CARDS.iter().map(|c| format!("{c:<80}")).collect();
-        assert!(Wcs::from_cards(&cards[..4]).is_none());
-        let wcs = Wcs::from_cards(&cards).unwrap();
+        assert!(Wcs::from_cards(&cards[..4], [0, 1, 2]).is_none());
+        let wcs = Wcs::from_cards(&cards, [0, 1, 2]).unwrap();
         assert_eq!(
             wcs.grid_to_world([270.5, 270.5, 11.0]).unwrap(),
             ["2:21:36.5", "-5:31:16", "1409.82 MHz"]
         );
+    }
+
+    #[test]
+    fn frequency_after_a_skipped_stokes_axis_is_z() {
+        let cards: Vec<String> = [
+            "NAXIS   = 4",
+            "NAXIS1  = 2",
+            "NAXIS2  = 2",
+            "NAXIS3  = 1",
+            "NAXIS4  = 4",
+            "CTYPE1  = 'RA---SIN'",
+            "CTYPE2  = 'DEC--SIN'",
+            "CTYPE3  = 'STOKES'",
+            "CTYPE4  = 'FREQ'",
+            "CRVAL1  = 10.0",
+            "CRVAL2  = -30.0",
+            "CRVAL3  = 1.0",
+            "CRVAL4  = 1.4E9",
+            "CDELT1  = -0.001",
+            "CDELT2  = 0.001",
+            "CDELT3  = 1.0",
+            "CDELT4  = 1.0E6",
+            "CUNIT4  = 'Hz'",
+            "CRPIX1  = 1.0",
+            "CRPIX2  = 1.0",
+            "CRPIX3  = 1.0",
+            "CRPIX4  = 1.0",
+        ]
+        .iter()
+        .map(|c| format!("{c:<80}"))
+        .collect();
+        let wcs = Wcs::from_cards(&cards, [0, 1, 3]).unwrap();
+        assert_eq!(wcs.axis_title(3).as_deref(), Some("Frequency (MHz)"));
+        assert_eq!(wcs.grid_to_world([1.0, 1.0, 3.0]).unwrap()[3], "1402 MHz");
+        let ticks = wcs.edge_ticks(3, [0.5, 0.5, 0.5], [0.5, 0.5, 4.5]);
+        let labels: Vec<&str> = ticks.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, ["1400", "1401", "1402", "1403"]);
     }
 
     #[test]
@@ -314,7 +371,7 @@ mod tests {
             _ => format!("{c:<80}"),
         };
         let cards: Vec<String> = CARDS.iter().map(swap).collect();
-        let wcs = Wcs::from_cards(&cards).unwrap();
+        let wcs = Wcs::from_cards(&cards, [0, 1, 2]).unwrap();
         let dec = wcs.edge_ticks(1, [0.5, 0.5, 0.5], [540.5, 0.5, 0.5]);
         let ra = wcs.edge_ticks(2, [0.5, 0.5, 0.5], [0.5, 540.5, 0.5]);
         let labels = |t: &[super::Tick]| t.iter().map(|t| t.label.clone()).collect::<Vec<_>>();
@@ -333,7 +390,7 @@ mod tests {
     #[test]
     fn edge_ticks_at_round_values() {
         let cards: Vec<String> = CARDS.iter().map(|c| format!("{c:<80}")).collect();
-        let wcs = Wcs::from_cards(&cards).unwrap();
+        let wcs = Wcs::from_cards(&cards, [0, 1, 2]).unwrap();
         // Channels span 1407.63 to 1412.01 MHz, so 1 MHz steps.
         let freq = wcs.edge_ticks(3, [0.5, 0.5, 0.5], [0.5, 0.5, 21.5]);
         let labels: Vec<&str> = freq.iter().map(|t| t.label.as_str()).collect();
@@ -366,10 +423,11 @@ mod tests {
         .iter()
         .map(|c| format!("{c:<80}"))
         .collect();
-        let ra =
-            Wcs::from_cards(&at_zero)
-                .unwrap()
-                .edge_ticks(1, [0.5, 50.5, 1.0], [100.5, 50.5, 1.0]);
+        let ra = Wcs::from_cards(&at_zero, [0, 1, 2]).unwrap().edge_ticks(
+            1,
+            [0.5, 50.5, 1.0],
+            [100.5, 50.5, 1.0],
+        );
         let labels: Vec<&str> = ra.iter().map(|t| t.label.as_str()).collect();
         assert!(
             labels.contains(&"0:00") && labels.contains(&"23:59"),

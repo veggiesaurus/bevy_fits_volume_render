@@ -104,6 +104,9 @@ pub fn cube_section(
             "Dimensions",
             format!("{} ({gb:.2} GB)", format_dims(cube.dims)),
         );
+        if let Some(planes) = cube.other_planes() {
+            row("Plane", planes);
+        }
         row(
             "Range",
             format!("{:.4e} .. {:.4e}{unit}", stats.min, stats.max),
@@ -205,7 +208,6 @@ pub fn rendering_section(ui: &mut egui::Ui, data: &Dataset, settings: &mut ResMu
     });
     ui.add(egui::Slider::new(&mut p.jitter, JITTER).text("Jitter"));
     ui.add(egui::Slider::new(&mut p.max_steps, RAYMARCHING_STEPS).text("Ray-marching steps"));
-    ui.checkbox(&mut s.skip_empty_space, "Skip empty space (experimental)");
     if data.wcs.is_some() {
         ui.checkbox(&mut s.wcs_axes, "WCS axes");
     }

@@ -6,16 +6,24 @@ mod grips;
 mod outline;
 mod selection;
 mod ui;
+mod upload;
 mod volume;
 mod wcs;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use bevy::{
-    diagnostic::FrameTimeDiagnosticsPlugin, platform::time::Instant, prelude::*,
-    window::RequestRedraw, winit::WinitSettings,
+    diagnostic::FrameTimeDiagnosticsPlugin,
+    platform::time::Instant,
+    prelude::*,
+    render::{
+        RenderPlugin,
+        settings::{WgpuFeatures, WgpuSettings},
+    },
+    window::RequestRedraw,
+    winit::WinitSettings,
 };
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
@@ -24,6 +32,7 @@ use config::Config;
 use fits::Cube;
 use outline::{CubeOutline, Outline, OutlineMaterials, SelectionOutline, box_lines};
 use selection::{CropCommand, Gesture, Hover, PendingCrop};
+use upload::{UploadPlugin, Uploads};
 use volume::{VolumeMaterial, VolumeParams, VolumePlugin};
 
 /// Bevy's local space is right-handed; iDaVIE's (Unity) object space mirrors z.
@@ -51,28 +60,28 @@ impl Region {
     }
 }
 
-/// A texture made from a region of the cube, its brick ranges, and the downsampling it took.
+/// A texture made from a region of the cube, and the downsampling it took.
 #[derive(Clone)]
 struct VolumeTexture {
     handle: Handle<Image>,
-    bricks: Handle<Image>,
     dims: [usize; 3],
     factors: [usize; 3],
 }
 
-/// A VolumeTexture's images before they're added as assets, so they can be built off the main thread.
-struct TextureImages {
-    data: Image,
-    bricks: Image,
+/// A VolumeTexture's bytes, built off the main thread and then uploaded a slab at a time.
+struct TextureBytes {
+    bytes: Vec<u8>,
     dims: [usize; 3],
     factors: [usize; 3],
 }
 
-impl TextureImages {
-    fn add(self, images: &mut Assets<Image>) -> VolumeTexture {
+impl TextureBytes {
+    /// The texture is empty until `uploads` has filled it.
+    fn upload(self, images: &mut Assets<Image>, uploads: &mut Uploads) -> VolumeTexture {
+        let handle = images.add(volume::empty_cube_image(self.dims));
+        uploads.push(handle.id(), self.dims, self.bytes);
         VolumeTexture {
-            handle: images.add(self.data),
-            bricks: images.add(self.bricks),
+            handle,
             dims: self.dims,
             factors: self.factors,
         }
@@ -91,7 +100,10 @@ struct Dataset {
 
 impl Dataset {
     fn new(name: String, cube: Cube, config: Config, start: Instant) -> Self {
-        let wcs = wcs::Wcs::from_cards(&cube.cards);
+        let wcs = wcs::Wcs::from_cards(&cube.cards, cube.axes);
+        if let Some(planes) = cube.other_planes() {
+            warn!("{name}: showing plane {planes}");
+        }
         Self {
             name,
             cube: Arc::new(cube),
@@ -133,7 +145,6 @@ impl CubeState {
 struct Settings {
     params: VolumeParams,
     wcs_axes: bool,
-    skip_empty_space: bool,
 }
 
 #[derive(Component)]
@@ -144,19 +155,32 @@ fn main() {
     let dataset = load_native();
 
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "iDaVIE volume renderer (Bevy)".into(),
-            canvas: Some("#bevy".into()),
-            fit_canvas_to_parent: true,
-            ..default()
-        }),
-        ..default()
-    }))
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "iDaVIE volume renderer (Bevy)".into(),
+                    canvas: Some("#bevy".into()),
+                    fit_canvas_to_parent: true,
+                    ..default()
+                }),
+                ..default()
+            })
+            // Keeps R32Float unfilterable on every device, which the cube's non-filtering sampler needs.
+            .set(RenderPlugin {
+                render_creation: WgpuSettings {
+                    disabled_features: Some(WgpuFeatures::FLOAT32_FILTERABLE),
+                    ..default()
+                }
+                .into(),
+                ..default()
+            }),
+    )
     .add_plugins((
         EguiPlugin::default(),
         FrameTimeDiagnosticsPlugin::default(),
         VolumePlugin,
+        UploadPlugin,
     ))
     .insert_resource(ClearColor(Color::BLACK))
     .init_resource::<Hover>()
@@ -181,6 +205,7 @@ fn main() {
             camera::orbit_camera,
             (
                 update_material,
+                show_volume,
                 axes::update_axes,
                 outline::update_outlines,
                 outline::shade_hidden_edges,
@@ -221,6 +246,7 @@ fn main() {
 /// being built, or a new texture still on its way to the screen.
 fn keep_redrawing(
     pending: Res<PendingCrop>,
+    uploads: Res<Uploads>,
     state: Option<Res<CubeState>>,
     mut settle_until: Local<Option<Instant>>,
     mut redraw: MessageWriter<RequestRedraw>,
@@ -228,7 +254,10 @@ fn keep_redrawing(
     if state.is_some_and(|state| state.is_changed()) {
         *settle_until = Some(Instant::now() + Duration::from_secs(1));
     }
-    if pending.0.is_some() || settle_until.is_some_and(|until| Instant::now() < until) {
+    if pending.0.is_some()
+        || !uploads.is_empty()
+        || settle_until.is_some_and(|until| Instant::now() < until)
+    {
         redraw.write(RequestRedraw);
     }
 }
@@ -302,28 +331,26 @@ fn load_native() -> Dataset {
         "Range {} .. {}, mean {:.4e}, std {:.4e}, {} non-finite voxels",
         s.min, s.max, s.mean, s.std, s.non_finite
     );
+    // Logging only starts with the app, so Dataset::new's warning doesn't reach the terminal.
+    if let Some(planes) = dataset.cube.other_planes() {
+        println!("Warning: showing plane {planes}");
+    }
     dataset
 }
 
-/// Texture and brick ranges for a region of the cube, downsampled to fit the configured GPU budget.
-fn region_images(cube: &Cube, config: &Config, region: Region) -> TextureImages {
+/// Texture for a region of the cube, downsampled to fit the configured GPU budget.
+fn region_bytes(cube: &Cube, config: &Config, region: Region) -> TextureBytes {
     let start = Instant::now();
     let factors = fits::find_downsample_factors(config.gpu_memory_limit_mb, region.extent());
-    let (dims, values) = if region == Region::whole(cube.dims) && factors == [1; 3] {
-        (cube.dims, Cow::Borrowed(&cube.data[..]))
-    } else {
-        let (dims, values) = fits::crop_and_downsample(
-            cube,
-            region.min,
-            region.max,
-            factors,
-            config.max_mode_downsampling,
-        );
-        (dims, Cow::Owned(values))
-    };
-    let images = TextureImages {
-        data: volume::cube_image(dims, &values),
-        bricks: volume::brick_image(dims, &values),
+    let (dims, bytes) = fits::crop_and_downsample(
+        cube,
+        region.min,
+        region.max,
+        factors,
+        config.max_mode_downsampling,
+    );
+    let texture = TextureBytes {
+        bytes,
         dims,
         factors,
     };
@@ -331,7 +358,7 @@ fn region_images(cube: &Cube, config: &Config, region: Region) -> TextureImages 
         "Texture {dims:?} for {region:?}, downsampled by {factors:?}, in {:.2} s",
         start.elapsed().as_secs_f32()
     );
-    images
+    texture
 }
 
 /// Object-space box of a voxel region, as iDaVIE's CropToRegion and highlight bounds compute it.
@@ -350,12 +377,14 @@ fn spawn_volume(
     mut materials: ResMut<Assets<VolumeMaterial>>,
     mut line_materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut uploads: ResMut<Uploads>,
     mut orbits: Query<&mut Orbit>,
 ) {
     for entity in &old {
         commands.entity(entity).despawn();
     }
-    let full = region_images(&data.cube, &data.config, data.full_region()).add(&mut images);
+    let full = region_bytes(&data.cube, &data.config, data.full_region())
+        .upload(&mut images, &mut uploads);
 
     let config = &data.config;
     let settings = Settings {
@@ -369,18 +398,18 @@ fn spawn_volume(
             ..default()
         },
         wcs_axes: true,
-        skip_empty_space: config.empty_space_skipping,
     };
     let material = materials.add(VolumeMaterial {
         params: settings.params,
         data_cube: full.handle.clone(),
-        brick_range: full.bricks.clone(),
         color_map: images.add(volume::color_map_image()),
     });
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
         MeshMaterial3d(material.clone()),
         Transform::IDENTITY,
+        // Until its texture has been filled.
+        Visibility::Hidden,
         VolumeCube,
     ));
     // Opaque line meshes rather than gizmos, so they reach the depth prepass and the volume covers the back edges.
@@ -396,7 +425,7 @@ fn spawn_volume(
     commands.spawn((
         Mesh3d(meshes.add(box_lines())),
         MeshMaterial3d(outline.white.clone()),
-        Outline::default(),
+        Outline::with_axes(),
         CubeOutline,
         VolumeCube,
     ));
@@ -441,8 +470,18 @@ fn update_material(
         (params.highlight_min, params.highlight_max) = region_bounds(selection, data.cube.dims);
         params.highlight_saturate_factor = SELECTION_SATURATE_FACTOR;
     }
-    params.empty_space_skipping = settings.skip_empty_space.into();
     material.params = params;
     material.data_cube = state.texture().handle.clone();
-    material.brick_range = state.texture().bricks.clone();
+}
+
+fn show_volume(
+    state: Res<CubeState>,
+    uploads: Res<Uploads>,
+    mut volume: Query<&mut Visibility, With<MeshMaterial3d<VolumeMaterial>>>,
+) {
+    if !uploads.is_filling(state.full.handle.id()) {
+        for mut visibility in &mut volume {
+            visibility.set_if_neq(Visibility::Inherited);
+        }
+    }
 }

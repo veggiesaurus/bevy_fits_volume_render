@@ -20,5 +20,5 @@ cargo build --profile dist --target wasm32-unknown-unknown
 wasm-bindgen --target web --no-typescript --remove-name-section --out-dir web/pkg \
   target/wasm32-unknown-unknown/dist/bevy_fits_volume_render.wasm
 if command -v wasm-opt >/dev/null; then
-  wasm-opt -O web/pkg/bevy_fits_volume_render_bg.wasm -o web/pkg/bevy_fits_volume_render_bg.wasm
+  wasm-opt -O1 web/pkg/bevy_fits_volume_render_bg.wasm -o web/pkg/bevy_fits_volume_render_bg.wasm
 fi

@@ -1,6 +1,8 @@
 use bevy::{
     asset::{RenderAssetUsages, embedded_asset},
-    image::{CompressedImageFormats, ImageSampler, ImageType},
+    image::{
+        CompressedImageFormats, ImageAddressMode, ImageSampler, ImageSamplerDescriptor, ImageType,
+    },
     mesh::MeshVertexBufferLayoutRef,
     pbr::{MaterialPipeline, MaterialPipelineKey},
     prelude::*,
@@ -9,7 +11,6 @@ use bevy::{
         SpecializedMeshPipelineError, TextureDimension, TextureFormat,
     },
     shader::ShaderRef,
-    tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool},
 };
 
 use crate::config::COLOR_MAPS;
@@ -47,7 +48,6 @@ pub struct VolumeParams {
     pub max_steps: u32,
     pub highlight_saturate_factor: f32,
     pub projection_mode: u32,
-    pub empty_space_skipping: u32,
 }
 
 impl Default for VolumeParams {
@@ -73,7 +73,6 @@ impl Default for VolumeParams {
             max_steps: 384,
             highlight_saturate_factor: 1.0,
             projection_mode: 0,
-            empty_space_skipping: 0,
         }
     }
 }
@@ -82,14 +81,13 @@ impl Default for VolumeParams {
 pub struct VolumeMaterial {
     #[uniform(0)]
     pub params: VolumeParams,
-    // Read with textureLoad: R32Float is filterable on some devices and not others, which a sampler binding can't span.
+    // R32Float is filterable on some devices and not others, so it's declared unfilterable everywhere.
     #[texture(1, dimension = "3d", sample_type = "float", filterable = false)]
+    #[sampler(2, sampler_type = "non_filtering")]
     pub data_cube: Handle<Image>,
     #[texture(3)]
     #[sampler(4)]
     pub color_map: Handle<Image>,
-    #[texture(5, dimension = "3d", sample_type = "float", filterable = false)]
-    pub brick_range: Handle<Image>,
 }
 
 impl Material for VolumeMaterial {
@@ -134,61 +132,27 @@ impl Material for VolumeMaterial {
     }
 }
 
-pub fn cube_image(dims: [usize; 3], data: &[f32]) -> Image {
+/// An R32Float texture with no data yet, which `Uploads` fills.
+pub fn empty_cube_image(dims: [usize; 3]) -> Image {
     let size = Extent3d {
         width: dims[0] as u32,
         height: dims[1] as u32,
         depth_or_array_layers: dims[2] as u32,
     };
-    let bytes = bytemuck::cast_slice(data).to_vec();
-    Image::new(
+    let mut image = Image::new_uninit(
         size,
         TextureDimension::D3,
-        bytes,
         TextureFormat::R32Float,
         RenderAssetUsages::RENDER_WORLD,
-    )
-}
-
-/// Texels per brick edge in `brick_image`, as BRICK in volume.wesl.
-pub const BRICK: usize = 8;
-
-/// The min and max of each BRICK³ block of texels, ignoring NaN (so min > max when a block is all NaN),
-/// which lets the shader skip blocks that can't change a ray's result.
-pub fn brick_image(dims: [usize; 3], data: &[f32]) -> Image {
-    let bricks = dims.map(|d| d.div_ceil(BRICK));
-    let layer = bricks[0] * bricks[1];
-    let mut ranges = vec![[f32::INFINITY, f32::NEG_INFINITY]; layer * bricks[2]];
-    ranges.par_chunk_map_mut(
-        ComputeTaskPool::get_or_init(TaskPool::default),
-        layer,
-        |bz, out| {
-            for z in bz * BRICK..((bz + 1) * BRICK).min(dims[2]) {
-                for y in 0..dims[1] {
-                    let row = &data[(z * dims[1] + y) * dims[0]..][..dims[0]];
-                    let out = &mut out[y / BRICK * bricks[0]..][..bricks[0]];
-                    for (range, texels) in out.iter_mut().zip(row.chunks(BRICK)) {
-                        for &v in texels {
-                            range[0] = range[0].min(v);
-                            range[1] = range[1].max(v);
-                        }
-                    }
-                }
-            }
-        },
     );
-    let size = Extent3d {
-        width: bricks[0] as u32,
-        height: bricks[1] as u32,
-        depth_or_array_layers: bricks[2] as u32,
-    };
-    Image::new(
-        size,
-        TextureDimension::D3,
-        bytemuck::cast_slice(&ranges).to_vec(),
-        TextureFormat::Rg32Float,
-        RenderAssetUsages::RENDER_WORLD,
-    )
+    // Point filtering with Repeat wrapping, which is what iDaVIE's `new Texture3D` gets by default.
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        address_mode_w: ImageAddressMode::Repeat,
+        ..ImageSamplerDescriptor::nearest()
+    });
+    image
 }
 
 /// iDaVIE's 80-row colour map atlas (Assets/Textures/allmaps.png): sRGB, point filtered, clamped.

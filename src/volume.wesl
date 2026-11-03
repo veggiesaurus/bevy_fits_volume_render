@@ -25,16 +25,13 @@ struct VolumeParams {
     max_steps: u32,
     highlight_saturate_factor: f32,
     projection_mode: u32,
-    empty_space_skipping: u32,
 };
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> params: VolumeParams;
 @group(constants::MATERIAL_BIND_GROUP) @binding(1) var data_cube: texture_3d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(2) var data_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(3) var color_map: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var color_map_sampler: sampler;
-// Min and max of each BRICK³ block of data_cube texels (min > max when all NaN), from volume.rs brick_image.
-@group(constants::MATERIAL_BIND_GROUP) @binding(5) var brick_range: texture_3d<f32>;
-const BRICK = 8u;
 
 const LOG: u32 = 1u;
 const SQRT: u32 = 2u;
@@ -93,22 +90,9 @@ fn in_box(position: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> bool {
     return all(position >= box_min) && all(position <= box_max);
 }
 
-// Point filtering with Repeat wrapping, which is what iDaVIE's `new Texture3D` gets by default.
+// data_sampler does iDaVIE's point filtering and Repeat wrapping (volume.rs cube_image).
 fn sample_cube(position: vec3<f32>) -> f32 {
-    let size = vec3<i32>(textureDimensions(data_cube));
-    // fract can round up to 1.0 just below a whole number, hence the min.
-    let texel = min(vec3<i32>(fract(position) * vec3<f32>(size)), size - 1);
-    return textureLoad(data_cube, texel, 0).r;
-}
-
-// Samples left in a brick from `position`, counting this one. The margin keeps rounding from skipping a
-// sample that lands just past the brick.
-fn samples_in_brick(position: vec3<f32>, step: vec3<f32>, brick: vec3<u32>, size: vec3<f32>) -> i32 {
-    let lo = vec3<f32>(brick * BRICK) / size;
-    let hi = min(vec3<f32>((brick + 1u) * BRICK), size) / size;
-    let along = select(lo, hi, step > vec3(0.0)) - position;
-    let t = select(vec3(3.402823466e+38), along / step, step != vec3(0.0));
-    return i32(floor(min(min(t.x, t.y), t.z) - 0.01)) + 1;
+    return textureSampleLevel(data_cube, data_sampler, position, 0.0).r;
 }
 
 struct Ray {
@@ -118,23 +102,33 @@ struct Ray {
     has_value: bool,
 };
 
-fn accumulate(ray: Ray, position: vec3<f32>, step_length: f32, highlight_min: vec3<f32>, highlight_max: vec3<f32>) -> Ray {
+fn maximum(ray: Ray, value: f32, position: vec3<f32>, highlight_min: vec3<f32>, highlight_max: vec3<f32>) -> Ray {
     var r = ray;
-    let step_value = sample_cube(position);
-    if is_nan(step_value) {
-        return r;
-    }
-    if params.projection_mode == 1u {
-        r.value += step_value * step_length;
-        r.cumulative_length += step_length;
-        r.in_highlight = r.in_highlight || in_box(position, highlight_min, highlight_max);
-        r.has_value = true;
-    } else if step_value >= r.value {
-        r.in_highlight = in_box(position, highlight_min, highlight_max) || (r.in_highlight && step_value == r.value);
-        r.value = step_value;
+    if !is_nan(value) && value >= r.value {
+        r.in_highlight = in_box(position, highlight_min, highlight_max) || (r.in_highlight && value == r.value);
+        r.value = value;
         r.has_value = true;
     }
     return r;
+}
+
+fn average(ray: Ray, value: f32, position: vec3<f32>, step_length: f32, highlight_min: vec3<f32>, highlight_max: vec3<f32>) -> Ray {
+    var r = ray;
+    if !is_nan(value) {
+        r.value += value * step_length;
+        r.cumulative_length += step_length;
+        r.in_highlight = r.in_highlight || in_box(position, highlight_min, highlight_max);
+        r.has_value = true;
+    }
+    return r;
+}
+
+fn accumulate(ray: Ray, position: vec3<f32>, step_length: f32, highlight_min: vec3<f32>, highlight_max: vec3<f32>) -> Ray {
+    let value = sample_cube(position);
+    if params.projection_mode == 1u {
+        return average(ray, value, position, step_length, highlight_min, highlight_max);
+    }
+    return maximum(ray, value, position, highlight_min, highlight_max);
 }
 
 @fragment
@@ -151,10 +145,19 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
+    // iDaVIE's step, sqrt(max_length) / max_steps, with the step count lifted so the longest rays (sqrt(3) on
+    // the full cube) reach the far side rather than stopping at max_steps. Capped at about two steps per texel
+    // along the texture's diagonal, so a small texture (a crop, or a heavily downsampled cube) costs less.
+    let max_length = length(params.slice_max - params.slice_min);
+    let max_steps = min(sqrt(max_length) * f32(params.max_steps), ceil(2.0 * length(vec3<f32>(textureDimensions(data_cube)))));
+    let step_length = max_length / max_steps;
+
     let direction = normalize(in.ray_direction);
     let t = intersect_box(in.ray_origin, direction, params.slice_min, params.slice_max);
-    // Early exit of pixels missing the bounding box or occluded by opaque objects
-    if t.x > t.y || t.y < 0.0 || opaque_depth < t.x {
+    // Early exit of pixels missing the bounding box or occluded by opaque objects. Within a step counts as
+    // occluded, since the last sample would land a step in front of the box and wrap round to the far side,
+    // tinting the front edges of the outline.
+    if t.x > t.y || t.y < 0.0 || opaque_depth < t.x + step_length {
         return vec4(0.0);
     }
     let t_near = max(0.0, t.x);
@@ -165,14 +168,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let ray_delta = p_far - p_near;
     let total_length = length(ray_delta);
 
-    // iDaVIE takes the square root of max_length here, which leaves max_steps short of the longest rays.
-    let max_length = length(params.slice_max - params.slice_min);
-    // Steps of about half a texel, so a small texture (a crop, or a heavily downsampled cube) doesn't pay
-    // for all of max_steps.
-    let steps = min(f32(params.max_steps), ceil(2.0 * length(vec3<f32>(textureDimensions(data_cube)))));
-    let step_length = max_length / steps;
     let step_vector = normalize(ray_delta);
-    let required_steps = i32(clamp(total_length / step_length, 0.0, steps));
+    let required_steps = i32(clamp(total_length / step_length, 0.0, max_steps));
 
     // Unity's _Time.xy is (t / 20, t)
     let rand_vector = nrand(in.position.xy + vec2(globals.time / 20.0, globals.time)) * step_vector * step_length * params.jitter;
@@ -184,36 +181,71 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let highlight_min = (params.highlight_min + region_offset + 0.5) * region_scale;
     let highlight_max = (params.highlight_max + region_offset + 0.5) * region_scale;
 
+    // The guard keeps a constant cube from dividing zero by zero.
+    let scale_range = select(params.scale_max - params.scale_min, 1.0, params.scale_max == params.scale_min);
+
     var ray = Ray(select(-3.402823466e+38, 0.0, params.projection_mode == 1u), 0.0, false, false);
-    if params.empty_space_skipping == 0u {
-        for (var i = 0; i < required_steps; i++) {
-            ray = accumulate(ray, position, step_length, highlight_min, highlight_max);
-            position += adjusted_step_vector;
+    // Unrolled so the texture fetches overlap; the step positions are the same as one step at a time.
+    let s = adjusted_step_vector;
+    let h_min = highlight_min;
+    let h_max = highlight_max;
+    if params.projection_mode == 1u {
+        var i = 0;
+        for (; i + 4 <= required_steps; i += 4) {
+            let p1 = position + s;
+            let p2 = p1 + s;
+            let p3 = p2 + s;
+            let v0 = sample_cube(position);
+            let v1 = sample_cube(p1);
+            let v2 = sample_cube(p2);
+            let v3 = sample_cube(p3);
+            ray = average(ray, v0, position, step_length, h_min, h_max);
+            ray = average(ray, v1, p1, step_length, h_min, h_max);
+            ray = average(ray, v2, p2, step_length, h_min, h_max);
+            ray = average(ray, v3, p3, step_length, h_min, h_max);
+            position = p3 + s;
+        }
+        for (; i < required_steps; i++) {
+            ray = average(ray, sample_cube(position), position, step_length, h_min, h_max);
+            position += s;
         }
     } else {
-        // A brick at a time: take none of its samples if none can change the result (all NaN, or for the
-        // maximum all below the ray's maximum so far, or equal to it while no selection is shown, since a tie
-        // only matters for the selection highlight). Stepping over them one by one keeps the positions.
-        let ties_skip = params.highlight_saturate_factor >= 1.0;
-        let size = vec3<f32>(textureDimensions(data_cube));
+        // Once the maximum is past threshold_max the colour can't change, unless a selection is shown.
+        let can_stop = params.highlight_saturate_factor == 1.0;
         var i = 0;
-        while i < required_steps {
-            var samples = 1;
-            var skip = false;
-            if all(position >= vec3(0.0)) && all(position < vec3(1.0)) {
-                let brick = vec3<u32>(position * size) / BRICK;
-                samples = clamp(samples_in_brick(position, adjusted_step_vector, brick, size), 1, required_steps - i);
-                let range = textureLoad(brick_range, brick, 0).rg;
-                let below = range.y < ray.value || (ties_skip && range.y == ray.value);
-                skip = range.x > range.y || (params.projection_mode == 0u && below);
+        for (; i + 8 <= required_steps; i += 8) {
+            let p1 = position + s;
+            let p2 = p1 + s;
+            let p3 = p2 + s;
+            let p4 = p3 + s;
+            let p5 = p4 + s;
+            let p6 = p5 + s;
+            let p7 = p6 + s;
+            let v0 = sample_cube(position);
+            let v1 = sample_cube(p1);
+            let v2 = sample_cube(p2);
+            let v3 = sample_cube(p3);
+            let v4 = sample_cube(p4);
+            let v5 = sample_cube(p5);
+            let v6 = sample_cube(p6);
+            let v7 = sample_cube(p7);
+            ray = maximum(ray, v0, position, h_min, h_max);
+            ray = maximum(ray, v1, p1, h_min, h_max);
+            ray = maximum(ray, v2, p2, h_min, h_max);
+            ray = maximum(ray, v3, p3, h_min, h_max);
+            ray = maximum(ray, v4, p4, h_min, h_max);
+            ray = maximum(ray, v5, p5, h_min, h_max);
+            ray = maximum(ray, v6, p6, h_min, h_max);
+            ray = maximum(ray, v7, p7, h_min, h_max);
+            position = p7 + s;
+            if can_stop && (ray.value - params.scale_min) / scale_range >= params.threshold_max {
+                i = required_steps;
+                break;
             }
-            for (var j = 0; j < samples; j++) {
-                if !skip {
-                    ray = accumulate(ray, position, step_length, highlight_min, highlight_max);
-                }
-                position += adjusted_step_vector;
-            }
-            i += samples;
+        }
+        for (; i < required_steps; i++) {
+            ray = maximum(ray, sample_cube(position), position, h_min, h_max);
+            position += s;
         }
     }
     let remaining_step_length = total_length - f32(required_steps + 1) * step_length - length(rand_vector);
@@ -229,11 +261,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4(0.0);
     }
 
-    // The guards keep a constant cube, or equal thresholds, from dividing zero by zero.
-    var ray_value = (ray.value - params.scale_min) / max(params.scale_max - params.scale_min, 1e-30);
+    var ray_value = (ray.value - params.scale_min) / scale_range;
     ray_value = clamp(ray_value, params.threshold_min, params.threshold_max);
     // Unity's v axis points up the atlas, wgpu's points down, so no "1.0 -" here.
     let color_map_offset = (0.5 + f32(params.color_map_index)) / f32(params.num_color_maps);
+    // The guard keeps equal thresholds from dividing zero by zero.
     var x = (ray_value - params.threshold_min) / max(params.threshold_max - params.threshold_min, 1e-6);
 
     if params.scale_type == SQUARE {

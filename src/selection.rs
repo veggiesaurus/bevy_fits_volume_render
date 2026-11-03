@@ -6,18 +6,24 @@ use bevy_egui::input::EguiWantsInput;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future::poll_once};
 
 use crate::{
-    CubeState, Dataset, Region, TextureImages, UNITY_FROM_LOCAL,
+    CubeState, Dataset, Region, TextureBytes, UNITY_FROM_LOCAL, VolumeTexture,
     camera::{DEFAULT_DISTANCE, Orbit, pointer},
     grips::Grips,
-    region_bounds, region_images,
+    region_bounds, region_bytes,
+    upload::Uploads,
 };
 
 #[derive(Resource, Default)]
 pub struct Hover(pub Option<[usize; 3]>);
 
-/// A crop being built in the background, so a big one doesn't stall the frame.
+/// A crop on its way: its texture built in the background, then uploaded over a few frames.
 #[derive(Resource, Default)]
-pub struct PendingCrop(pub Option<(Region, Task<TextureImages>)>);
+pub struct PendingCrop(pub Option<(Region, CropStage)>);
+
+pub enum CropStage {
+    Building(Task<TextureBytes>),
+    Uploading(VolumeTexture),
+}
 
 #[derive(Message)]
 pub enum CropCommand {
@@ -137,13 +143,14 @@ pub fn select_region(
 }
 
 /// Cropping keeps the selection, as iDaVIE's CropToFeature does, so a reset still shows where the crop was.
-/// The crop's texture is built in the background and swapped in when it's ready.
+/// The crop's texture is built and uploaded in the background, and swapped in when it's ready.
 pub fn apply_crop(
     mut commands: MessageReader<CropCommand>,
     data: Res<Dataset>,
     mut state: ResMut<CubeState>,
     mut pending: ResMut<PendingCrop>,
     mut images: ResMut<Assets<Image>>,
+    mut uploads: ResMut<Uploads>,
     mut orbits: Query<&mut Orbit>,
 ) {
     let mut framed = false;
@@ -160,8 +167,8 @@ pub fn apply_crop(
                 }
                 let (cube, config) = (data.cube.clone(), data.config.clone());
                 let task = AsyncComputeTaskPool::get()
-                    .spawn(async move { region_images(&cube, &config, region) });
-                pending.0 = Some((region, task));
+                    .spawn(async move { region_bytes(&cube, &config, region) });
+                pending.0 = Some((region, CropStage::Building(task)));
             }
             CropCommand::Reset => {
                 pending.0 = None;
@@ -170,13 +177,23 @@ pub fn apply_crop(
             }
         }
     }
-    let built =
-        (pending.0.as_mut()).and_then(|(region, task)| Some((*region, block_on(poll_once(task))?)));
-    if let Some((region, texture)) = built {
-        pending.0 = None;
-        state.crop = Some((region, texture.add(&mut images)));
-        framed = true;
-    }
+    pending.0 = match pending.0.take() {
+        Some((region, CropStage::Building(mut task))) => match block_on(poll_once(&mut task)) {
+            Some(bytes) => {
+                let texture = bytes.upload(&mut images, &mut uploads);
+                Some((region, CropStage::Uploading(texture)))
+            }
+            None => Some((region, CropStage::Building(task))),
+        },
+        Some((region, CropStage::Uploading(texture)))
+            if !uploads.is_filling(texture.handle.id()) =>
+        {
+            state.crop = Some((region, texture));
+            framed = true;
+            None
+        }
+        pending => pending,
+    };
     if framed {
         let (lo, hi) = region_bounds(state.visible(&data), data.cube.dims);
         for mut orbit in &mut orbits {

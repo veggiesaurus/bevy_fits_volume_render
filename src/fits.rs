@@ -1,7 +1,7 @@
 use std::io::{self, ErrorKind};
 use std::str::FromStr;
 
-use bevy::tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool};
+use bevy::tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool, TaskPoolBuilder};
 
 const BLOCK: usize = 2880;
 /// Voxels read, decoded and summarised per task: 4 MB of output, small enough to stay in cache.
@@ -63,6 +63,8 @@ impl Source for std::fs::File {
 
 pub struct Cube {
     pub dims: [usize; 3],
+    /// The FITS axes (0-based) shown as x, y and z. One past NAXIS pads a 2D image.
+    pub axes: [usize; 3],
     pub data: Vec<f32>,
     pub cards: Vec<String>,
     pub hdu: usize,
@@ -71,8 +73,27 @@ pub struct Cube {
 
 impl Cube {
     /// The data unit from BUNIT, e.g. "Jy/beam" (or CASA's "beam-1 Jy").
-    pub fn unit(&self) -> Option<&str> {
-        value(&self.cards, "BUNIT").filter(|u| !u.is_empty())
+    pub fn unit(&self) -> Option<String> {
+        Some(value(&self.cards, "BUNIT")?.trim_start().to_string()).filter(|u| !u.is_empty())
+    }
+
+    /// "1 of 3 along STOKES" when the HDU holds more than the one plane of its other axes that's shown.
+    pub fn other_planes(&self) -> Option<String> {
+        let naxis: usize = num(&self.cards, "NAXIS").ok()??;
+        let others: Vec<(u64, String)> = (1..=naxis)
+            .filter(|a| !self.axes.contains(&(a - 1)))
+            .map(|a| {
+                let n = num(&self.cards, &format!("NAXIS{a}")).ok().flatten();
+                let name = value(&self.cards, &format!("CTYPE{a}"));
+                (n.unwrap_or(1), name.unwrap_or(format!("axis {a}")))
+            })
+            .filter(|(n, _)| *n > 1)
+            .collect();
+        let planes = others
+            .iter()
+            .try_fold(1u64, |p, (n, _)| p.checked_mul(*n))?;
+        let names: Vec<&str> = others.iter().map(|(_, name)| name.as_str()).collect();
+        (planes > 1).then(|| format!("1 of {planes} along {}", names.join(", ")))
     }
 }
 
@@ -89,11 +110,18 @@ pub struct Stats {
 pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Cube, String> {
     let size = source.size().map_err(|e| e.to_string())?;
     let (mut index, mut offset) = (0, 0);
+    let (mut primary, mut compressed): (Vec<String>, _) = (Vec::new(), None);
+    let tile_compressed = |n| {
+        format!(
+            "HDU {n} is a tile-compressed image, which isn't supported; decompress it with funpack"
+        )
+    };
     loop {
-        let Some(cards) = read_header(source, &mut offset)? else {
-            return Err(match hdu {
-                Some(n) => format!("HDU {n} not found, the file has {index}"),
-                None => "no image HDU with NAXIS >= 3 found".into(),
+        let Some(mut cards) = read_header(source, &mut offset)? else {
+            return Err(match (hdu, compressed) {
+                (Some(n), _) => format!("HDU {n} not found, the file has {index}"),
+                (None, Some(n)) => tile_compressed(n),
+                (None, None) => "no image HDU with NAXIS >= 2 found".into(),
             });
         };
         let bitpix: i64 = num(&cards, "BITPIX")?.ok_or("missing BITPIX")?;
@@ -106,23 +134,28 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
         }
         let width = bitpix.unsigned_abs() / 8;
         // A random-groups primary (UVFITS) has NAXIS1 = 0 and is no image.
-        let groups = value(&cards, "GROUPS") == Some("T");
-        let is_cube = naxis >= 3
-            && axes[..3].iter().all(|&n| n > 0)
+        let groups = value(&cards, "GROUPS").as_deref() == Some("T");
+        let tiled = value(&cards, "ZIMAGE").as_deref() == Some("T");
+        compressed = compressed.or(tiled.then_some(index));
+        let is_cube = naxis >= 2
+            && axes.iter().all(|&n| n > 0)
             && !groups
-            && (index == 0 || value(&cards, "XTENSION") == Some("IMAGE"));
+            && (index == 0 || value(&cards, "XTENSION").as_deref() == Some("IMAGE"));
 
         if hdu == Some(index) || (hdu.is_none() && is_cube) {
             if !is_cube {
-                return Err(format!(
-                    "HDU {index} is not an image with three non-empty axes"
-                ));
+                return Err(match tiled {
+                    true => tile_compressed(index),
+                    false => format!("HDU {index} is not an image with two or more non-empty axes"),
+                });
             }
-            let len = checked_product(&axes[..3])
+            let picked = pick_axes(&axes);
+            let lengths = picked.map(|a| axes.get(a).copied().unwrap_or(1));
+            let len = checked_product(&lengths)
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or(format!("HDU {index}: image too large"))?;
             // Each axis is at most `len`, which fits.
-            let dims = [0, 1, 2].map(|i| axes[i] as usize);
+            let dims = lengths.map(|n| n as usize);
             // Checked before allocating, so a header can't claim more memory than its file backs.
             if (len as u64)
                 .checked_mul(width)
@@ -131,9 +164,21 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
             {
                 return Err(format!("HDU {index}: data truncated"));
             }
+            // The keyword inheritance convention. The extension's cards come first, so its values win.
+            if index > 0 && value(&cards, "INHERIT").as_deref() == Some("T") {
+                let structural = ["SIMPLE", "BITPIX", "EXTEND", "GROUPS", "PCOUNT", "GCOUNT"];
+                let commentary = ["COMMENT", "HISTORY", ""];
+                cards.extend(primary.into_iter().filter(|c| {
+                    let key = c[..8].trim_end();
+                    !key.starts_with("NAXIS")
+                        && !structural.contains(&key)
+                        && !commentary.contains(&key)
+                }));
+            }
             let (data, stats) = read_data(source, offset, &cards, bitpix, width as usize, len)?;
             return Ok(Cube {
                 dims,
+                axes: picked,
                 data,
                 cards,
                 hdu: index,
@@ -159,8 +204,22 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
             .and_then(|padded| offset.checked_add(padded))
             .filter(|&end| end <= size)
             .ok_or(format!("HDU {index}: data truncated"))?;
+        if index == 0 {
+            primary = cards;
+        }
         index += 1;
     }
+}
+
+/// The first three axes longer than 1, then length-1 axes, then ones past NAXIS. Leaving out length-1 axes
+/// keeps the first x * y * z values in order, so CASA's RA, DEC, STOKES(1), FREQ loads every channel.
+fn pick_axes(lengths: &[u64]) -> [usize; 3] {
+    let n = lengths.len();
+    let mut picked = (0..n)
+        .filter(|&a| lengths[a] > 1)
+        .chain((0..n).filter(|&a| lengths[a] == 1))
+        .chain(n..);
+    std::array::from_fn(|_| picked.next().unwrap())
 }
 
 fn checked_product(values: &[u64]) -> Option<u64> {
@@ -197,17 +256,43 @@ fn read_header<S: Source + ?Sized>(
     }
 }
 
-/// A card's value: a quoted string without its quotes (and trailing spaces), or the text before any comment.
-fn value<'a>(cards: &'a [String], key: &str) -> Option<&'a str> {
-    let card = cards
+/// A card's value: a string without its quotes and trailing spaces, joined across the CONTINUE cards of the
+/// long-string convention, or the text before any comment. None when the value field is empty.
+fn value(cards: &[String], key: &str) -> Option<String> {
+    let at = cards
         .iter()
-        .find(|c| c[..8].trim_end() == key && &c[8..10] == "= ")?;
-    let field = card[10..].trim_start();
-    // ponytail: a quote doubled inside the string ('O''Brien') ends it early; fine for the keys read here.
-    match field.strip_prefix('\'') {
-        Some(quoted) => Some(quoted[..quoted.find('\'')?].trim_end()),
-        None => Some(field.split('/').next()?.trim()),
+        .position(|c| c[..8].trim_end() == key && &c[8..10] == "= ")?;
+    let field = cards[at][10..].trim_start();
+    let Some(quoted) = field.strip_prefix('\'') else {
+        return Some(field.split('/').next()?.trim().to_string()).filter(|v| !v.is_empty());
+    };
+    let mut text = string(quoted)?;
+    let mut next = cards[at + 1..].iter();
+    while text.ends_with('&') {
+        let Some(more) = next
+            .next()
+            .filter(|c| c.starts_with("CONTINUE"))
+            .and_then(|c| string(c[8..].trim_start().strip_prefix('\'')?))
+        else {
+            break;
+        };
+        text.pop();
+        text.push_str(&more);
     }
+    Some(text.trim_end().to_string())
+}
+
+/// The string after an opening quote, up to the closing one, with '' read as a quote. None if unterminated.
+fn string(after_quote: &str) -> Option<String> {
+    let mut text = String::new();
+    let mut chars = after_quote.chars();
+    while let Some(c) = chars.next() {
+        if c == '\'' && chars.next() != Some('\'') {
+            return Some(text);
+        }
+        text.push(c);
+    }
+    None
 }
 
 fn num<T: FromStr>(cards: &[String], key: &str) -> Result<Option<T>, String> {
@@ -231,9 +316,12 @@ fn read_data<S: Source + ?Sized>(
 ) -> Result<(Vec<f32>, Stats), String> {
     let bscale: f64 = num(cards, "BSCALE")?.unwrap_or(1.0);
     let bzero: f64 = num(cards, "BZERO")?.unwrap_or(0.0);
-    // BLANK only applies to integer data.
+    // BLANK only applies to integer data. A real with no fraction (-32768.0) is taken too.
     let blank: Option<i64> = if bitpix > 0 {
-        num(cards, "BLANK")?
+        num(cards, "BLANK").or_else(|e| match num::<f64>(cards, "BLANK")? {
+            Some(b) if b.fract() == 0.0 => Ok(Some(b as i64)),
+            _ => Err(e),
+        })?
     } else {
         None
     };
@@ -259,23 +347,39 @@ fn read_data<S: Source + ?Sized>(
         data
     };
     let decode = |chunk: usize, out: &mut [f32]| -> Result<Moments, String> {
+        let read = |buf: &mut [u8]| {
+            source
+                .read_at(offset + (chunk * CHUNK_VOXELS * width) as u64, buf)
+                .map_err(|e| format!("reading FITS data: {e}"))
+        };
+        // 32-bit values are read straight into the output and converted in place.
+        if width == 4 {
+            read(bytemuck::cast_slice_mut(out))?;
+            for v in out.iter_mut() {
+                let bytes = v.to_ne_bytes();
+                *v = match bitpix {
+                    32 => int(i32::from_be_bytes(bytes) as i64),
+                    _ => float(f32::from_be_bytes(bytes) as f64),
+                };
+            }
+            return Ok(Moments::of(out));
+        }
         let mut raw = vec![0u8; out.len() * width];
-        source
-            .read_at(offset + (chunk * CHUNK_VOXELS * width) as u64, &mut raw)
-            .map_err(|e| format!("reading FITS data: {e}"))?;
+        read(&mut raw)?;
         match bitpix {
             8 => convert(out, &raw, |b: [u8; 1]| int(b[0] as i64)),
             16 => convert(out, &raw, |b| int(i16::from_be_bytes(b) as i64)),
-            32 => convert(out, &raw, |b| int(i32::from_be_bytes(b) as i64)),
             64 => convert(out, &raw, |b| int(i64::from_be_bytes(b))),
-            -32 => convert(out, &raw, |b| float(f32::from_be_bytes(b) as f64)),
             _ => convert(out, &raw, |b| float(f64::from_be_bytes(b))),
         }
         Ok(Moments::of(out))
     };
+    // A pool of its own with a thread per core, since Bevy's compute pool only gets some of them.
     #[cfg(not(target_arch = "wasm32"))]
     let chunks = data.par_chunk_map_mut(
-        ComputeTaskPool::get_or_init(TaskPool::default),
+        &TaskPoolBuilder::new()
+            .num_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
+            .build(),
         CHUNK_VOXELS,
         decode,
     );
@@ -406,14 +510,15 @@ pub fn find_downsample_factors(max_cube_size_mb: u64, region_dims: [usize; 3]) -
     [fx as usize, fy as usize, fz as usize]
 }
 
-/// min/max are 0-based inclusive voxel corners. Returns (new_dims, data) with data x-fastest.
+/// min/max are 0-based inclusive voxel corners. Each block of `factors` becomes its maximum or mean, ignoring
+/// NaN, and NaN when it's all NaN. Returns (new_dims, bytes): the R32Float texture data, x fastest.
 pub fn crop_and_downsample(
     cube: &Cube,
     min: [usize; 3],
     max: [usize; 3],
     factors: [usize; 3],
     max_mode: bool,
-) -> ([usize; 3], Vec<f32>) {
+) -> ([usize; 3], Vec<u8>) {
     assert!(
         (0..3).all(|i| min[i] <= max[i] && max[i] < cube.dims[i] && factors[i] > 0),
         "invalid crop or factors"
@@ -423,38 +528,48 @@ pub fn crop_and_downsample(
         min[i] + o * factors[i]..(min[i] + (o + 1) * factors[i]).min(max[i] + 1)
     };
     let [width, height, _] = cube.dims;
-    let row = |z: usize, y: usize| &cube.data[(z * height + y) * width..];
-    // One output plane per task, as iDaVIE splits over z. On wasm the pool runs them in turn.
-    let fill_plane = |oz: usize, plane: &mut [f32]| {
-        if factors == [1; 3] {
-            for (out, y) in plane.chunks_mut(dims[0]).zip(min[1]..) {
-                out.copy_from_slice(&row(min[2] + oz, y)[min[0]..=max[0]]);
+    let row = |z: usize, y: usize| &cube.data[(z * height + y) * width..][min[0]..=max[0]];
+    // One output plane per task, as iDaVIE splits over z, built a row of blocks at a time. On wasm the pool
+    // runs them in turn.
+    let fill_plane = |oz: usize, plane: &mut [u8]| {
+        let (mut acc, mut count) = (vec![0f32; dims[0]], vec![0u32; dims[0]]);
+        for (oy, out) in plane.chunks_mut(dims[0] * 4).enumerate() {
+            if factors == [1; 3] {
+                out.copy_from_slice(bytemuck::cast_slice(row(min[2] + oz, min[1] + oy)));
+                continue;
             }
-            return;
-        }
-        for (oy, out) in plane.chunks_mut(dims[0]).enumerate() {
-            for (ox, out) in out.iter_mut().enumerate() {
-                let (mut acc, mut count) = (if max_mode { f32::MIN } else { 0.0 }, 0);
-                for z in block(2, oz) {
-                    for y in block(1, oy) {
-                        for &v in row(z, y)[block(0, ox)].iter().filter(|v| !v.is_nan()) {
-                            acc = if max_mode { acc.max(v) } else { acc + v };
-                            count += 1;
+            // f32::max ignores a NaN operand, so starting from NaN leaves an all-NaN block NaN.
+            acc.fill(if max_mode { f32::NAN } else { 0.0 });
+            count.fill(0);
+            for z in block(2, oz) {
+                for y in block(1, oy) {
+                    let blocks = row(z, y).chunks(factors[0]);
+                    if max_mode {
+                        for (a, values) in acc.iter_mut().zip(blocks) {
+                            *a = values.iter().fold(*a, |a, &v| a.max(v));
+                        }
+                    } else {
+                        for ((a, n), values) in acc.iter_mut().zip(&mut count).zip(blocks) {
+                            for &v in values.iter().filter(|v| !v.is_nan()) {
+                                *a += v;
+                                *n += 1;
+                            }
                         }
                     }
                 }
-                *out = match count {
-                    0 => f32::NAN,
-                    _ if max_mode => acc,
-                    _ => acc / count as f32,
-                };
             }
+            if !max_mode {
+                for (a, &n) in acc.iter_mut().zip(&count) {
+                    *a = if n == 0 { f32::NAN } else { *a / n as f32 };
+                }
+            }
+            out.copy_from_slice(bytemuck::cast_slice(&acc));
         }
     };
-    let mut out = vec![0.0; dims.iter().product()];
+    let mut out = vec![0u8; dims.iter().product::<usize>() * 4];
     out.par_chunk_map_mut(
         ComputeTaskPool::get_or_init(TaskPool::default),
-        dims[0] * dims[1],
+        dims[0] * dims[1] * 4,
         fill_plane,
     );
     (dims, out)
@@ -480,49 +595,56 @@ mod tests {
 
     #[test]
     fn reads_scaled_4d_extension_after_empty_primary() {
-        let mut file = header(&[
-            "SIMPLE  =                    T",
-            "BITPIX  =                    8",
-            "NAXIS   =                    0",
-            "EXTEND  =                    T",
-        ]);
-        let image = [
-            "XTENSION= 'IMAGE   '           / image extension",
-            "BITPIX  =                   16",
-            "NAXIS   =                    4",
-            "NAXIS1  =                    3",
-            "NAXIS2  =                    2",
-            "NAXIS3  =                    2",
-            "NAXIS4  =                    2",
-            "PCOUNT  =                    0",
-            "GCOUNT  =                    1",
-            "BSCALE  =                  0.5",
-            "BZERO   =               1.0D01",
-            "BLANK   =               -32768",
-            "BUNIT   = 'Jy/beam '           / Brightness (pixel) unit",
-        ];
-        file.extend(header(&image));
-        let raw: Vec<i16> = (0..24).map(|i| if i == 5 { i16::MIN } else { i }).collect();
-        file.extend(pad(raw.iter().flat_map(|v| v.to_be_bytes()).collect(), 0));
+        for bitpix in [16, 32] {
+            let bitpix_card = format!("BITPIX  = {bitpix:>20}");
+            let mut file = header(&[
+                "SIMPLE  =                    T",
+                "BITPIX  =                    8",
+                "NAXIS   =                    0",
+                "EXTEND  =                    T",
+            ]);
+            let image = [
+                "XTENSION= 'IMAGE   '           / image extension",
+                &bitpix_card,
+                "NAXIS   =                    4",
+                "NAXIS1  =                    3",
+                "NAXIS2  =                    2",
+                "NAXIS3  =                    2",
+                "NAXIS4  =                    2",
+                "PCOUNT  =                    0",
+                "GCOUNT  =                    1",
+                "BSCALE  =                  0.5",
+                "BZERO   =               1.0D01",
+                "BLANK   =               -32768",
+                "BUNIT   = 'Jy/beam '           / Brightness (pixel) unit",
+            ];
+            file.extend(header(&image));
+            let raw = (0..24i32).map(|i| if i == 5 { -32768 } else { i });
+            let bytes = match bitpix {
+                16 => raw.flat_map(|v| (v as i16).to_be_bytes()).collect(),
+                _ => raw.flat_map(|v| v.to_be_bytes()).collect(),
+            };
+            file.extend(pad(bytes, 0));
 
-        let cube = read_fits(&file[..], None).unwrap();
-        assert_eq!((cube.hdu, cube.dims, cube.data.len()), (1, [3, 2, 2], 12));
-        for (i, v) in cube.data.iter().enumerate() {
-            if i == 5 {
-                assert!(v.is_nan())
-            } else {
-                assert_eq!(*v, 10.0 + 0.5 * i as f32)
+            let cube = read_fits(&file[..], None).unwrap();
+            assert_eq!((cube.hdu, cube.dims, cube.data.len()), (1, [3, 2, 2], 12));
+            for (i, v) in cube.data.iter().enumerate() {
+                if i == 5 {
+                    assert!(v.is_nan())
+                } else {
+                    assert_eq!(*v, 10.0 + 0.5 * i as f32)
+                }
             }
+            assert_eq!(cube.cards.len(), image.len());
+            assert_eq!(cube.cards[0], format!("{:<80}", image[0]));
+            assert_eq!(cube.unit().as_deref(), Some("Jy/beam"));
+            assert_eq!(
+                (cube.stats.min, cube.stats.max, cube.stats.non_finite),
+                (10.0, 15.5, 1)
+            );
+            assert!(read_fits(&file[..], Some(0)).is_err());
+            assert_eq!(read_fits(&file[..], Some(1)).unwrap().dims, [3, 2, 2]);
         }
-        assert_eq!(cube.cards.len(), image.len());
-        assert_eq!(cube.cards[0], format!("{:<80}", image[0]));
-        assert_eq!(cube.unit(), Some("Jy/beam"));
-        assert_eq!(
-            (cube.stats.min, cube.stats.max, cube.stats.non_finite),
-            (10.0, 15.5, 1)
-        );
-        assert!(read_fits(&file[..], Some(0)).is_err());
-        assert_eq!(read_fits(&file[..], Some(1)).unwrap().dims, [3, 2, 2]);
     }
 
     #[test]
@@ -536,22 +658,44 @@ mod tests {
         }
         let cube = Cube {
             dims,
+            axes: [0, 1, 2],
             data,
             cards: vec![],
             hdu: 0,
             stats: Moments::EMPTY.stats(0),
         };
 
-        let (new_dims, max) = crop_and_downsample(&cube, [1, 0, 0], [4, 2, 1], [3, 2, 2], true);
+        let floats = |(dims, bytes): ([usize; 3], Vec<u8>)| {
+            (dims, bytemuck::pod_collect_to_vec::<u8, f32>(&bytes))
+        };
+        let (new_dims, max) = floats(crop_and_downsample(
+            &cube,
+            [1, 0, 0],
+            [4, 2, 1],
+            [3, 2, 2],
+            true,
+        ));
         assert_eq!(new_dims, [2, 2, 1]);
         assert_eq!(max[..3], [113.0, 114.0, 123.0]);
         assert!(max[3].is_nan());
 
-        let (_, mean) = crop_and_downsample(&cube, [1, 0, 0], [4, 2, 1], [3, 2, 2], false);
+        let (_, mean) = floats(crop_and_downsample(
+            &cube,
+            [1, 0, 0],
+            [4, 2, 1],
+            [3, 2, 2],
+            false,
+        ));
         assert_eq!(mean[..3], [683.0 / 11.0, 59.0, 72.0]);
         assert!(mean[3].is_nan());
 
-        let (new_dims, full) = crop_and_downsample(&cube, [1, 1, 0], [3, 2, 1], [1; 3], true);
+        let (new_dims, full) = floats(crop_and_downsample(
+            &cube,
+            [1, 1, 0],
+            [3, 2, 1],
+            [1; 3],
+            true,
+        ));
         assert_eq!(new_dims, [3, 2, 2]);
         assert_eq!(
             full,
@@ -559,6 +703,81 @@ mod tests {
                 11., 12., 13., 21., 22., 23., 111., 112., 113., 121., 122., 123.
             ]
         );
+    }
+
+    #[test]
+    fn downsampling_matches_a_voxel_at_a_time_reference() {
+        let dims = [37, 29, 11];
+        let mut seed = 12345u32;
+        let data = (0..dims.iter().product::<usize>())
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                if seed.is_multiple_of(7) {
+                    f32::NAN
+                } else {
+                    (seed >> 8) as f32 / 1e3 - 5e3
+                }
+            })
+            .collect();
+        let cube = Cube {
+            dims,
+            axes: [0, 1, 2],
+            data,
+            cards: vec![],
+            hdu: 0,
+            stats: Moments::EMPTY.stats(0),
+        };
+        // The plain version that the row-at-a-time one replaced: each output voxel's block in z, y, x order.
+        let reference = |min: [usize; 3], max: [usize; 3], f: [usize; 3], max_mode: bool| {
+            let mut out = vec![];
+            for z0 in (min[2]..=max[2]).step_by(f[2]) {
+                for y0 in (min[1]..=max[1]).step_by(f[1]) {
+                    for x0 in (min[0]..=max[0]).step_by(f[0]) {
+                        let (mut acc, mut n) = (if max_mode { f32::MIN } else { 0.0 }, 0);
+                        for z in z0..(z0 + f[2]).min(max[2] + 1) {
+                            for y in y0..(y0 + f[1]).min(max[1] + 1) {
+                                for x in x0..(x0 + f[0]).min(max[0] + 1) {
+                                    let v = cube.data[(z * dims[1] + y) * dims[0] + x];
+                                    if !v.is_nan() {
+                                        acc = if max_mode { acc.max(v) } else { acc + v };
+                                        n += 1;
+                                    }
+                                }
+                            }
+                        }
+                        out.push(match n {
+                            0 => f32::NAN,
+                            _ if max_mode => acc,
+                            _ => acc / n as f32,
+                        });
+                    }
+                }
+            }
+            out
+        };
+        for factors in [
+            [1, 1, 1],
+            [2, 2, 1],
+            [3, 2, 2],
+            [1, 1, 3],
+            [5, 4, 3],
+            [40, 40, 20],
+        ] {
+            for (min, max) in [([0; 3], [36, 28, 10]), ([3, 5, 1], [30, 20, 9])] {
+                for max_mode in [true, false] {
+                    let (_, bytes) = crop_and_downsample(&cube, min, max, factors, max_mode);
+                    let got = bytemuck::pod_collect_to_vec::<u8, f32>(&bytes);
+                    let want = reference(min, max, factors, max_mode);
+                    assert!(
+                        got.len() == want.len()
+                            && got.iter().zip(&want).all(
+                                |(a, b)| a.to_bits() == b.to_bits() || a.is_nan() && b.is_nan()
+                            ),
+                        "{factors:?} {min:?} {max_mode}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -697,5 +916,106 @@ mod tests {
         assert!(read_fits(&file[..], Some(0)).is_err());
         // An infinite voxel stays out of the range, which would otherwise scale everything to zero.
         assert_eq!((cube.stats.max, cube.stats.non_finite), (1.0, 1));
+    }
+
+    #[test]
+    fn picks_the_first_three_axes_longer_than_one() {
+        let image = |lengths: &[u64]| {
+            let mut cards = vec![
+                "SIMPLE  =                    T".to_string(),
+                "BITPIX  =                  -32".to_string(),
+                format!("NAXIS   = {:>20}", lengths.len()),
+                "CTYPE4  = 'STOKES  '".to_string(),
+            ];
+            cards.extend(
+                (1..)
+                    .zip(lengths)
+                    .map(|(i, n)| format!("NAXIS{i:<3}= {n:>20}")),
+            );
+            let mut file = header(&cards.iter().map(String::as_str).collect::<Vec<_>>());
+            let values: Vec<f32> = (0..lengths.iter().product::<u64>())
+                .map(|v| v as f32)
+                .collect();
+            file.extend(pad(
+                values.iter().flat_map(|v| v.to_be_bytes()).collect(),
+                0,
+            ));
+            read_fits(&file[..], None).unwrap()
+        };
+        // CASA's RA, DEC, STOKES(1), FREQ order.
+        let casa = image(&[2, 2, 1, 4]);
+        assert_eq!(
+            (casa.dims, casa.axes, casa.other_planes()),
+            ([2, 2, 4], [0, 1, 3], None)
+        );
+        assert_eq!(casa.data, (0..16).map(|v| v as f32).collect::<Vec<_>>());
+        let flat = image(&[3, 2]);
+        assert_eq!(
+            (flat.dims, flat.axes, flat.data.len()),
+            ([3, 2, 1], [0, 1, 2], 6)
+        );
+        let stokes = image(&[2, 2, 2, 3]);
+        assert_eq!((stokes.dims, stokes.data.len()), ([2, 2, 2], 8));
+        assert_eq!(
+            stokes.other_planes().as_deref(),
+            Some("1 of 3 along STOKES")
+        );
+    }
+
+    #[test]
+    fn reads_quoted_and_continued_strings() {
+        let cube = Cube {
+            dims: [1; 3],
+            axes: [0, 1, 2],
+            data: vec![],
+            cards: [
+                "BUNIT   = '  K ''per'' &'      / doubled quotes, continued",
+                "CONTINUE  'beam'               / unit",
+                "OBJECT  = 'AT&T'",
+                "BSCALE  =                      / undefined",
+            ]
+            .map(|c| format!("{c:<80}"))
+            .into(),
+            hdu: 0,
+            stats: Moments::EMPTY.stats(0),
+        };
+        assert_eq!(cube.unit().as_deref(), Some("K 'per' beam"));
+        assert_eq!(value(&cube.cards, "OBJECT").as_deref(), Some("AT&T"));
+        assert_eq!(num::<f64>(&cube.cards, "BSCALE"), Ok(None));
+    }
+
+    #[test]
+    fn an_inheriting_extension_takes_the_primary_cards_it_lacks() {
+        let primary = [
+            "SIMPLE  =                    T",
+            "BITPIX  =                    8",
+            "NAXIS   =                    0",
+            "EXTEND  =                    T",
+            "BUNIT   = 'K       '",
+            "SPECSYS = 'BARYCENT'",
+            "COMMENT   from the primary",
+        ];
+        let extension = |inherit: &str| {
+            let mut file = header(&primary);
+            file.extend(header(&[
+                "XTENSION= 'IMAGE   '",
+                "BITPIX  =                  -32",
+                "NAXIS   =                    2",
+                "NAXIS1  =                    2",
+                "NAXIS2  =                    1",
+                "PCOUNT  =                    0",
+                "GCOUNT  =                    1",
+                inherit,
+                "BUNIT   = 'Jy/beam '",
+            ]));
+            file.extend(pad(vec![0; 8], 0));
+            read_fits(&file[..], None).unwrap()
+        };
+        let cube = extension("INHERIT =                    T");
+        assert_eq!(cube.unit().as_deref(), Some("Jy/beam"));
+        assert_eq!(value(&cube.cards, "SPECSYS").as_deref(), Some("BARYCENT"));
+        assert_eq!(value(&cube.cards, "BITPIX").as_deref(), Some("-32"));
+        assert_eq!(cube.cards.len(), 9 + 2);
+        assert_eq!(extension("INHERIT =                    F").cards.len(), 9);
     }
 }

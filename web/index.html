@@ -14,12 +14,18 @@
     border: 1px solid oklch(0.4461 0.0263 256.8018); border-radius: 0.5rem;
     font: 13px Inter, system-ui, sans-serif; overflow-wrap: anywhere;
   }
+  #examples a { color: oklch(0.7137 0.1434 254.624); }
 </style>
 </head>
 <body>
 <canvas id="bevy"></canvas>
 <div id="overlay">
   <input type="file" id="picker" aria-label="Open a FITS file" disabled>
+  <nav id="examples" aria-label="Example cubes">Examples:
+    <a href="?file=https://static.veggiesaurus.net/cubes/m25n512_hicube_gal15.fits">simulated HI galaxy</a> (88 MB),
+    <a href="?file=https://static.veggiesaurus.net/cubes/HD163296_CO_2-1.fits">HD 163296 CO 2-1</a> (187 MB),
+    <a href="?file=https://static.veggiesaurus.net/cubes/bin5_off2.fits">CO 1-0</a> (64 MB)
+  </nav>
   <div id="status" role="status">Starting</div>
 </div>
 <script type="module">
@@ -44,9 +50,28 @@ async function download(url, signal) {
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   // With a Content-Encoding it's the compressed size, so the buffer grows instead.
   const total = res.headers.get("Content-Encoding") ? 0 : Number(res.headers.get("Content-Length"));
+  const progress = got => (status.textContent = `Downloading ${mb(got)}${total ? ` of ${mb(total)}` : ""}`);
+  let got = 0;
+  // A BYOB reader fills the buffer in place, where the default reader hands back a new array per chunk that
+  // piles up as garbage until the load is over.
+  let byob = null;
+  try {
+    if (total) byob = res.body.getReader({ mode: "byob" });
+  } catch {}
+  if (byob) {
+    let buffer = new ArrayBuffer(total);
+    while (got < total) {
+      const { done, value } = await byob.read(new Uint8Array(buffer, got));
+      if (done) break;
+      // Each read transfers the buffer, so carry on with the one it hands back.
+      buffer = value.buffer;
+      got += value.length;
+      progress(got);
+    }
+    return new Uint8Array(buffer, 0, got);
+  }
   const reader = res.body.getReader();
   let bytes = new Uint8Array(total || 1 << 20);
-  let got = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -57,7 +82,7 @@ async function download(url, signal) {
     }
     bytes.set(value, got);
     got += value.length;
-    status.textContent = `Downloading ${mb(got)}${total ? ` of ${mb(total)}` : ""}`;
+    progress(got);
   }
   return bytes.subarray(0, got);
 }
