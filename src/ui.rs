@@ -13,6 +13,9 @@ use crate::{
     selection::{CropRequest, Hover},
 };
 
+/// CARTA's clip presets.
+pub const PERCENTILES: [f64; 8] = [90.0, 95.0, 99.0, 99.5, 99.9, 99.95, 99.99, 100.0];
+
 const HELP: &str = "Drag: orbit. Right or middle drag: pan. Scroll: zoom. Shift+drag: select region. \
     Drag a blue arrow or corner: resize. C or Enter: crop to selection. R: reset crop. Esc: clear selection.";
 
@@ -191,6 +194,22 @@ fn rendering_section(ui: &mut egui::Ui, data: &Dataset, settings: &mut ResMut<Se
     if p.scale_type == GAMMA {
         ui.add(egui::Slider::new(&mut p.scale_gamma, 0.0..=5.0).text("Gamma"));
     }
+    ui.horizontal_wrapped(|ui| {
+        for percent in PERCENTILES {
+            let clip = data.cube.histogram.clip(percent);
+            let button = ui
+                .selectable_label(
+                    (p.threshold_min, p.threshold_max) == clip,
+                    format!("{percent}%"),
+                )
+                .on_hover_text(format!(
+                    "Thresholds that keep the middle {percent}% of the whole cube's voxels"
+                ));
+            if button.clicked() {
+                (p.threshold_min, p.threshold_max) = clip;
+            }
+        }
+    });
     let value = |t: f32| p.scale_min + t * (p.scale_max - p.scale_min);
     let (min_value, max_value) = (value(p.threshold_min), value(p.threshold_max));
     // Each threshold is bounded by the other, as in iDaVIE, so Min can't pass Max.

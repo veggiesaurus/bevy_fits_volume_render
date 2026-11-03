@@ -66,6 +66,7 @@ The shader takes the same samples as iDaVIE's, apart from the step changes below
 - everything outside the selection stays desaturated for as long as there is one, including after a crop or reset. iDaVIE only desaturates while the selection is being drawn
 - a selection is clamped to the visible crop, so cropping can only narrow the view. In iDaVIE a selection can reach outside the crop, and cropping to it widens the view without a reset
 - WCS ticks are drawn on the box by default (the WCS axes checkbox turns them off); iDaVIE has none
+- percentile buttons (90 to 100%) set the thresholds to keep the middle share of the voxels, from an exact histogram built while the cube loads (about 20 ms per GB natively, 0.2 s per GB in the browser); iDaVIE has none
 - the near plane follows the camera in, so a small crop doesn't end up behind it
 - the step count is capped at two per texel along the texture's diagonal, so a small crop or a heavily downsampled cube takes fewer steps than in iDaVIE. Voxel edges can shift by a fraction of a voxel compared with iDaVIE
 - the view only redraws on input, so the jitter noise holds still while nothing changes; iDaVIE renders every frame

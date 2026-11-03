@@ -1,6 +1,8 @@
 use std::io::{self, ErrorKind};
 use std::str::FromStr;
 
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::tasks::ParallelSlice;
 use bevy::tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool};
 
 const BLOCK: usize = 2880;
@@ -89,6 +91,7 @@ pub struct Cube {
     pub cards: Vec<String>,
     pub hdu: usize,
     pub stats: Stats,
+    pub histogram: Histogram,
 }
 
 impl Cube {
@@ -199,7 +202,8 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
                         && !commentary.contains(&key)
                 }));
             }
-            let (data, stats) = read_data(source, offset, &cards, bitpix, width as usize, len)?;
+            let (data, stats, histogram) =
+                read_data(source, offset, &cards, bitpix, width as usize, len)?;
             return Ok(Cube {
                 dims,
                 axes: picked,
@@ -207,6 +211,7 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
                 cards,
                 hdu: index,
                 stats,
+                histogram,
             });
         }
 
@@ -337,7 +342,7 @@ fn read_data<S: Source + ?Sized>(
     bitpix: i64,
     width: usize,
     len: usize,
-) -> Result<(Vec<f32>, Stats), String> {
+) -> Result<(Vec<f32>, Stats, Histogram), String> {
     let bscale: f64 = num(cards, "BSCALE")?.unwrap_or(1.0);
     let bzero: f64 = num(cards, "BZERO")?.unwrap_or(0.0);
     // BLANK only applies to integer data. A real with no fraction (-32768.0) is taken too.
@@ -400,13 +405,11 @@ fn read_data<S: Source + ?Sized>(
     };
     // A pool of its own with a thread per core, since Bevy's compute pool only gets some of them.
     #[cfg(not(target_arch = "wasm32"))]
-    let chunks = data.par_chunk_map_mut(
-        &bevy::tasks::TaskPoolBuilder::new()
-            .num_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
-            .build(),
-        CHUNK_VOXELS,
-        decode,
-    );
+    let pool = bevy::tasks::TaskPoolBuilder::new()
+        .num_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
+        .build();
+    #[cfg(not(target_arch = "wasm32"))]
+    let chunks = data.par_chunk_map_mut(&pool, CHUNK_VOXELS, decode);
     #[cfg(target_arch = "wasm32")]
     let chunks: Vec<_> = data
         .chunks_mut(CHUNK_VOXELS)
@@ -416,7 +419,90 @@ fn read_data<S: Source + ?Sized>(
     let moments = chunks.into_iter().try_fold(Moments::EMPTY, |all, chunk| {
         Ok::<_, String>(all.merge(chunk?))
     })?;
-    Ok((data, moments.stats(len)))
+    let stats = moments.stats(len);
+
+    // The range is only known once every chunk is in, so the histogram takes a second pass.
+    let bins = ((moments.n as f64).sqrt().round() as usize).clamp(1, MAX_BINS);
+    let count = |values: &[f32]| count(values, stats.min, stats.max, bins);
+    // A few parts per thread, so the faster cores pick up the slack.
+    #[cfg(not(target_arch = "wasm32"))]
+    let parts = data.par_chunk_map(&pool, len.div_ceil(4 * pool.thread_num()), |_, part| {
+        count(part)
+    });
+    #[cfg(target_arch = "wasm32")]
+    let parts = [count(&data)];
+    let mut counts = vec![0; bins];
+    for part in parts {
+        counts.iter_mut().zip(part).for_each(|(c, n)| *c += n);
+    }
+    let cumulative = counts.iter().scan(0, |below, &n| {
+        *below += n;
+        Some(*below)
+    });
+    Ok((data, stats, Histogram(cumulative.collect())))
+}
+
+/// At most u16::MAX bins, so a u16 slot can't overrun a table and its last slot takes the non-finite voxels.
+const MAX_BINS: usize = u16::MAX as usize;
+
+/// Counts `values` in `bins` equal bins from `min` to `max`. Four tables take the voxels in turn, so a run of
+/// equal values (zeros, or the non-finite voxels in the last slot) doesn't wait on its own increments.
+fn count(values: &[f32], min: f32, max: f32, bins: usize) -> Vec<u64> {
+    const LANES: usize = 16;
+    let mut storage = vec![0u32; 4 << 16];
+    let tables: &mut [[u32; 1 << 16]; 4] = storage.as_chunks_mut().0.try_into().unwrap();
+    let range = f64::from(max) - f64::from(min);
+    let scale = if range > 0.0 {
+        (bins as f64 / range) as f32
+    } else {
+        0.0
+    };
+    let top = bins as u32 - 1;
+    let slot = |v: f32| match v.is_finite() {
+        true => (((v - min) * scale) as u32).min(top) as u16,
+        false => u16::MAX,
+    };
+    let (blocks, rest) = values.as_chunks::<LANES>();
+    for block in blocks {
+        // Worked out for a whole block first, so LLVM can vectorise it.
+        let mut slots = [0u16; LANES];
+        for i in 0..LANES {
+            slots[i] = slot(block[i]);
+        }
+        for (i, s) in slots.into_iter().enumerate() {
+            tables[i % 4][usize::from(s)] += 1;
+        }
+    }
+    for &v in rest {
+        tables[0][usize::from(slot(v))] += 1;
+    }
+    (0..bins)
+        .map(|b| tables.iter().map(|t| u64::from(t[b])).sum())
+        .collect()
+}
+
+/// Cumulative counts of the finite voxels in equal bins from `Stats::min` to `Stats::max`.
+#[derive(Clone, Debug)]
+pub struct Histogram(Vec<u64>);
+
+impl Histogram {
+    /// The fraction of the range below which `rank` (0..=1) of the voxels lie, interpolating linearly within the
+    /// bin, as CARTA does.
+    fn fraction_below(&self, rank: f64) -> f64 {
+        let target = rank * self.0[self.0.len() - 1] as f64;
+        let i = self.0.partition_point(|&c| (c as f64) < target);
+        let below = if i == 0 { 0 } else { self.0[i - 1] };
+        // Only a cube with no finite voxels has an empty bin here.
+        let n = (self.0[i] - below).max(1);
+        (i as f64 + (target - below as f64) / n as f64) / self.0.len() as f64
+    }
+
+    /// Thresholds, as fractions of the range, that keep the middle `percent` of the voxels.
+    pub fn clip(&self, percent: f64) -> (f32, f32) {
+        let tail = (100.0 - percent) / 200.0;
+        let (min, max) = (self.fraction_below(tail), self.fraction_below(1.0 - tail));
+        (min as f32, max as f32)
+    }
 }
 
 fn convert<const N: usize>(out: &mut [f32], raw: &[u8], f: impl Fn([u8; N]) -> f32) {
@@ -688,6 +774,7 @@ mod tests {
             cards: vec![],
             hdu: 0,
             stats: Moments::EMPTY.stats(0),
+            histogram: Histogram(vec![0]),
         };
 
         let floats = |(dims, bytes): ([usize; 3], Vec<u8>)| {
@@ -741,6 +828,7 @@ mod tests {
             cards: vec![],
             hdu: 0,
             stats: Moments::EMPTY.stats(0),
+            histogram: Histogram(vec![0]),
         };
         // The plain version that the row-at-a-time one replaced: each output voxel's block in z, y, x order.
         let reference = |min: [usize; 3], max: [usize; 3], f: [usize; 3], max_mode: bool| {
@@ -862,6 +950,69 @@ mod tests {
         assert_eq!((cube.stats.min, cube.stats.max), (0.0, 999.0));
         assert!((cube.stats.mean - whole.mean).abs() < 1e-9);
         assert!((cube.stats.std - whole.std).abs() < 1e-9);
+    }
+
+    #[test]
+    fn percentile_thresholds_match_an_exact_sort() {
+        // Noise across several chunks, with a strong negative artefact and a few bright outliers that percentiles
+        // should clip, as in THINGS' NGC 5236 cube, and NaN and infinite voxels to leave out.
+        let len = 2 * CHUNK_VOXELS + 123;
+        let mut seed = 12345u32;
+        let mut uniform = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1 << 24) as f32
+        };
+        let values: Vec<f32> = (0..len)
+            .map(|i| {
+                let noise = (0..12).map(|_| uniform()).sum::<f32>() - 6.0;
+                match i {
+                    _ if i % 1000 == 999 => f32::NAN,
+                    _ if i % 300_000 == 5 => f32::NEG_INFINITY,
+                    _ if i % 100_000 == 7 => noise - 80.0,
+                    _ if i % 200_000 == 11 => noise + 20.0,
+                    _ => noise,
+                }
+            })
+            .collect();
+        let mut file = header(&[
+            "SIMPLE  =                    T",
+            "BITPIX  =                  -32",
+            "NAXIS   =                    3",
+            &format!("NAXIS1  = {len:>20}"),
+            "NAXIS2  =                    1",
+            "NAXIS3  =                    1",
+        ]);
+        file.extend(pad(
+            values.iter().flat_map(|v| v.to_be_bytes()).collect(),
+            0,
+        ));
+        let histogram = read_fits(&file[..], None).unwrap().histogram;
+
+        let mut finite: Vec<f64> = (values.iter().filter(|v| v.is_finite()))
+            .map(|&v| v.into())
+            .collect();
+        finite.sort_by(f64::total_cmp);
+        assert_eq!(histogram.0.last(), Some(&(finite.len() as u64)));
+        let (min, max) = (finite[0], finite[finite.len() - 1]);
+        let exact = |rank: f64| {
+            let at = rank * (finite.len() - 1) as f64;
+            let (i, t) = (at as usize, at.fract());
+            let v = finite[i] + t * (finite[(i + 1).min(finite.len() - 1)] - finite[i]);
+            (v - min) / (max - min)
+        };
+        // Interpolating within a bin keeps every rank within about a twentieth of a bin here; without it, they'd be
+        // off by up to a whole bin.
+        let bin = 1.0 / histogram.0.len() as f64;
+        for percent in crate::ui::PERCENTILES {
+            let tail = (100.0 - percent) / 200.0;
+            let (lo, hi) = histogram.clip(percent);
+            for (got, want) in [(lo, exact(tail)), (hi, exact(1.0 - tail))] {
+                assert!(
+                    (f64::from(got) - want).abs() < 0.15 * bin,
+                    "{percent}%: {got} against {want}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -994,6 +1145,7 @@ mod tests {
             .into(),
             hdu: 0,
             stats: Moments::EMPTY.stats(0),
+            histogram: Histogram(vec![0]),
         };
         assert_eq!(cube.unit().as_deref(), Some("K 'per' beam"));
         assert_eq!(value(&cube.cards, "OBJECT").as_deref(), Some("AT&T"));
