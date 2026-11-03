@@ -1,7 +1,7 @@
 use std::io::{self, ErrorKind};
 use std::str::FromStr;
 
-use bevy::tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool, TaskPoolBuilder};
+use bevy::tasks::{ComputeTaskPool, ParallelSliceMut, TaskPool};
 
 const BLOCK: usize = 2880;
 /// Voxels read, decoded and summarised per task: 4 MB of output, small enough to stay in cache.
@@ -61,6 +61,26 @@ impl Source for std::fs::File {
     }
 }
 
+/// 0-based inclusive voxel corners.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Region {
+    pub min: [usize; 3],
+    pub max: [usize; 3],
+}
+
+impl Region {
+    pub fn whole(dims: [usize; 3]) -> Self {
+        Self {
+            min: [0; 3],
+            max: dims.map(|d| d - 1),
+        }
+    }
+
+    pub fn extent(&self) -> [usize; 3] {
+        std::array::from_fn(|i| self.max[i] - self.min[i] + 1)
+    }
+}
+
 pub struct Cube {
     pub dims: [usize; 3],
     /// The FITS axes (0-based) shown as x, y and z. One past NAXIS pads a 2D image.
@@ -72,6 +92,10 @@ pub struct Cube {
 }
 
 impl Cube {
+    pub fn value_at(&self, voxel: [usize; 3]) -> f32 {
+        self.data[voxel[0] + self.dims[0] * (voxel[1] + self.dims[1] * voxel[2])]
+    }
+
     /// The data unit from BUNIT, e.g. "Jy/beam" (or CASA's "beam-1 Jy").
     pub fn unit(&self) -> Option<String> {
         Some(value(&self.cards, "BUNIT")?.trim_start().to_string()).filter(|u| !u.is_empty())
@@ -358,8 +382,8 @@ fn read_data<S: Source + ?Sized>(
             for v in out.iter_mut() {
                 let bytes = v.to_ne_bytes();
                 *v = match bitpix {
-                    32 => int(i32::from_be_bytes(bytes) as i64),
-                    _ => float(f32::from_be_bytes(bytes) as f64),
+                    32 => int(i32::from_be_bytes(bytes).into()),
+                    _ => float(f32::from_be_bytes(bytes).into()),
                 };
             }
             return Ok(Moments::of(out));
@@ -367,8 +391,8 @@ fn read_data<S: Source + ?Sized>(
         let mut raw = vec![0u8; out.len() * width];
         read(&mut raw)?;
         match bitpix {
-            8 => convert(out, &raw, |b: [u8; 1]| int(b[0] as i64)),
-            16 => convert(out, &raw, |b| int(i16::from_be_bytes(b) as i64)),
+            8 => convert(out, &raw, |b: [u8; 1]| int(b[0].into())),
+            16 => convert(out, &raw, |b| int(i16::from_be_bytes(b).into())),
             64 => convert(out, &raw, |b| int(i64::from_be_bytes(b))),
             _ => convert(out, &raw, |b| float(f64::from_be_bytes(b))),
         }
@@ -377,7 +401,7 @@ fn read_data<S: Source + ?Sized>(
     // A pool of its own with a thread per core, since Bevy's compute pool only gets some of them.
     #[cfg(not(target_arch = "wasm32"))]
     let chunks = data.par_chunk_map_mut(
-        &TaskPoolBuilder::new()
+        &bevy::tasks::TaskPoolBuilder::new()
             .num_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
             .build(),
         CHUNK_VOXELS,
@@ -428,15 +452,15 @@ impl Moments {
         let (blocks, rest) = values.as_chunks::<LANES>();
         let tail: [f32; LANES] = std::array::from_fn(|i| rest.get(i).copied().unwrap_or(f32::NAN));
         let blocks = || blocks.iter().chain([&tail]);
-        // A lane counts a sixteenth of the voxels, so u32 holds any slice that fits in memory.
+        // A lane counts a sixteenth of a chunk of CHUNK_VOXELS, so u32 has room to spare.
         let (mut n, mut sum) = ([0u32; LANES], [0f64; LANES]);
         // In f32, which is exact, since comparisons never round.
         let (mut min, mut max) = ([f32::INFINITY; LANES], [f32::NEG_INFINITY; LANES]);
         for block in blocks() {
             for i in 0..LANES {
                 let (v, finite) = (block[i], block[i].is_finite());
-                n[i] += finite as u32;
-                sum[i] += if finite { v as f64 } else { 0.0 };
+                n[i] += u32::from(finite);
+                sum[i] += if finite { f64::from(v) } else { 0.0 };
                 min[i] = if finite { min[i].min(v) } else { min[i] };
                 max[i] = if finite { max[i].max(v) } else { max[i] };
             }
@@ -446,7 +470,7 @@ impl Moments {
         let mut m2 = [0f64; LANES];
         for block in blocks() {
             for i in 0..LANES {
-                let d = block[i] as f64 - mean;
+                let d = f64::from(block[i]) - mean;
                 m2[i] += if block[i].is_finite() { d * d } else { 0.0 };
             }
         }
@@ -454,8 +478,8 @@ impl Moments {
             n,
             mean,
             m2: m2.iter().sum(),
-            min: min.into_iter().fold(f32::INFINITY, f32::min) as f64,
-            max: max.into_iter().fold(f32::NEG_INFINITY, f32::max) as f64,
+            min: f64::from(min.into_iter().fold(f32::INFINITY, f32::min)),
+            max: f64::from(max.into_iter().fold(f32::NEG_INFINITY, f32::max)),
         }
     }
 
@@ -487,8 +511,8 @@ impl Moments {
     }
 }
 
-pub fn find_downsample_factors(max_cube_size_mb: u64, region_dims: [usize; 3]) -> [usize; 3] {
-    let [x, y, z] = region_dims.map(|d| d as u64);
+pub fn find_downsample_factors(gpu_memory_limit_mb: u64, extent: [usize; 3]) -> [usize; 3] {
+    let [x, y, z] = extent.map(|d| d as u64);
     let (mut fx, mut fy, mut fz) = (1, 1, 1);
     // Rounded up, as crop_and_downsample sizes the texture; iDaVIE rounds down here and can ask for 2049.
     while x.div_ceil(fx) > 2048 || y.div_ceil(fy) > 2048 {
@@ -498,7 +522,7 @@ pub fn find_downsample_factors(max_cube_size_mb: u64, region_dims: [usize; 3]) -
     while z.div_ceil(fz) > 2048 {
         fz += 1;
     }
-    let max_elements = max_cube_size_mb * 1_000_000 / 4;
+    let max_elements = gpu_memory_limit_mb * 1_000_000 / 4;
     while x.div_ceil(fx) * y.div_ceil(fy) * z.div_ceil(fz) > max_elements {
         if z / fz > x / fx || z / fz > y / fy {
             fz += 1;
@@ -510,20 +534,21 @@ pub fn find_downsample_factors(max_cube_size_mb: u64, region_dims: [usize; 3]) -
     [fx as usize, fy as usize, fz as usize]
 }
 
-/// min/max are 0-based inclusive voxel corners. Each block of `factors` becomes its maximum or mean, ignoring
-/// NaN, and NaN when it's all NaN. Returns (new_dims, bytes): the R32Float texture data, x fastest.
+/// Each block of `factors` becomes its maximum or mean, ignoring NaN, and NaN when it's all NaN. Returns
+/// (new_dims, bytes): the R32Float texture data, x fastest.
 pub fn crop_and_downsample(
     cube: &Cube,
-    min: [usize; 3],
-    max: [usize; 3],
+    region: Region,
     factors: [usize; 3],
     max_mode: bool,
 ) -> ([usize; 3], Vec<u8>) {
+    let Region { min, max } = region;
     assert!(
         (0..3).all(|i| min[i] <= max[i] && max[i] < cube.dims[i] && factors[i] > 0),
         "invalid crop or factors"
     );
-    let dims: [usize; 3] = std::array::from_fn(|i| (max[i] - min[i] + 1).div_ceil(factors[i]));
+    let extent = region.extent();
+    let dims: [usize; 3] = std::array::from_fn(|i| extent[i].div_ceil(factors[i]));
     let block = |i: usize, o: usize| {
         min[i] + o * factors[i]..(min[i] + (o + 1) * factors[i]).min(max[i] + 1)
     };
@@ -668,34 +693,24 @@ mod tests {
         let floats = |(dims, bytes): ([usize; 3], Vec<u8>)| {
             (dims, bytemuck::pod_collect_to_vec::<u8, f32>(&bytes))
         };
-        let (new_dims, max) = floats(crop_and_downsample(
-            &cube,
-            [1, 0, 0],
-            [4, 2, 1],
-            [3, 2, 2],
-            true,
-        ));
+        let crop = Region {
+            min: [1, 0, 0],
+            max: [4, 2, 1],
+        };
+        let (new_dims, max) = floats(crop_and_downsample(&cube, crop, [3, 2, 2], true));
         assert_eq!(new_dims, [2, 2, 1]);
         assert_eq!(max[..3], [113.0, 114.0, 123.0]);
         assert!(max[3].is_nan());
 
-        let (_, mean) = floats(crop_and_downsample(
-            &cube,
-            [1, 0, 0],
-            [4, 2, 1],
-            [3, 2, 2],
-            false,
-        ));
+        let (_, mean) = floats(crop_and_downsample(&cube, crop, [3, 2, 2], false));
         assert_eq!(mean[..3], [683.0 / 11.0, 59.0, 72.0]);
         assert!(mean[3].is_nan());
 
-        let (new_dims, full) = floats(crop_and_downsample(
-            &cube,
-            [1, 1, 0],
-            [3, 2, 1],
-            [1; 3],
-            true,
-        ));
+        let crop = Region {
+            min: [1, 1, 0],
+            max: [3, 2, 1],
+        };
+        let (new_dims, full) = floats(crop_and_downsample(&cube, crop, [1; 3], true));
         assert_eq!(new_dims, [3, 2, 2]);
         assert_eq!(
             full,
@@ -765,7 +780,8 @@ mod tests {
         ] {
             for (min, max) in [([0; 3], [36, 28, 10]), ([3, 5, 1], [30, 20, 9])] {
                 for max_mode in [true, false] {
-                    let (_, bytes) = crop_and_downsample(&cube, min, max, factors, max_mode);
+                    let (_, bytes) =
+                        crop_and_downsample(&cube, Region { min, max }, factors, max_mode);
                     let got = bytemuck::pod_collect_to_vec::<u8, f32>(&bytes);
                     let want = reference(min, max, factors, max_mode);
                     assert!(

@@ -92,7 +92,7 @@ impl From<Scaling> for String {
     }
 }
 
-/// Parse TOML text (None = defaults), then apply overrides, then validate.
+/// Parse TOML text (None = defaults), then apply overrides (whose keys may use - for _), then validate.
 pub fn from_toml(text: Option<&str>, overrides: &[(String, String)]) -> Result<Config, String> {
     let mut table: toml::Table = text
         .unwrap_or("")
@@ -102,7 +102,7 @@ pub fn from_toml(text: Option<&str>, overrides: &[(String, String)]) -> Result<C
         let parsed = value
             .parse()
             .unwrap_or_else(|_| toml::Value::String(value.clone()));
-        table.insert(key.clone(), parsed);
+        table.insert(key.replace('-', "_"), parsed);
     }
     let config: Config = table
         .try_into()
@@ -123,6 +123,12 @@ pub fn from_toml(text: Option<&str>, overrides: &[(String, String)]) -> Result<C
         return Err("gpu_memory_limit_mb must be > 0".into());
     }
     Ok(config)
+}
+
+pub fn parse_hdu(value: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| format!("hdu needs a number, got '{value}'"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -199,14 +205,8 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>
             .ok_or_else(|| format!("--{key} needs a value\n{USAGE}"))?;
         match key {
             "config" => config = Some(PathBuf::from(value)),
-            "hdu" => {
-                hdu = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("--hdu needs a number, got '{value}'"))?,
-                )
-            }
-            _ => overrides.push((key.replace('-', "_"), value)),
+            "hdu" => hdu = Some(parse_hdu(&value)?),
+            _ => overrides.push((key.to_string(), value)),
         }
     }
     Ok(Some(Args {

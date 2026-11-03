@@ -39,6 +39,11 @@ const SQUARE: u32 = 3u;
 const POWER: u32 = 4u;
 const GAMMA: u32 = 5u;
 
+// The projection_mode of ui.rs's Average button; 0 is Maximum.
+const AVERAGE: u32 = 1u;
+
+const F32_MAX: f32 = 3.402823466e+38;
+
 // Unity object space is left-handed: same x and y as Bevy's local space, z mirrored.
 const UNITY_FROM_LOCAL = vec3<f32>(1.0, 1.0, -1.0);
 
@@ -90,7 +95,7 @@ fn in_box(position: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> bool {
     return all(position >= box_min) && all(position <= box_max);
 }
 
-// data_sampler does iDaVIE's point filtering and Repeat wrapping (volume.rs cube_image).
+// data_sampler does iDaVIE's point filtering and Repeat wrapping (volume.rs empty_cube_image).
 fn sample_cube(position: vec3<f32>) -> f32 {
     return textureSampleLevel(data_cube, data_sampler, position, 0.0).r;
 }
@@ -125,7 +130,7 @@ fn average(ray: Ray, value: f32, position: vec3<f32>, step_length: f32, highligh
 
 fn accumulate(ray: Ray, position: vec3<f32>, step_length: f32, highlight_min: vec3<f32>, highlight_max: vec3<f32>) -> Ray {
     let value = sample_cube(position);
-    if params.projection_mode == 1u {
+    if params.projection_mode == AVERAGE {
         return average(ray, value, position, step_length, highlight_min, highlight_max);
     }
     return maximum(ray, value, position, highlight_min, highlight_max);
@@ -134,7 +139,7 @@ fn accumulate(ray: Ray, position: vec3<f32>, step_length: f32, highlight_min: ve
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Distance to opaque geometry along the ray (iDaVIE reads _CameraDepthTexture), here the outline lines.
-    var opaque_depth = 3.402823466e+38;
+    var opaque_depth = F32_MAX;
     @if(DEPTH_PREPASS) {
         let depth = prepass_depth(in.position, 0u);
         // Reverse-Z: 0 is the far plane, so nothing opaque at this pixel.
@@ -184,12 +189,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // The guard keeps a constant cube from dividing zero by zero.
     let scale_range = select(params.scale_max - params.scale_min, 1.0, params.scale_max == params.scale_min);
 
-    var ray = Ray(select(-3.402823466e+38, 0.0, params.projection_mode == 1u), 0.0, false, false);
+    var ray = Ray(select(-F32_MAX, 0.0, params.projection_mode == AVERAGE), 0.0, false, false);
     // Unrolled so the texture fetches overlap; the step positions are the same as one step at a time.
     let s = adjusted_step_vector;
     let h_min = highlight_min;
     let h_max = highlight_max;
-    if params.projection_mode == 1u {
+    if params.projection_mode == AVERAGE {
         var i = 0;
         for (; i + 4 <= required_steps; i += 4) {
             let p1 = position + s;
@@ -253,7 +258,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // iDaVIE weights this sample by remaining_step_length, which is negative and can zero the average.
     let leftover_length = max(total_length - f32(required_steps) * step_length, 0.0);
     ray = accumulate(ray, position, leftover_length, highlight_min, highlight_max);
-    if params.projection_mode == 1u && ray.cumulative_length > 0.0 {
+    if params.projection_mode == AVERAGE && ray.cumulative_length > 0.0 {
         ray.value /= ray.cumulative_length;
     }
 

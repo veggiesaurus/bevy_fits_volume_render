@@ -13,7 +13,7 @@ use bevy::{
 };
 use js_sys::Uint8Array;
 
-use crate::{Dataset, config, fits, ui::format_dims};
+use crate::{Dataset, config, fits};
 
 static PENDING: Mutex<Option<Dataset>> = Mutex::new(None);
 
@@ -31,7 +31,7 @@ struct JsBytes(Uint8Array);
 
 impl fits::Source for JsBytes {
     fn size(&self) -> io::Result<u64> {
-        Ok(self.0.length() as u64)
+        Ok(u64::from(self.0.length()))
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -58,14 +58,8 @@ pub fn load_fits(
     let mut hdu = None;
     let mut config_overrides = Vec::new();
     for (key, value) in overrides.lines().filter_map(|kv| kv.split_once('=')) {
-        match key.replace('-', "_").as_str() {
-            "hdu" => {
-                hdu = Some(
-                    value
-                        .parse()
-                        .map_err(|_| format!("hdu needs a number, got '{value}'"))?,
-                )
-            }
+        match key {
+            "hdu" => hdu = Some(config::parse_hdu(value)?),
             key => config_overrides.push((key.to_string(), value.to_string())),
         }
     }
@@ -75,13 +69,7 @@ pub fn load_fits(
     )?;
     let cube = fits::read_fits(&JsBytes(bytes), hdu)?;
     let dataset = Dataset::new(name, cube, config, start);
-    info!(
-        "Loaded {} (HDU {}): {} in {:.2} s",
-        dataset.name,
-        dataset.cube.hdu,
-        format_dims(dataset.cube.dims),
-        dataset.load_seconds
-    );
+    info!("{}", dataset.summary());
     *PENDING.lock().unwrap() = Some(dataset);
     WAKE.with(|wake| {
         wake.borrow()

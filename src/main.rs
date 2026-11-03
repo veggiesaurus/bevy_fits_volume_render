@@ -27,42 +27,23 @@ use bevy::{
 };
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
+use axes::AxisAnnotation;
 use camera::Orbit;
 use config::Config;
-use fits::Cube;
-use outline::{CubeOutline, Outline, OutlineMaterials, SelectionOutline, box_lines};
-use selection::{CropCommand, Gesture, Hover, PendingCrop};
+use fits::{Cube, Region};
+use selection::{CropRequest, Gesture, Hover, PendingCrop};
 use upload::{UploadPlugin, Uploads};
 use volume::{VolumeMaterial, VolumeParams, VolumePlugin};
 
-/// Bevy's local space is right-handed; iDaVIE's (Unity) object space mirrors z.
+/// Bevy's local space is right-handed; iDaVIE's (Unity) object space mirrors z. Its own inverse, so it
+/// converts either way.
 const UNITY_FROM_LOCAL: Vec3 = Vec3::new(1.0, 1.0, -1.0);
 /// iDaVIE's VolumeDataSetRenderer.SelectionSaturateFactor.
 const SELECTION_SATURATE_FACTOR: f32 = 0.7;
 
-/// 0-based inclusive voxel corners.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Region {
-    min: [usize; 3],
-    max: [usize; 3],
-}
-
-impl Region {
-    fn whole(dims: [usize; 3]) -> Self {
-        Self {
-            min: [0; 3],
-            max: dims.map(|d| d - 1),
-        }
-    }
-
-    fn extent(&self) -> [usize; 3] {
-        std::array::from_fn(|i| self.max[i] - self.min[i] + 1)
-    }
-}
-
 /// A texture made from a region of the cube, and the downsampling it took.
-#[derive(Clone)]
 struct VolumeTexture {
+    region: Region,
     handle: Handle<Image>,
     dims: [usize; 3],
     factors: [usize; 3],
@@ -70,6 +51,7 @@ struct VolumeTexture {
 
 /// A VolumeTexture's bytes, built off the main thread and then uploaded a slab at a time.
 struct TextureBytes {
+    region: Region,
     bytes: Vec<u8>,
     dims: [usize; 3],
     factors: [usize; 3],
@@ -81,6 +63,7 @@ impl TextureBytes {
         let handle = images.add(volume::empty_cube_image(self.dims));
         uploads.push(handle.id(), self.dims, self.bytes);
         VolumeTexture {
+            region: self.region,
             handle,
             dims: self.dims,
             factors: self.factors,
@@ -101,9 +84,6 @@ struct Dataset {
 impl Dataset {
     fn new(name: String, cube: Cube, config: Config, start: Instant) -> Self {
         let wcs = wcs::Wcs::from_cards(&cube.cards, cube.axes);
-        if let Some(planes) = cube.other_planes() {
-            warn!("{name}: showing plane {planes}");
-        }
         Self {
             name,
             cube: Arc::new(cube),
@@ -113,8 +93,25 @@ impl Dataset {
         }
     }
 
-    fn full_region(&self) -> Region {
-        Region::whole(self.cube.dims)
+    /// What was loaded, for the terminal or the browser console.
+    fn summary(&self) -> String {
+        let s = self.cube.stats;
+        let mut summary = format!(
+            "Loaded {} (HDU {}): {} in {:.2} s\nRange {} .. {}, mean {:.4e}, std {:.4e}, {} non-finite voxels",
+            self.name,
+            self.cube.hdu,
+            ui::format_dims(self.cube.dims),
+            self.load_seconds,
+            s.min,
+            s.max,
+            s.mean,
+            s.std,
+            s.non_finite
+        );
+        if let Some(planes) = self.cube.other_planes() {
+            summary.push_str(&format!("\nWarning: showing plane {planes}"));
+        }
+        summary
     }
 }
 
@@ -122,22 +119,18 @@ impl Dataset {
 struct CubeState {
     material: Handle<VolumeMaterial>,
     full: VolumeTexture,
-    crop: Option<(Region, VolumeTexture)>,
+    crop: Option<VolumeTexture>,
     selection: Option<Region>,
 }
 
 impl CubeState {
-    /// The region on screen: the crop, or the whole cube.
-    fn visible(&self, data: &Dataset) -> Region {
-        self.crop
-            .as_ref()
-            .map_or(data.full_region(), |(region, _)| *region)
+    fn texture(&self) -> &VolumeTexture {
+        self.crop.as_ref().unwrap_or(&self.full)
     }
 
-    fn texture(&self) -> &VolumeTexture {
-        self.crop
-            .as_ref()
-            .map_or(&self.full, |(_, texture)| texture)
+    /// The region on screen: the crop, or the whole cube.
+    fn visible(&self) -> Region {
+        self.texture().region
     }
 }
 
@@ -147,8 +140,28 @@ struct Settings {
     wcs_axes: bool,
 }
 
+impl Settings {
+    /// The config's rendering defaults, scaled to the cube's range.
+    fn new(data: &Dataset) -> Self {
+        let config = &data.config;
+        Self {
+            params: VolumeParams {
+                scale_min: data.cube.stats.min,
+                scale_max: data.cube.stats.max,
+                jitter: config.jitter,
+                max_steps: config.max_raymarching_steps,
+                color_map_index: config.default_color_map.0,
+                scale_type: config.default_scaling_type.0,
+                ..default()
+            },
+            wcs_axes: true,
+        }
+    }
+}
+
+/// Everything spawned for the loaded file, despawned when another is loaded.
 #[derive(Component)]
-struct VolumeCube;
+struct DatasetEntity;
 
 fn main() {
     #[cfg(not(target_arch = "wasm32"))]
@@ -187,44 +200,56 @@ fn main() {
     .init_resource::<grips::Grips>()
     .init_resource::<Gesture>()
     .init_resource::<PendingCrop>()
-    .add_message::<CropCommand>()
+    .add_message::<CropRequest>()
     .add_systems(Startup, camera::spawn_camera)
     .add_systems(
         Update,
         (
+            selection::end_gesture,
             spawn_volume.run_if(resource_exists_and_changed::<Dataset>),
             // Grips go first so grabbing one takes the click away from orbiting and shift-drag selection,
             // and a crop retargets the orbit before the camera moves this frame.
             (
                 grips::drag_grips,
                 selection::select_region,
+                selection::selection_keys,
                 selection::apply_crop,
             )
                 .chain()
                 .run_if(resource_exists::<CubeState>),
             camera::orbit_camera,
+            // After the orbit, so hidden edges are shaded and grips drawn from this frame's camera.
             (
-                update_material,
+                update_material.run_if(
+                    resource_exists_and_changed::<Settings>
+                        .or_eager(resource_exists_and_changed::<CubeState>),
+                ),
                 show_volume,
                 axes::update_axes,
-                outline::update_outlines,
-                outline::shade_hidden_edges,
+                // Each outline is moved before its hidden edges are worked out.
+                (
+                    outline::update_outlines.run_if(resource_exists_and_changed::<CubeState>),
+                    outline::shade_hidden_edges,
+                )
+                    .chain(),
                 grips::draw_grips,
             )
-                .chain()
                 .run_if(resource_exists::<CubeState>),
         )
             .chain(),
     )
     .add_systems(Update, keep_redrawing)
-    .add_systems(EguiPrimaryContextPass, (ui::ui, axes::draw_axes));
+    .add_systems(
+        EguiPrimaryContextPass,
+        (
+            ui::ui,
+            axes::draw_axes.run_if(resource_exists::<AxisAnnotation>),
+        ),
+    );
 
     // Redraw only on input, so an idle view doesn't keep the GPU ray-marching. SCREENSHOT counts frames, so
     // it keeps Bevy's continuous default.
-    #[cfg(not(target_arch = "wasm32"))]
-    let continuous = std::env::var("SCREENSHOT").is_ok();
-    #[cfg(target_arch = "wasm32")]
-    let continuous = false;
+    let continuous = cfg!(not(target_arch = "wasm32")) && std::env::var("SCREENSHOT").is_ok();
     if !continuous {
         app.insert_resource(WinitSettings::desktop_app());
     }
@@ -233,10 +258,11 @@ fn main() {
     app.add_systems(Startup, web::keep_wake_proxy)
         .add_systems(PreUpdate, web::poll);
     #[cfg(not(target_arch = "wasm32"))]
-    app.insert_resource(dataset);
-    #[cfg(not(target_arch = "wasm32"))]
-    if let Ok(path) = std::env::var("SCREENSHOT") {
-        app.add_systems(Update, screenshot_and_exit(path));
+    {
+        app.insert_resource(dataset);
+        if let Ok(path) = std::env::var("SCREENSHOT") {
+            app.add_systems(Update, screenshot_and_exit(path));
+        }
     }
 
     app.run();
@@ -301,7 +327,6 @@ fn load_native() -> Dataset {
     }
     let config_path = args
         .config
-        .clone()
         .or_else(config::default_path)
         .unwrap_or_else(|| fail("No config location found; pass --config"));
     let config = config::load(&config_path, &args.overrides)
@@ -319,22 +344,9 @@ fn load_native() -> Dataset {
         |n| n.to_string_lossy().into_owned(),
     );
     let dataset = Dataset::new(name, cube, config, start);
-
-    let [x, y, z] = dataset.cube.dims;
-    let s = dataset.cube.stats;
+    // Printed, since logging only starts with the app.
     println!("Config: {}", config_path.display());
-    println!(
-        "Loaded {} (HDU {}): {x} x {y} x {z} in {:.2} s",
-        dataset.name, dataset.cube.hdu, dataset.load_seconds
-    );
-    println!(
-        "Range {} .. {}, mean {:.4e}, std {:.4e}, {} non-finite voxels",
-        s.min, s.max, s.mean, s.std, s.non_finite
-    );
-    // Logging only starts with the app, so Dataset::new's warning doesn't reach the terminal.
-    if let Some(planes) = dataset.cube.other_planes() {
-        println!("Warning: showing plane {planes}");
-    }
+    println!("{}", dataset.summary());
     dataset
 }
 
@@ -342,14 +354,10 @@ fn load_native() -> Dataset {
 fn region_bytes(cube: &Cube, config: &Config, region: Region) -> TextureBytes {
     let start = Instant::now();
     let factors = fits::find_downsample_factors(config.gpu_memory_limit_mb, region.extent());
-    let (dims, bytes) = fits::crop_and_downsample(
-        cube,
-        region.min,
-        region.max,
-        factors,
-        config.max_mode_downsampling,
-    );
+    let (dims, bytes) =
+        fits::crop_and_downsample(cube, region, factors, config.max_mode_downsampling);
     let texture = TextureBytes {
+        region,
         bytes,
         dims,
         factors,
@@ -372,33 +380,21 @@ fn region_bounds(region: Region, dims: [usize; 3]) -> (Vec3, Vec3) {
 fn spawn_volume(
     mut commands: Commands,
     data: Res<Dataset>,
-    old: Query<Entity, With<VolumeCube>>,
+    old: Query<Entity, With<DatasetEntity>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<VolumeMaterial>>,
     mut line_materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut uploads: ResMut<Uploads>,
-    mut orbits: Query<&mut Orbit>,
+    mut orbit: Single<&mut Orbit>,
 ) {
     for entity in &old {
         commands.entity(entity).despawn();
     }
-    let full = region_bytes(&data.cube, &data.config, data.full_region())
+    let full = region_bytes(&data.cube, &data.config, Region::whole(data.cube.dims))
         .upload(&mut images, &mut uploads);
 
-    let config = &data.config;
-    let settings = Settings {
-        params: VolumeParams {
-            scale_min: data.cube.stats.min,
-            scale_max: data.cube.stats.max,
-            jitter: config.jitter,
-            max_steps: config.max_raymarching_steps,
-            color_map_index: config.default_color_map.0,
-            scale_type: config.default_scaling_type.0,
-            ..default()
-        },
-        wcs_axes: true,
-    };
+    let settings = Settings::new(&data);
     let material = materials.add(VolumeMaterial {
         params: settings.params,
         data_cube: full.handle.clone(),
@@ -410,34 +406,9 @@ fn spawn_volume(
         Transform::IDENTITY,
         // Until its texture has been filled.
         Visibility::Hidden,
-        VolumeCube,
+        DatasetEntity,
     ));
-    // Opaque line meshes rather than gizmos, so they reach the depth prepass and the volume covers the back edges.
-    let line_colour = |c: Color| StandardMaterial {
-        base_color: c,
-        unlit: true,
-        ..default()
-    };
-    let outline = OutlineMaterials {
-        white: line_materials.add(line_colour(Color::WHITE)),
-        yellow: line_materials.add(line_colour(Color::srgb(1.0, 1.0, 0.0))),
-    };
-    commands.spawn((
-        Mesh3d(meshes.add(box_lines())),
-        MeshMaterial3d(outline.white.clone()),
-        Outline::with_axes(),
-        CubeOutline,
-        VolumeCube,
-    ));
-    commands.spawn((
-        Mesh3d(meshes.add(box_lines())),
-        MeshMaterial3d(outline.white.clone()),
-        Visibility::Hidden,
-        Outline::default(),
-        SelectionOutline,
-        VolumeCube,
-    ));
-    commands.insert_resource(outline);
+    outline::spawn_outlines(&mut commands, &mut meshes, &mut line_materials);
     commands.insert_resource(settings);
     commands.insert_resource(Gesture::default());
     commands.insert_resource(PendingCrop::default());
@@ -447,9 +418,7 @@ fn spawn_volume(
         crop: None,
         selection: None,
     });
-    for mut orbit in &mut orbits {
-        *orbit = Orbit::default();
-    }
+    **orbit = Orbit::default();
 }
 
 fn update_material(
@@ -458,14 +427,11 @@ fn update_material(
     data: Res<Dataset>,
     mut materials: ResMut<Assets<VolumeMaterial>>,
 ) {
-    if !settings.is_changed() && !state.is_changed() {
-        return;
-    }
     let Some(mut material) = materials.get_mut(&state.material) else {
         return;
     };
     let mut params = settings.params;
-    (params.slice_min, params.slice_max) = region_bounds(state.visible(&data), data.cube.dims);
+    (params.slice_min, params.slice_max) = region_bounds(state.visible(), data.cube.dims);
     if let Some(selection) = state.selection {
         (params.highlight_min, params.highlight_max) = region_bounds(selection, data.cube.dims);
         params.highlight_saturate_factor = SELECTION_SATURATE_FACTOR;

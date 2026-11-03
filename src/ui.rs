@@ -7,12 +7,13 @@ use bevy::{
 use bevy_egui::{EguiContexts, egui};
 
 use crate::{
-    CubeState, Dataset, Region, Settings,
+    CubeState, Dataset, Settings,
     config::{COLOR_MAPS, GAMMA, JITTER, RAYMARCHING_STEPS, SCALING_TYPES},
-    selection::{CropCommand, Hover},
+    fits::Region,
+    selection::{CropRequest, Hover},
 };
 
-pub const HELP: &str = "Drag: orbit. Right or middle drag: pan. Scroll: zoom. Shift+drag: select region. \
+const HELP: &str = "Drag: orbit. Right or middle drag: pan. Scroll: zoom. Shift+drag: select region. \
     Drag a blue arrow or corner: resize. C or Enter: crop to selection. R: reset crop. Esc: clear selection.";
 
 pub fn format_dims(d: [usize; 3]) -> String {
@@ -20,7 +21,7 @@ pub fn format_dims(d: [usize; 3]) -> String {
 }
 
 /// 1-based inclusive ranges, as iDaVIE displays them.
-pub fn format_region(Region { min, max }: Region) -> String {
+fn format_region(Region { min, max }: Region) -> String {
     format!(
         "x {}..{}, y {}..{}, z {}..{}",
         min[0] + 1,
@@ -40,7 +41,7 @@ pub fn ui(
     hover: Res<Hover>,
     diagnostics: Res<DiagnosticsStore>,
     windows: Query<&Window>,
-    mut crop: MessageWriter<CropCommand>,
+    mut crop_requests: MessageWriter<CropRequest>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     egui::Window::new("iDaVIE volume renderer")
@@ -65,7 +66,9 @@ pub fn ui(
             };
             egui::CollapsingHeader::new("Cube")
                 .default_open(true)
-                .show(ui, |ui| cube_section(ui, &data, &state, hover.0, &mut crop));
+                .show(ui, |ui| {
+                    cube_section(ui, &data, &state, hover.0, &mut crop_requests)
+                });
             if let Some(wcs) = &data.wcs {
                 egui::CollapsingHeader::new("WCS").show(ui, |ui| {
                     for line in wcs.summary() {
@@ -82,16 +85,16 @@ pub fn ui(
     Ok(())
 }
 
-pub fn cube_section(
+fn cube_section(
     ui: &mut egui::Ui,
     data: &Dataset,
     state: &CubeState,
     hover: Option<[usize; 3]>,
-    crop: &mut MessageWriter<CropCommand>,
+    crop_requests: &mut MessageWriter<CropRequest>,
 ) {
     let cube = &data.cube;
     let stats = cube.stats;
-    let gb = cube.data.len() as f64 * 4.0 / 1e9;
+    let gb = (cube.data.len() * size_of::<f32>()) as f64 / 1e9;
     let unit = cube.unit().map_or(String::new(), |u| format!(" {u}"));
     egui::Grid::new("cube").num_columns(2).show(ui, |ui| {
         let mut row = |name: &str, value: String| {
@@ -124,7 +127,7 @@ pub fn cube_section(
         } else {
             format!("downsampled {fx} x {fy} x {fz}")
         };
-        let mb = texture.dims.iter().product::<usize>() as f64 * 4.0 / 1e6;
+        let mb = (texture.dims.iter().product::<usize>() * size_of::<f32>()) as f64 / 1e6;
         row(
             "Texture",
             format!("{} ({mb:.0} MB), {resolution}", format_dims(texture.dims)),
@@ -134,16 +137,13 @@ pub fn cube_section(
             state
                 .crop
                 .as_ref()
-                .map_or("entire cube".to_string(), |(region, _)| {
-                    format_region(*region)
-                }),
+                .map_or("entire cube".to_string(), |crop| format_region(crop.region)),
         );
         if let Some(selection) = state.selection {
             row("Selection", format_region(selection));
         }
         if let Some(v) = hover {
-            let index = v[0] + cube.dims[0] * (v[1] + cube.dims[1] * v[2]);
-            let value = cube.data[index];
+            let value = cube.value_at(v);
             row(
                 "Cursor",
                 format!(
@@ -163,15 +163,15 @@ pub fn cube_section(
         let button =
             |ui: &mut egui::Ui, enabled, text| ui.add_enabled(enabled, egui::Button::new(text));
         if button(ui, state.selection.is_some(), "Crop to selection").clicked() {
-            crop.write(CropCommand::ToSelection);
+            crop_requests.write(CropRequest::ToSelection);
         }
         if button(ui, state.crop.is_some(), "Reset crop").clicked() {
-            crop.write(CropCommand::Reset);
+            crop_requests.write(CropRequest::Reset);
         }
     });
 }
 
-pub fn rendering_section(ui: &mut egui::Ui, data: &Dataset, settings: &mut ResMut<Settings>) {
+fn rendering_section(ui: &mut egui::Ui, data: &Dataset, settings: &mut ResMut<Settings>) {
     let mut s = settings.clone();
     let p = &mut s.params;
     egui::ComboBox::from_label("Colour map")

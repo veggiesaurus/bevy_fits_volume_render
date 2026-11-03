@@ -8,13 +8,13 @@ use bevy::{
 };
 use bevy_egui::input::EguiWantsInput;
 
-use crate::{UNITY_FROM_LOCAL, grips::Grips, selection::Gesture};
+use crate::{UNITY_FROM_LOCAL, selection::Gesture};
 
 pub const DEFAULT_DISTANCE: f32 = 2.0;
 
 /// The near plane as a fraction of the orbit distance: iDaVIE's 0.05 at the default distance, and it
 /// follows the camera in when a crop or zoom brings it close.
-pub const NEAR_FRACTION: f32 = 0.025;
+const NEAR_FRACTION: f32 = 0.025;
 
 #[derive(Component)]
 pub struct Orbit {
@@ -38,21 +38,19 @@ impl Default for Orbit {
 /// The cursor's window position, and the ray under it in iDaVIE (Unity) object space.
 pub struct Pointer {
     pub cursor: Vec2,
-    pub origin: Vec3,
-    pub direction: Vec3,
+    pub ray: Ray3d,
 }
 
-pub fn pointer(
-    windows: &Query<&Window>,
-    camera: &Camera,
-    view: &GlobalTransform,
-) -> Option<Pointer> {
-    let cursor = windows.single().ok()?.cursor_position()?;
+pub fn pointer(window: &Window, camera: &Camera, view: &GlobalTransform) -> Option<Pointer> {
+    let cursor = window.cursor_position()?;
     let ray = camera.viewport_to_world(view, cursor).ok()?;
     Some(Pointer {
         cursor,
-        origin: ray.origin * UNITY_FROM_LOCAL,
-        direction: *ray.direction * UNITY_FROM_LOCAL,
+        // Mirroring keeps the direction a unit vector.
+        ray: Ray3d::new(
+            ray.origin * UNITY_FROM_LOCAL,
+            Dir3::new_unchecked(*ray.direction * UNITY_FROM_LOCAL),
+        ),
     })
 }
 
@@ -81,23 +79,12 @@ pub fn orbit_camera(
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     egui: Res<EguiWantsInput>,
-    grips: Res<Grips>,
     mut gesture: ResMut<Gesture>,
-    mut cameras: Query<(&mut Orbit, &mut Transform, &mut Projection)>,
+    camera: Single<(&mut Orbit, &mut Transform, &mut Projection)>,
 ) {
-    let Ok((mut orbit, mut transform, mut projection)) = cameras.single_mut() else {
-        return;
-    };
+    let (mut orbit, mut transform, mut projection) = camera.into_inner();
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    if !buttons.pressed(MouseButton::Left) && matches!(*gesture, Gesture::Orbit) {
-        *gesture = Gesture::Idle;
-    }
-    if buttons.just_pressed(MouseButton::Left)
-        && !shift
-        && !egui.wants_pointer_input()
-        && grips.drag.is_none()
-        && matches!(*gesture, Gesture::Idle)
-    {
+    if !shift && gesture.can_start(&buttons, &egui) {
         *gesture = Gesture::Orbit;
     }
     // A tap can press and release in one frame, which shouldn't turn that frame's pointer motion into an orbit.
@@ -121,8 +108,9 @@ pub fn orbit_camera(
         orbit.target += rotation * Vec3::new(-motion.delta.x, motion.delta.y, 0.0) * scale;
     }
     let offset = rotation * Vec3::Z * orbit.distance;
-    *transform =
-        Transform::from_translation(orbit.target + offset).looking_at(orbit.target, Vec3::Y);
+    transform.set_if_neq(
+        Transform::from_translation(orbit.target + offset).looking_at(orbit.target, Vec3::Y),
+    );
     // Written only when it moves, so the projection isn't marked changed every frame.
     let near = orbit.distance * NEAR_FRACTION;
     if let Projection::Perspective(perspective) = projection.bypass_change_detection()

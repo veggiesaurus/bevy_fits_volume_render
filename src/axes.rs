@@ -4,16 +4,16 @@ use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 
 use crate::{
-    CubeState, Dataset, Region, Settings, UNITY_FROM_LOCAL, camera::Orbit, outline::edge_ends,
-    region_bounds, wcs,
+    CubeState, Dataset, Settings, UNITY_FROM_LOCAL, camera::Orbit, fits::Region,
+    outline::edge_ends, region_bounds, wcs,
 };
 
 /// WCS ticks for the 12 edges of the visible box (see `edge_ends`), recomputed when it changes.
 #[derive(Resource)]
 pub struct AxisAnnotation {
-    pub region: Region,
-    pub edges: Vec<Vec<wcs::Tick>>,
-    pub titles: [Option<String>; 3],
+    visible: Region,
+    edges: Vec<Vec<wcs::Tick>>,
+    titles: [Option<String>; 3],
 }
 
 pub fn update_axes(
@@ -22,9 +22,8 @@ pub fn update_axes(
     state: Res<CubeState>,
     axes: Option<Res<AxisAnnotation>>,
 ) {
-    let region = state.visible(&data);
-    let Region { min, max } = region;
-    if !data.is_changed() && axes.map_or(data.wcs.is_none(), |a| a.region == region) {
+    let visible = state.visible();
+    if !data.is_changed() && axes.map_or(data.wcs.is_none(), |a| a.visible == visible) {
         return;
     }
     let Some(wcs) = &data.wcs else {
@@ -32,8 +31,9 @@ pub fn update_axes(
         return;
     };
     // GRID coordinates put voxel i's centre at i + 1, so the box spans min + 0.5 to max + 1.5.
+    let extent = visible.extent();
     let grid = |u: [f32; 3]| -> [f64; 3] {
-        std::array::from_fn(|i| min[i] as f64 + 0.5 + u[i] as f64 * (max[i] - min[i] + 1) as f64)
+        std::array::from_fn(|i| visible.min[i] as f64 + 0.5 + f64::from(u[i]) * extent[i] as f64)
     };
     let edges = (0..12)
         .map(|e| {
@@ -43,7 +43,7 @@ pub fn update_axes(
         .collect();
     let titles = std::array::from_fn(|i| wcs.axis_title(i + 1));
     commands.insert_resource(AxisAnnotation {
-        region,
+        visible,
         edges,
         titles,
     });
@@ -53,26 +53,21 @@ pub fn update_axes(
 pub fn draw_axes(
     mut contexts: EguiContexts,
     mut gizmos: Gizmos,
-    data: Option<Res<Dataset>>,
-    settings: Option<Res<Settings>>,
-    axes: Option<Res<AxisAnnotation>>,
-    cameras: Query<(&Camera, &Transform), With<Orbit>>,
+    data: Res<Dataset>,
+    settings: Res<Settings>,
+    axes: Res<AxisAnnotation>,
+    camera: Single<(&Camera, &Transform), With<Orbit>>,
 ) -> Result {
-    let (Some(data), Some(settings), Some(axes)) = (data, settings, axes) else {
-        return Ok(());
-    };
-    let Ok((camera, transform)) = cameras.single() else {
-        return Ok(());
-    };
     if !settings.wcs_axes {
         return Ok(());
     }
+    let (camera, transform) = *camera;
     // The local transform is already this frame's orbit; GlobalTransform may not be propagated yet.
     let view = GlobalTransform::from(*transform);
-    let (lo, hi) = region_bounds(axes.region, data.cube.dims);
-    let world = |u: [f32; 3]| (lo + (hi - lo) * Vec3::from_array(u)) * UNITY_FROM_LOCAL;
+    let (lo, hi) = region_bounds(axes.visible, data.cube.dims);
+    let local = |u: [f32; 3]| (lo + (hi - lo) * Vec3::from_array(u)) * UNITY_FROM_LOCAL;
     let screen = |p: Vec3| camera.world_to_viewport(&view, p).ok();
-    let centre = world([0.5; 3]);
+    let centre = local([0.5; 3]);
     let Some(centre_on_screen) = screen(centre) else {
         return Ok(());
     };
@@ -109,13 +104,13 @@ pub fn draw_axes(
         let edge_on_screen = |e: usize| {
             let (start, end) = edge_ends(e);
             let mid = std::array::from_fn(|i| (start[i] + end[i]) / 2.0);
-            screen(world(mid)).map_or(f32::MIN, |p| p.distance(centre_on_screen) + 0.001 * p.y)
+            screen(local(mid)).map_or(f32::MIN, |p| p.distance(centre_on_screen) + 0.001 * p.y)
         };
         let e = (axis * 4..axis * 4 + 4)
             .max_by(|a, b| edge_on_screen(*a).total_cmp(&edge_on_screen(*b)))
             .unwrap();
         let (start, end) = edge_ends(e);
-        let (start, end) = (world(start), world(end));
+        let (start, end) = (local(start), local(end));
         let mid = (start + end) / 2.0;
         let along = (end - start).normalize();
         let outward = {

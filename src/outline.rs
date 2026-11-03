@@ -2,24 +2,29 @@
 
 use bevy::{asset::RenderAssetUsages, mesh::PrimitiveTopology, prelude::*};
 
-use crate::{CubeState, Dataset, Region, UNITY_FROM_LOCAL, camera::Orbit, fits, region_bounds};
+use crate::{
+    CubeState, Dataset, DatasetEntity, UNITY_FROM_LOCAL,
+    camera::Orbit,
+    fits::{self, Region},
+    region_bounds,
+};
 
 #[derive(Component)]
 pub struct SelectionOutline;
 
 #[derive(Component)]
-pub struct CubeOutline;
+pub struct VisibleOutline;
 
 /// A box outline drawn as line meshes. `axes` tints the edges at the first voxel's corner as iDaVIE does, and
 /// `written` caches the hidden-edge mask and tint last written to its colours.
 #[derive(Component, Default)]
 pub struct Outline {
-    pub axes: bool,
+    axes: bool,
     written: Option<(u16, bool)>,
 }
 
 impl Outline {
-    pub fn with_axes() -> Self {
+    fn with_axes() -> Self {
         Self {
             axes: true,
             ..default()
@@ -29,12 +34,45 @@ impl Outline {
 
 #[derive(Resource)]
 pub struct OutlineMaterials {
-    pub white: Handle<StandardMaterial>,
-    pub yellow: Handle<StandardMaterial>,
+    white: Handle<StandardMaterial>,
+    yellow: Handle<StandardMaterial>,
+}
+
+/// Line meshes rather than gizmos, so they reach the depth prepass and the volume covers the back edges.
+pub fn spawn_outlines(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let line_colour = |c: Color| StandardMaterial {
+        base_color: c,
+        unlit: true,
+        ..default()
+    };
+    let outline = OutlineMaterials {
+        white: materials.add(line_colour(Color::WHITE)),
+        yellow: materials.add(line_colour(Color::srgb(1.0, 1.0, 0.0))),
+    };
+    commands.spawn((
+        Mesh3d(meshes.add(box_lines())),
+        MeshMaterial3d(outline.white.clone()),
+        Outline::with_axes(),
+        VisibleOutline,
+        DatasetEntity,
+    ));
+    commands.spawn((
+        Mesh3d(meshes.add(box_lines())),
+        MeshMaterial3d(outline.white.clone()),
+        Visibility::Hidden,
+        Outline::default(),
+        SelectionOutline,
+        DatasetEntity,
+    ));
+    commands.insert_resource(outline);
 }
 
 /// The 12 edges of a unit cube centred on the origin, in `edge_ends` order.
-pub fn box_lines() -> Mesh {
+fn box_lines() -> Mesh {
     let positions: Vec<Vec3> = (0..12)
         .flat_map(|e| {
             let (start, end) = edge_ends(e);
@@ -61,7 +99,7 @@ pub fn edge_ends(e: usize) -> ([f32; 3], [f32; 3]) {
 
 /// Bit e is set when edge e (see `edge_ends`) is hidden from `eye`, in the unit cube's own coordinates:
 /// neither face it borders faces the eye.
-pub fn hidden_edges(eye: Vec3) -> u16 {
+fn hidden_edges(eye: Vec3) -> u16 {
     (0..12).fold(0, |mask, e| {
         let (start, _) = edge_ends(e);
         let seen = (0..3).filter(|&axis| axis != e / 4).any(|axis| {
@@ -91,13 +129,10 @@ fn edge_colour(e: usize, axes: bool) -> LinearRgba {
 
 /// Draws an outline's hidden edges dark so the box reads as solid on a flat screen.
 pub fn shade_hidden_edges(
-    cameras: Query<&Transform, With<Orbit>>,
+    camera: Single<&Transform, With<Orbit>>,
     mut outlines: Query<(&Transform, &Mesh3d, &mut Outline)>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    let Ok(camera) = cameras.single() else {
-        return;
-    };
     for (transform, mesh, mut outline) in &mut outlines {
         let eye = transform
             .compute_affine()
@@ -131,13 +166,13 @@ pub fn box_transform(region: Region, dims: [usize; 3]) -> Transform {
     Transform::from_translation((lo + hi) / 2.0 * UNITY_FROM_LOCAL).with_scale(hi - lo)
 }
 
-/// The cube outline follows the visible (cropped) region; the selection outline follows the selection.
+/// The visible outline follows the visible (cropped) region; the selection outline follows the selection.
 pub fn update_outlines(
     data: Res<Dataset>,
     state: Res<CubeState>,
     outline_materials: Res<OutlineMaterials>,
-    mut cube: Query<&mut Transform, (With<CubeOutline>, Without<SelectionOutline>)>,
-    mut outline: Query<
+    mut visible_outline: Query<&mut Transform, (With<VisibleOutline>, Without<SelectionOutline>)>,
+    mut selection_outline: Query<
         (
             &mut Transform,
             &mut Visibility,
@@ -147,13 +182,11 @@ pub fn update_outlines(
         With<SelectionOutline>,
     >,
 ) {
-    if !state.is_changed() {
-        return;
+    for mut transform in &mut visible_outline {
+        *transform = box_transform(state.visible(), data.cube.dims);
     }
-    for mut transform in &mut cube {
-        *transform = box_transform(state.visible(&data), data.cube.dims);
-    }
-    let Ok((mut transform, mut visibility, mut material, mut outline)) = outline.single_mut()
+    let Ok((mut transform, mut visibility, mut material, mut outline)) =
+        selection_outline.single_mut()
     else {
         return;
     };
@@ -182,7 +215,7 @@ mod tests {
 
     #[test]
     fn hidden_edges_from_a_face_a_corner_and_inside() {
-        assert_eq!(hidden_edges(Vec3::new(0.0, 0.0, 10.0)).count_ones(), 8);
+        assert_eq!(hidden_edges(Vec3::new(0.0, 0.0, 10.0)), 0xf53);
         let corner = hidden_edges(Vec3::splat(10.0));
         assert_eq!(corner.count_ones(), 3);
         // Those three meet at the far corner, (-0.5, -0.5, -0.5).

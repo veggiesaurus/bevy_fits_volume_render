@@ -38,7 +38,7 @@ const params = new URLSearchParams(location.search);
 const file = params.get("file");
 params.delete("file");
 const overrides = [...params].map(([k, v]) => `${k}=${v}`).join("\n");
-const mb = n => `${(n / 1048576).toFixed(1)} MB`;
+const mb = n => `${(n / 1e6).toFixed(1)} MB`;
 
 // Only the latest load may touch the status or the viewer, so a slow download can't replace a file picked
 // after it started.

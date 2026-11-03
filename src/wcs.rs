@@ -71,11 +71,7 @@ impl Wcs {
         let frame = fs.current();
         let mut lines = vec![frame.title().unwrap_or_default()];
         for axis in 1..=frame.naxes() {
-            let label = frame.label(axis).unwrap_or_default();
-            lines.push(match display_unit(frame, axis) {
-                Some(unit) => format!("{label} ({unit})"),
-                None => label,
-            });
+            lines.push(title(frame, axis).unwrap_or_default());
             if let Some(spec) = spec_frame(frame, axis) {
                 // Without SPECSYS this is only AST's default.
                 if spec.test_std_of_rest() {
@@ -97,7 +93,7 @@ impl Wcs {
             .ok()?
             .point(0)
             .to_vec();
-        if world.iter().any(|&v| v == BAD_VALUE || !v.is_finite()) {
+        if world.iter().any(|&v| is_bad(v)) {
             return None;
         }
         let frame = fs.current();
@@ -121,11 +117,7 @@ impl Wcs {
         if axis > frame.naxes() {
             return None;
         }
-        let label = frame.label(axis).ok()?;
-        Some(match display_unit(frame, axis) {
-            Some(unit) => format!("{label} ({unit})"),
-            None => label,
-        })
+        title(frame, axis)
     }
 
     /// Ticks at round values of the world axis along the cube's `cube_axis` (1-based x, y or z), on the
@@ -148,25 +140,14 @@ impl Wcs {
         let Ok(world) = fs.transform(&PointSet::from_rows(grid), true) else {
             return Vec::new();
         };
-        let bad = |v: f64| v == BAD_VALUE || !v.is_finite();
         let mut values = world.axis(axis - 1).to_vec();
         let sky = sky_as_time(fs.current(), axis);
-        // Longitudes wrap at 2pi; unwrap them so crossings are found on a continuous curve.
-        for i in 1..values.len() {
-            if sky.is_some() && !bad(values[i]) && !bad(values[i - 1]) {
-                let jump = values[i] - values[i - 1];
-                if jump.abs() > PI {
-                    let shift = -TAU * jump.signum();
-                    values[i..]
-                        .iter_mut()
-                        .filter(|v| !bad(**v))
-                        .for_each(|v| *v += shift);
-                }
-            }
+        if sky.is_some() {
+            unwrap_longitudes(&mut values);
         }
         let (min, max) = values
             .iter()
-            .filter(|v| !bad(**v))
+            .filter(|v| !is_bad(**v))
             .fold((f64::MAX, f64::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
         if min >= max {
             return Vec::new();
@@ -197,7 +178,7 @@ impl Wcs {
         let mut ticks: Vec<(i64, Tick)> = Vec::new();
         for (s, pair) in values.windows(2).enumerate() {
             let [w0, w1] = [pair[0], pair[1]];
-            if bad(w0) || bad(w1) {
+            if is_bad(w0) || is_bad(w1) {
                 continue;
             }
             for k in (w0.min(w1) / gap).ceil() as i64..=(w0.max(w1) / gap).floor() as i64 {
@@ -228,6 +209,34 @@ pub struct Tick {
     /// Fraction of the way along the edge.
     pub at: f32,
     pub label: String,
+}
+
+fn is_bad(v: f64) -> bool {
+    v == BAD_VALUE || !v.is_finite()
+}
+
+/// Longitudes wrap at 2pi; unwrap them so crossings are found on a continuous curve.
+fn unwrap_longitudes(values: &mut [f64]) {
+    for i in 1..values.len() {
+        if !is_bad(values[i]) && !is_bad(values[i - 1]) {
+            let jump = values[i] - values[i - 1];
+            if jump.abs() > PI {
+                let shift = -TAU * jump.signum();
+                values[i..]
+                    .iter_mut()
+                    .filter(|v| !is_bad(**v))
+                    .for_each(|v| *v += shift);
+            }
+        }
+    }
+}
+
+fn title(frame: &dyn Frame, axis: usize) -> Option<String> {
+    let label = frame.label(axis).ok()?;
+    Some(match display_unit(frame, axis) {
+        Some(unit) => format!("{label} ({unit})"),
+        None => label,
+    })
 }
 
 fn nice_step(raw: f64, sexagesimal: bool) -> f64 {
@@ -313,9 +322,13 @@ mod tests {
         "RESTFRQ = 1420405750.0",
     ];
 
+    fn padded(cards: &[&str]) -> Vec<String> {
+        cards.iter().map(|c| format!("{c:<80}")).collect()
+    }
+
     #[test]
-    fn real_cube_centre() {
-        let cards: Vec<String> = CARDS.iter().map(|c| format!("{c:<80}")).collect();
+    fn grid_to_world_matches_astropy() {
+        let cards = padded(&CARDS);
         assert!(Wcs::from_cards(&cards[..4], [0, 1, 2]).is_none());
         let wcs = Wcs::from_cards(&cards, [0, 1, 2]).unwrap();
         assert_eq!(
@@ -326,7 +339,7 @@ mod tests {
 
     #[test]
     fn frequency_after_a_skipped_stokes_axis_is_z() {
-        let cards: Vec<String> = [
+        let cards = padded(&[
             "NAXIS   = 4",
             "NAXIS1  = 2",
             "NAXIS2  = 2",
@@ -349,10 +362,7 @@ mod tests {
             "CRPIX2  = 1.0",
             "CRPIX3  = 1.0",
             "CRPIX4  = 1.0",
-        ]
-        .iter()
-        .map(|c| format!("{c:<80}"))
-        .collect();
+        ]);
         let wcs = Wcs::from_cards(&cards, [0, 1, 3]).unwrap();
         assert_eq!(wcs.axis_title(3).as_deref(), Some("Frequency (MHz)"));
         assert_eq!(wcs.grid_to_world([1.0, 1.0, 3.0]).unwrap()[3], "1402 MHz");
@@ -389,8 +399,7 @@ mod tests {
 
     #[test]
     fn edge_ticks_at_round_values() {
-        let cards: Vec<String> = CARDS.iter().map(|c| format!("{c:<80}")).collect();
-        let wcs = Wcs::from_cards(&cards, [0, 1, 2]).unwrap();
+        let wcs = Wcs::from_cards(&padded(&CARDS), [0, 1, 2]).unwrap();
         // Channels span 1407.63 to 1412.01 MHz, so 1 MHz steps.
         let freq = wcs.edge_ticks(3, [0.5, 0.5, 0.5], [0.5, 0.5, 21.5]);
         let labels: Vec<&str> = freq.iter().map(|t| t.label.as_str()).collect();
@@ -406,8 +415,12 @@ mod tests {
             "{:?}",
             dec.iter().map(|t| &t.label).collect::<Vec<_>>()
         );
-        // An RA range across 0h is labelled 0:01, 0:00, 23:59 rather than going negative.
-        let at_zero: Vec<String> = [
+    }
+
+    #[test]
+    fn ra_ticks_across_zero_hours_wrap_to_23h() {
+        // Labelled 0:01, 0:00, 23:59 rather than going negative.
+        let at_zero = padded(&[
             "NAXIS   = 2",
             "NAXIS1  = 100",
             "NAXIS2  = 100",
@@ -419,10 +432,7 @@ mod tests {
             "CDELT2  = 0.01",
             "CRVAL1  = 0.0",
             "CRVAL2  = 0.0",
-        ]
-        .iter()
-        .map(|c| format!("{c:<80}"))
-        .collect();
+        ]);
         let ra = Wcs::from_cards(&at_zero, [0, 1, 2]).unwrap().edge_ticks(
             1,
             [0.5, 50.5, 1.0],
@@ -434,7 +444,13 @@ mod tests {
             "{labels:?}"
         );
         assert!(labels.iter().all(|l| !l.starts_with('-')), "{labels:?}");
-        // The temporary tick format doesn't leak into the cursor readout.
+    }
+
+    #[test]
+    fn tick_formats_stay_out_of_the_cursor_readout() {
+        let wcs = Wcs::from_cards(&padded(&CARDS), [0, 1, 2]).unwrap();
+        // Whole MHz ticks, where the readout shows hundredths.
+        wcs.edge_ticks(3, [0.5, 0.5, 0.5], [0.5, 0.5, 21.5]);
         assert_eq!(
             wcs.grid_to_world([270.5, 270.5, 11.0]).unwrap()[2],
             "1409.82 MHz"
