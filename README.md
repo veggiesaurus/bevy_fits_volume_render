@@ -79,7 +79,7 @@ The example cubes linked from the web page are on R2 behind `static.veggiesaurus
 - NGC 4631 and NGC 5055, HI: [HALOGAS](https://zenodo.org/records/3715549) data release 1 (Heald et al. 2011, A&A 526, A118), Westerbork Synthesis Radio Telescope, under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 - M83, HI: [THINGS](https://things.www3.mpia.de/) (Walter et al. 2008, AJ 136, 2563), the natural weighted cube
 - M83, CO(2-1): [PHANGS-ALMA](https://www.canfar.net/storage/vault/file/phangs/RELEASES/PHANGS-ALMA/by_product/cubes/nativeres/ngc5236_12m%2B7m%2Btp_co21.fits) (Leroy et al. 2021, ApJS 257, 43 and ApJS 255, 19), 12m+7m+TP at native resolution; the ALMA project codes are in the release README
-- M33, HI: [LGLBS](https://www.canfar.net/storage/vault/file/LGLBS/RELEASES/LGLBS-HI-v1.0/m33/m33_C%2BD%2Btp_himidres_30as.fits) v1.0 (Koch et al. 2025, ApJS 279, 35), VLA C+D configurations plus GBT at 30" and 2.1 km/s, cropped to -55.5 to -317.3 km/s, which keeps M33 and drops the Milky Way's HI
+- M33 and IC 10, HI: [LGLBS](https://www.canfar.net/storage/vault/list/LGLBS/RELEASES/LGLBS-HI-v1.0) v1.0 (Koch et al. 2025, ApJS 279, 35), VLA C+D configurations plus GBT at 30". M33 is the 2.1 km/s cube cropped to -55.5 to -317.3 km/s, which keeps M33 and drops the Milky Way's HI; IC 10 is the 0.8 km/s cube as released
 - the simulated galaxy: a [MARTINI](https://github.com/kyleaoman/martini) mock observation by K. Oman, converted from float64 to float32
 - HD 163296, CO(2-1): ALMA Science Verification data
 - the CO 1-0 test cube: from CARTA's test images
