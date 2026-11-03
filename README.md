@@ -40,7 +40,7 @@ The view only redraws on input (and while a crop is being built), so an idle win
 python3 -m http.server -d web 8000
 ```
 
-A build of `main` is published at https://fits.veggiesaurus.net. Locally, open http://localhost:8000 and pick a file, or pass `?file=<url>` for one served from the same origin or with CORS headers that allow it. The example cubes linked on the page are on R2 behind `static.veggiesaurus.net`. `?hdu=N` picks an HDU, any other query parameter overrides a config key (`?file=cube.fits&default_color_map=Viridis`), and a `config.toml` next to `index.html` is read if there is one. It needs a WebGPU browser; it's been tested in Chrome on macOS only.
+A build of `main` is published at https://fits.veggiesaurus.net. Locally, open http://localhost:8000 and pick a file, or pass `?file=<url>` for one served from the same origin or with CORS headers that allow it (`https://` can be left off, as in `?file=static.veggiesaurus.net/cubes/bin5_off2.fits`). The example cubes linked on the page are on R2 behind `static.veggiesaurus.net`. `?hdu=N` picks an HDU, any other query parameter overrides a config key (`?file=cube.fits&default_color_map=Viridis`), and a `config.toml` next to `index.html` is read if there is one. It needs a WebGPU browser; it's been tested in Chrome on macOS only.
 
 The build needs rustup's toolchain with the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` 0.2.130, matching the `wasm-bindgen` in `Cargo.lock`. The script puts `~/.cargo/bin` first on `PATH` because Homebrew's Rust has no wasm32 standard library. The script builds `--release` with wasm `simd128`, which every WebGPU browser supports; the thin LTO `dist` profile (`cargo build --profile dist`, for a native build to ship) made the wasm larger and no faster. A cold build is slow, and the wasm is about 42 MB once `wasm-opt -O1` (from Homebrew's `binaryen`) has run, which compresses smaller than `-O`; the script skips it if it isn't installed.
 
@@ -71,6 +71,18 @@ The shader takes the same samples as iDaVIE's, apart from the step changes below
 - the view only redraws on input, so the jitter noise holds still while nothing changes; iDaVIE renders every frame
 
 WCS comes from [starlink-ast](https://github.com/Starlink/starlink-ast-rs), the Rust port of AST, with spectral axes shown in MHz or km/s. The port doesn't include AST's `Plot3D`, so the WCS ticks on the bounding box are our own. Each axis is labelled on the box edge that's on the silhouette, at round values found with AST's transforms and formatted with AST's `Format`. The tick spacing is chosen by hand because `astGap` isn't ported either.
+
+## Example data
+
+The example cubes linked from the web page are on R2 behind `static.veggiesaurus.net`. Credit the surveys if you use them:
+
+- NGC 4631 and NGC 5055, HI: [HALOGAS](https://zenodo.org/records/3715549) data release 1 (Heald et al. 2011, A&A 526, A118), Westerbork Synthesis Radio Telescope, under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+- M83, HI: [THINGS](https://things.www3.mpia.de/) (Walter et al. 2008, AJ 136, 2563), the natural weighted cube
+- M83, CO(2-1): [PHANGS-ALMA](https://www.canfar.net/storage/vault/file/phangs/RELEASES/PHANGS-ALMA/by_product/cubes/nativeres/ngc5236_12m%2B7m%2Btp_co21.fits) (Leroy et al. 2021, ApJS 257, 43 and ApJS 255, 19), 12m+7m+TP at native resolution; the ALMA project codes are in the release README
+- M33, HI: [LGLBS](https://www.canfar.net/storage/vault/file/LGLBS/RELEASES/LGLBS-HI-v1.0/m33/m33_C%2BD%2Btp_himidres_30as.fits) v1.0 (Koch et al. 2025, ApJS 279, 35), VLA C+D configurations plus GBT at 30" and 2.1 km/s, cropped to -55.5 to -317.3 km/s, which keeps M33 and drops the Milky Way's HI
+- the simulated galaxy: a [MARTINI](https://github.com/kyleaoman/martini) mock observation by K. Oman, converted from float64 to float32
+- HD 163296, CO(2-1): ALMA Science Verification data
+- the CO 1-0 test cube: from CARTA's test images
 
 ## Licence
 
