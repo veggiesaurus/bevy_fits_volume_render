@@ -47,6 +47,14 @@ impl Hover {
 #[derive(Resource, Default)]
 pub struct PendingCrop(pub Option<VolumeTexture>);
 
+impl PendingCrop {
+    fn cancel(&mut self, source: &DataSource) {
+        if let Some(crop) = self.0.take() {
+            source.cancel(crop.handle.id());
+        }
+    }
+}
+
 #[derive(Message)]
 pub enum CropRequest {
     ToSelection,
@@ -202,20 +210,17 @@ pub fn apply_crop(
                 let Some(region) = state.selection else {
                     continue;
                 };
-                let shown = state.crop.as_ref().map(|crop| crop.region);
-                let on_its_way = pending.0.as_ref().map(|crop| crop.region);
-                if shown == Some(region) || on_its_way == Some(region) {
+                if pending.0.as_ref().is_some_and(|crop| crop.region == region) {
                     continue;
                 }
-                let crop = data.texture(region, &mut images, &mut uploads);
-                if let Some(superseded) = pending.0.replace(crop) {
-                    data.source.cancel(superseded.handle.id());
+                // Cropping back to the region on screen drops a different crop that's on its way.
+                pending.cancel(&data.source);
+                if state.crop.as_ref().is_none_or(|crop| crop.region != region) {
+                    pending.0 = Some(data.texture(region, &mut images, &mut uploads));
                 }
             }
             CropRequest::Reset => {
-                if let Some(superseded) = pending.0.take() {
-                    data.source.cancel(superseded.handle.id());
-                }
+                pending.cancel(&data.source);
                 state.crop = None;
                 framed = true;
             }

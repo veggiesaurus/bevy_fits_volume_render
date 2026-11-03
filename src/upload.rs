@@ -84,7 +84,7 @@ impl Plugin for UploadPlugin {
 }
 
 /// Drops finished uploads, and those whose image is gone (a crop reset or replaced before it arrived).
-fn retire_uploads(mut uploads: ResMut<Uploads>, images: Res<Assets<Image>>) {
+pub fn retire_uploads(mut uploads: ResMut<Uploads>, images: Res<Assets<Image>>) {
     let done = |upload: &Upload| upload.finished() || !images.contains(upload.image);
     if uploads.0.iter().any(done) {
         uploads.0.retain(|upload| !done(upload));

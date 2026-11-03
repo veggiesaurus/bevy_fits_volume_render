@@ -250,8 +250,9 @@ fn main() {
         )
             .chain(),
     )
-    // Last, so that it sees the requests this frame's systems sent.
-    .add_systems(Last, keep_redrawing)
+    // Last, to see the requests this frame's systems sent. Before retire_uploads, so that a finished upload still
+    // asks for the frame that shows its texture.
+    .add_systems(Last, keep_redrawing.before(upload::retire_uploads))
     .add_systems(
         EguiPrimaryContextPass,
         (
