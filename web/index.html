@@ -52,13 +52,61 @@ const mb = n => `${(n / 1e6).toFixed(1)} MB`;
 // after it started.
 let latest;
 
-// Reads into one buffer sized from Content-Length, so the file is held once rather than as chunks plus a copy.
+const progress = (got, total) => (status.textContent = `Downloading ${mb(got)}${total ? ` of ${mb(total)}` : ""}`);
+
+// A big file comes down as four ranges at once: in Chrome one stream only reached about half the line speed.
+const PARTS = 4;
 async function download(url, signal) {
+  const head = await fetch(url, { method: "HEAD", signal }).catch(() => null);
+  const total = head?.ok && !head.headers.get("Content-Encoding") ? Number(head.headers.get("Content-Length")) : 0;
+  if (total >= PARTS << 23) {
+    try {
+      return await downloadRanges(url, total, signal);
+    } catch (e) {
+      if (signal.aborted) throw e;
+    }
+  }
+  return downloadStream(url, signal);
+}
+
+// A BYOB read transfers the buffer it fills, so the ranges can't share one: each reads into its own scratch
+// buffer and copies from it into the result.
+async function downloadRanges(url, total, signal) {
+  const abort = new AbortController();
+  signal.addEventListener("abort", () => abort.abort(), { once: true });
+  const bytes = new Uint8Array(total);
+  const size = Math.ceil(total / PARTS);
+  let got = 0;
+  try {
+    await Promise.all(Array.from({ length: PARTS }, async (_, i) => {
+      const start = i * size, end = Math.min(total, start + size);
+      const res = await fetch(url, { headers: { Range: `bytes=${start}-${end - 1}` }, signal: abort.signal });
+      if (res.status !== 206) throw new Error(`no range support (${res.status})`);
+      const reader = res.body.getReader({ mode: "byob" });
+      let scratch = new ArrayBuffer(1 << 20);
+      for (let at = start; at < end; ) {
+        const { done, value } = await reader.read(new Uint8Array(scratch));
+        if (done || at + value.length > end) throw new Error("range doesn't match its request");
+        bytes.set(value, at);
+        at += value.length;
+        got += value.length;
+        scratch = value.buffer;
+        progress(got, total);
+      }
+    }));
+  } catch (e) {
+    abort.abort();
+    throw e;
+  }
+  return bytes;
+}
+
+// Reads into one buffer sized from Content-Length, so the file is held once rather than as chunks plus a copy.
+async function downloadStream(url, signal) {
   const res = await fetch(url, { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   // With a Content-Encoding it's the compressed size, so the buffer grows instead.
   const total = res.headers.get("Content-Encoding") ? 0 : Number(res.headers.get("Content-Length"));
-  const progress = got => (status.textContent = `Downloading ${mb(got)}${total ? ` of ${mb(total)}` : ""}`);
   let got = 0;
   // A BYOB reader fills the buffer in place, where the default reader hands back a new array per chunk that
   // piles up as garbage until the load is over.
@@ -74,7 +122,7 @@ async function download(url, signal) {
       // Each read transfers the buffer, so carry on with the one it hands back.
       buffer = value.buffer;
       got += value.length;
-      progress(got);
+      progress(got, total);
     }
     return new Uint8Array(buffer, 0, got);
   }
@@ -90,7 +138,7 @@ async function download(url, signal) {
     }
     bytes.set(value, got);
     got += value.length;
-    progress(got);
+    progress(got, total);
   }
   return bytes.subarray(0, got);
 }
