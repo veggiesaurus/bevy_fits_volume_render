@@ -1,5 +1,7 @@
 //! Cubes travel as cubelets of up to CUBELET³ voxels, cut from a fixed list of levels per file.
 
+use bevy_tasks::{ComputeTaskPool, TaskPool};
+
 use crate::{Cube, Region, downsample, downsampled_dims, find_downsample_factors};
 
 pub const CUBELET: usize = 64;
@@ -10,11 +12,11 @@ pub struct Levels {
     /// while it's the longest axis, so it nests in and can be built from the one before. The last fits in one
     /// cubelet.
     pub chain: Vec<[usize; 3]>,
-    /// The factors that fit the GPU budget, which may be one of the chain's.
+    /// The factors that fit the GPU budget and the device's layers, which may be one of the chain's.
     pub overview: [usize; 3],
 }
 
-pub fn levels(dims: [usize; 3], gpu_memory_limit_mb: u64) -> Levels {
+pub fn levels(dims: [usize; 3], gpu_memory_limit_mb: u64, max_depth: usize) -> Levels {
     let mut chain = vec![[1; 3]];
     loop {
         let f = chain[chain.len() - 1];
@@ -27,7 +29,7 @@ pub fn levels(dims: [usize; 3], gpu_memory_limit_mb: u64) -> Levels {
     }
     Levels {
         chain,
-        overview: find_downsample_factors(gpu_memory_limit_mb, dims),
+        overview: find_downsample_factors(gpu_memory_limit_mb, dims, max_depth),
     }
 }
 
@@ -99,6 +101,49 @@ pub fn cubelet(
         let (dims, data, _) = downsample(&cube.data, dims, None, region, factors, max_mode, false);
         Cubelet::new(dims, data)
     })
+}
+
+/// The largest value in a cell of a texture, ignoring NaN (-inf when there's nothing else), and whether it has a NaN.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cell {
+    pub max: f32,
+    pub has_nan: bool,
+}
+
+/// A `Cell` for each block of `edge`³ voxels of `voxels`, a cube of `dims`, x fastest. Each takes in a voxel past
+/// its faces as well, for samples that round across them. One pass in memory order, a task per layer of cells.
+pub fn cell_summary(voxels: &[f32], dims: [usize; 3], edge: usize) -> Vec<Cell> {
+    let cells = dims.map(|d| d.div_ceil(edge));
+    // The voxels along an axis of `len` that cell `c` takes in.
+    let span =
+        move |c: usize, len: usize| (c * edge).saturating_sub(1)..((c + 1) * edge + 1).min(len);
+    let [width, height, depth] = dims;
+    let layer = cells[0] * cells[1];
+    let empty = Cell {
+        max: f32::NEG_INFINITY,
+        has_nan: false,
+    };
+    let mut out = vec![empty; layer * cells[2]];
+    ComputeTaskPool::get_or_init(TaskPool::default).scope(|s| {
+        for (cz, layer_cells) in out.chunks_mut(layer).enumerate() {
+            s.spawn(async move {
+                for z in span(cz, depth) {
+                    for (cy, row_cells) in layer_cells.chunks_mut(cells[0]).enumerate() {
+                        for y in span(cy, height) {
+                            let row = &voxels[(z * height + y) * width..][..width];
+                            for (cx, cell) in row_cells.iter_mut().enumerate() {
+                                for &v in &row[span(cx, width)] {
+                                    cell.has_nan |= v.is_nan();
+                                    cell.max = cell.max.max(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    out
 }
 
 /// A whole level held in memory, so that its cubelets are copies and a coarser level takes one pass over it. Level 0
@@ -176,7 +221,7 @@ mod tests {
     fn levels_halve_x_and_y_down_to_a_cubelet_and_z_when_its_longest() {
         // A tie leaves z alone, as find_downsample_factors does, and the overview is the chain's second level.
         assert_eq!(
-            levels([512, 512, 512], 384),
+            levels([512, 512, 512], 384, 2048),
             Levels {
                 chain: vec![[1, 1, 1], [2, 2, 1], [4, 4, 2], [8, 8, 4], [8, 8, 8]],
                 overview: [2, 2, 1],
@@ -184,7 +229,7 @@ mod tests {
         );
         // x and y stay at 50 while z halves to 63, and the overview is today's 1 x 1 x 2.
         assert_eq!(
-            levels([100, 100, 4000], 384),
+            levels([100, 100, 4000], 384, 2048),
             Levels {
                 chain: vec![
                     [1, 1, 1],
@@ -200,7 +245,7 @@ mod tests {
         );
         // The overview is today's 5 x 5 x 1, where the power-of-two levels skip from 4 to 8.
         assert_eq!(
-            levels([4096, 4096, 100], 384),
+            levels([4096, 4096, 100], 384, 2048),
             Levels {
                 chain: vec![
                     [1, 1, 1],
@@ -215,6 +260,46 @@ mod tests {
                 overview: [5, 5, 1],
             }
         );
+    }
+
+    #[test]
+    fn cells_reach_a_voxel_past_their_faces() {
+        let cell = |max, has_nan| Cell { max, has_nan };
+        // Two cells along x, the second 6 voxels wide; all NaN apart from the voxels named below.
+        let dims = [70, 2, 1];
+        let mut voxels = vec![f32::NAN; 140];
+        let at = |x: usize, y: usize| y * 70 + x;
+        // Cell 0's last voxel: its own max and, a voxel across the face, cell 1's.
+        voxels[at(63, 1)] = 5.0;
+        // Cell 1's first voxel, which cell 0 takes in across the face.
+        voxels[at(64, 0)] = 7.0;
+        voxels[at(66, 0)] = 3.0;
+        let summary = cell_summary(&voxels, dims, CUBELET);
+        assert_eq!(summary, [cell(7.0, true), cell(7.0, true)]);
+        voxels[at(63, 1)] = f32::NAN;
+        voxels[at(64, 0)] = f32::NAN;
+        let summary = cell_summary(&voxels, dims, CUBELET);
+        assert_eq!(summary, [cell(f32::NEG_INFINITY, true), cell(3.0, true)]);
+        assert_eq!(
+            cell_summary(&[1.0; 140], dims, CUBELET),
+            [cell(1.0, false); 2]
+        );
+
+        // The same in y and z, on zeros: 9 on a y face, 5 on a z face, and a NaN that only its own cell takes in.
+        let dims = [1, 66, 66];
+        let mut voxels = vec![0.0; 66 * 66];
+        let at = |y: usize, z: usize| z * 66 + y;
+        voxels[at(64, 10)] = 9.0;
+        voxels[at(30, 63)] = 5.0;
+        voxels[at(65, 65)] = f32::NAN;
+        let summary = cell_summary(&voxels, dims, CUBELET);
+        let want = [
+            cell(9.0, false),
+            cell(9.0, false),
+            cell(5.0, false),
+            cell(0.0, true),
+        ];
+        assert_eq!(summary, want);
     }
 
     #[test]

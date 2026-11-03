@@ -20,7 +20,9 @@ use bevy::{
     prelude::*,
     render::{
         RenderPlugin,
+        renderer::RenderDevice,
         settings::{WgpuFeatures, WgpuSettings},
+        storage::ShaderBuffer,
     },
     window::RequestRedraw,
     winit::WinitSettings,
@@ -36,7 +38,7 @@ use fits::{Cube, FileInfo, Region};
 use selection::{CropRequest, Gesture, Hover, PendingCrop};
 use source::{DataSource, Event, Request};
 use upload::{UploadPlugin, Uploads};
-use volume::{VolumeMaterial, VolumeParams, VolumePlugin};
+use volume::{NoGrid, VolumeMaterial, VolumeParams, VolumePlugin};
 
 /// Bevy's local space is right-handed; iDaVIE's (Unity) object space mirrors z. Its own inverse, so it
 /// converts either way.
@@ -50,6 +52,8 @@ struct VolumeTexture {
     handle: Handle<Image>,
     dims: [usize; 3],
     factors: [usize; 3],
+    /// None until the source has sent the voxels.
+    grid: Option<volume::Grid>,
 }
 
 #[derive(Resource)]
@@ -80,11 +84,11 @@ impl Dataset {
     fn texture(
         &self,
         region: Region,
+        device: &RenderDevice,
         images: &mut Assets<Image>,
         uploads: &mut Uploads,
     ) -> VolumeTexture {
-        let factors =
-            fits::find_downsample_factors(self.config.gpu_memory_limit_mb, region.extent());
+        let factors = self.factors(region, device);
         let dims = fits::downsampled_dims(region, factors);
         let handle = images.add(volume::empty_cube_image(dims));
         uploads.expect(handle.id(), dims);
@@ -99,7 +103,14 @@ impl Dataset {
             handle,
             dims,
             factors,
+            grid: None,
         }
+    }
+
+    /// The downsampling `region` takes to fit the GPU budget and the device's layers, up to iDaVIE's 2048.
+    fn factors(&self, region: Region, device: &RenderDevice) -> [usize; 3] {
+        let layers = device.limits().max_texture_array_layers.min(2048) as usize;
+        fits::find_downsample_factors(self.config.gpu_memory_limit_mb, region.extent(), layers)
     }
 
     /// What was loaded, for the terminal or the browser console.
@@ -283,10 +294,33 @@ fn main() {
 }
 
 /// Takes what the data source has sent since the last frame.
-fn receive(data: Res<Dataset>, mut uploads: ResMut<Uploads>, mut hover: ResMut<Hover>) {
+fn receive(
+    data: Res<Dataset>,
+    mut uploads: ResMut<Uploads>,
+    mut hover: ResMut<Hover>,
+    mut state: Option<ResMut<CubeState>>,
+    mut pending: ResMut<PendingCrop>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
+) {
     for event in data.source.drain() {
         match event {
-            Event::Texture { image, data } => uploads.fill(image, data),
+            Event::Texture { image, data, cells } => {
+                uploads.fill(image, data);
+                // Mutable access only for the texture it's for, so nothing else counts as changed.
+                let is = |texture: &VolumeTexture| texture.handle.id() == image;
+                let shown = state
+                    .as_deref()
+                    .map(|state| (is(&state.full), state.crop.as_ref().is_some_and(is)));
+                let texture = match shown {
+                    Some((true, _)) => state.as_mut().map(|state| &mut state.full),
+                    Some((_, true)) => state.as_mut().and_then(|state| state.crop.as_mut()),
+                    _ if pending.0.as_ref().is_some_and(is) => pending.0.as_mut(),
+                    _ => None,
+                };
+                if let Some(texture) = texture {
+                    texture.grid = Some(volume::Grid::new(&cells, &mut buffers));
+                }
+            }
             Event::PixelValue { id, value } => hover.receive(id, value),
         }
     }
@@ -400,17 +434,25 @@ fn spawn_volume(
     mut images: ResMut<Assets<Image>>,
     mut uploads: ResMut<Uploads>,
     mut orbit: Single<&mut Orbit>,
+    device: Res<RenderDevice>,
+    no_grid: Res<NoGrid>,
 ) {
     for entity in &old {
         commands.entity(entity).despawn();
     }
-    let full = data.texture(Region::whole(data.info.dims), &mut images, &mut uploads);
+    let full = data.texture(
+        Region::whole(data.info.dims),
+        &device,
+        &mut images,
+        &mut uploads,
+    );
 
     let settings = Settings::new(&data);
     let material = materials.add(VolumeMaterial {
         params: settings.params,
         data_cube: full.handle.clone(),
         color_map: images.add(volume::color_map_image()),
+        grid: no_grid.0.clone(),
     });
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
@@ -438,6 +480,7 @@ fn update_material(
     settings: Res<Settings>,
     state: Res<CubeState>,
     data: Res<Dataset>,
+    no_grid: Res<NoGrid>,
     mut materials: ResMut<Assets<VolumeMaterial>>,
 ) {
     let Some(mut material) = materials.get_mut(&state.material) else {
@@ -449,8 +492,15 @@ fn update_material(
         (params.highlight_min, params.highlight_max) = region_bounds(selection, data.info.dims);
         params.highlight_saturate_factor = SELECTION_SATURATE_FACTOR;
     }
+    let texture = state.texture();
+    params.set_texture(texture.dims, texture.grid.as_ref());
     material.params = params;
-    material.data_cube = state.texture().handle.clone();
+    material.data_cube = texture.handle.clone();
+    material.grid = texture
+        .grid
+        .as_ref()
+        .map_or(&no_grid.0, |grid| &grid.buffer)
+        .clone();
 }
 
 fn show_volume(

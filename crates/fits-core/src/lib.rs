@@ -6,7 +6,7 @@ use bevy_tasks::{ComputeTaskPool, TaskPool};
 use bevy_tasks::{ParallelSlice, ParallelSliceMut};
 
 mod cubelet;
-pub use cubelet::{CUBELET, Cubelet, Level, Levels, Voxels, cubelet, levels};
+pub use cubelet::{CUBELET, Cell, Cubelet, Level, Levels, Voxels, cell_summary, cubelet, levels};
 
 const BLOCK: usize = 2880;
 /// Voxels read, decoded and summarised per task: 4 MB of output, small enough to stay in cache.
@@ -647,7 +647,12 @@ impl Moments {
     }
 }
 
-pub fn find_downsample_factors(gpu_memory_limit_mb: u64, extent: [usize; 3]) -> [usize; 3] {
+/// The factors that fit `extent` in the GPU budget, with no side over 2048 texels and at most `max_depth` layers.
+pub fn find_downsample_factors(
+    gpu_memory_limit_mb: u64,
+    extent: [usize; 3],
+    max_depth: usize,
+) -> [usize; 3] {
     let [x, y, z] = extent.map(|d| d as u64);
     let (mut fx, mut fy, mut fz) = (1, 1, 1);
     // Rounded up, as crop_and_downsample sizes the texture; iDaVIE rounds down here and can ask for 2049.
@@ -655,7 +660,7 @@ pub fn find_downsample_factors(gpu_memory_limit_mb: u64, extent: [usize; 3]) -> 
         fx += 1;
         fy += 1;
     }
-    while z.div_ceil(fz) > 2048 {
+    while z.div_ceil(fz) > max_depth.max(1) as u64 {
         fz += 1;
     }
     // At least one, so that a budget of zero still ends.
@@ -1156,12 +1161,26 @@ mod tests {
 
     #[test]
     fn downsample_factors_match_idavie() {
-        assert_eq!(find_downsample_factors(384, [4096, 4096, 100]), [5, 5, 1]);
-        assert_eq!(find_downsample_factors(64, [512, 512, 2000]), [3, 3, 8]);
+        assert_eq!(
+            find_downsample_factors(384, [4096, 4096, 100], 2048),
+            [5, 5, 1]
+        );
+        assert_eq!(
+            find_downsample_factors(64, [512, 512, 2000], 2048),
+            [3, 3, 8]
+        );
         // 4097 / 2 rounds up to 2049, over the 3D texture limit.
-        assert_eq!(find_downsample_factors(384, [4097, 10, 10]), [3, 3, 1]);
+        assert_eq!(
+            find_downsample_factors(384, [4097, 10, 10], 2048),
+            [3, 3, 1]
+        );
         // A budget of zero still ends, at one voxel.
-        assert_eq!(find_downsample_factors(0, [3, 2, 2]), [3, 3, 2]);
+        assert_eq!(find_downsample_factors(0, [3, 2, 2], 2048), [3, 3, 2]);
+        // A device with WebGPU's minimum of 256 layers.
+        assert_eq!(
+            find_downsample_factors(384, [100, 100, 1000], 256),
+            [1, 1, 4]
+        );
     }
 
     #[test]

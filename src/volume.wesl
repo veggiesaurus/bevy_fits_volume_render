@@ -25,13 +25,24 @@ struct VolumeParams {
     max_steps: u32,
     highlight_saturate_factor: f32,
     projection_mode: u32,
+    // From the texture shown (volume.rs VolumeParams::set_texture).
+    step_length: f32,
+    step_count: f32,
+    // A grid cell's size and the texture's, z in layers.
+    cell_size: vec3<f32>,
+    layers: f32,
+    grid_cells: vec3<u32>,
+    // 1 when the texture has a NaN.
+    has_nan: u32,
 };
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> params: VolumeParams;
-@group(constants::MATERIAL_BIND_GROUP) @binding(1) var data_cube: texture_3d<f32>;
+@group(constants::MATERIAL_BIND_GROUP) @binding(1) var data_cube: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(2) var data_sampler: sampler;
 @group(constants::MATERIAL_BIND_GROUP) @binding(3) var color_map: texture_2d<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(4) var color_map_sampler: sampler;
+// volume.rs Grid: a cell to an entry, 1 if it holds a NaN and then its max (-inf for nothing but NaN).
+@group(constants::MATERIAL_BIND_GROUP) @binding(5) var<storage, read> grid: array<vec2<u32>>;
 
 const LOG: u32 = 1u;
 const SQRT: u32 = 2u;
@@ -95,45 +106,93 @@ fn in_box(position: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> bool {
     return all(position >= box_min) && all(position <= box_max);
 }
 
-// data_sampler does iDaVIE's point filtering and Repeat wrapping (volume.rs empty_cube_image).
+// data_sampler does iDaVIE's point filtering and Repeat wrapping in x and y (volume.rs empty_cube_image), and
+// fract wraps z the same way.
 fn sample_cube(position: vec3<f32>) -> f32 {
-    return textureSampleLevel(data_cube, data_sampler, position, 0.0).r;
+    return fetch(vec3(position.xy, fract(position.z) * params.layers));
 }
 
-struct Ray {
-    value: f32,
-    cumulative_length: f32,
-    in_highlight: bool,
-    has_value: bool,
-};
-
-fn maximum(ray: Ray, value: f32, position: vec3<f32>, highlight_min: vec3<f32>, highlight_max: vec3<f32>) -> Ray {
-    var r = ray;
-    if !is_nan(value) && value >= r.value {
-        r.in_highlight = in_box(position, highlight_min, highlight_max) || (r.in_highlight && value == r.value);
-        r.value = value;
-        r.has_value = true;
-    }
-    return r;
+// z in layers.
+fn fetch(a: vec3<f32>) -> f32 {
+    return textureSampleLevel(data_cube, data_sampler, a.xy, i32(a.z), 0.0).r;
 }
 
-fn average(ray: Ray, value: f32, position: vec3<f32>, step_length: f32, highlight_min: vec3<f32>, highlight_max: vec3<f32>) -> Ray {
-    var r = ray;
-    if !is_nan(value) {
-        r.value += value * step_length;
-        r.cumulative_length += step_length;
-        r.in_highlight = r.in_highlight || in_box(position, highlight_min, highlight_max);
-        r.has_value = true;
+// The max, and the max in the selection.
+fn max_sample(top: vec2<f32>, value: f32, position: vec3<f32>, h_min: vec3<f32>, h_max: vec3<f32>) -> vec2<f32> {
+    if is_nan(value) {
+        return top;
     }
-    return r;
+    return vec2(max(top.x, value), select(top.y, max(top.y, value), in_box(position, h_min, h_max)));
 }
 
-fn accumulate(ray: Ray, position: vec3<f32>, step_length: f32, highlight_min: vec3<f32>, highlight_max: vec3<f32>) -> Ray {
-    let value = sample_cube(position);
-    if params.projection_mode == AVERAGE {
-        return average(ray, value, position, step_length, highlight_min, highlight_max);
+// The sum, the count, and the count in the selection.
+fn add_sample(acc: vec3<f32>, value: f32, position: vec3<f32>, h_min: vec3<f32>, h_max: vec3<f32>) -> vec3<f32> {
+    if is_nan(value) {
+        return acc;
     }
-    return maximum(ray, value, position, highlight_min, highlight_max);
+    return acc + vec3(value, 1.0, select(0.0, 1.0, in_box(position, h_min, h_max)));
+}
+
+// `nan` is a literal at each call, so each call compiles to its own loop.
+fn lean_max(value: f32, nan: bool) -> f32 {
+    return select(value, -F32_MAX, nan && is_nan(value));
+}
+
+fn lean_add(value: f32, nan: bool) -> vec2<f32> {
+    return select(vec2(value, 1.0), vec2(0.0), nan && is_nan(value));
+}
+
+// The max of `count` samples from `a` on, `da` apart, with the tail in groups of 4, 2 and 1 rather than up to
+// seven fetches in turn.
+fn segment_max(a_in: vec3<f32>, da: vec3<f32>, count: i32, nan: bool) -> f32 {
+    var a = a_in;
+    var m = -F32_MAX;
+    var k = 0;
+    for (; k + 8 <= count; k += 8) {
+        m = max(m, max(max(max(lean_max(fetch(a), nan), lean_max(fetch(a + da), nan)),
+            max(lean_max(fetch(a + 2.0 * da), nan), lean_max(fetch(a + 3.0 * da), nan))),
+            max(max(lean_max(fetch(a + 4.0 * da), nan), lean_max(fetch(a + 5.0 * da), nan)),
+            max(lean_max(fetch(a + 6.0 * da), nan), lean_max(fetch(a + 7.0 * da), nan)))));
+        a += 8.0 * da;
+    }
+    let rest = count - k;
+    if (rest & 4) != 0 {
+        m = max(m, max(max(lean_max(fetch(a), nan), lean_max(fetch(a + da), nan)),
+            max(lean_max(fetch(a + 2.0 * da), nan), lean_max(fetch(a + 3.0 * da), nan))));
+        a += 4.0 * da;
+    }
+    if (rest & 2) != 0 {
+        m = max(m, max(lean_max(fetch(a), nan), lean_max(fetch(a + da), nan)));
+        a += 2.0 * da;
+    }
+    if (rest & 1) != 0 {
+        m = max(m, lean_max(fetch(a), nan));
+    }
+    return m;
+}
+
+// The sum and count of the valid samples among `count` from `a` on, as segment_max.
+fn segment_sum(a_in: vec3<f32>, da: vec3<f32>, count: i32, nan: bool) -> vec2<f32> {
+    var a = a_in;
+    var acc = vec2(0.0);
+    var k = 0;
+    for (; k + 4 <= count; k += 4) {
+        acc += (lean_add(fetch(a), nan) + lean_add(fetch(a + da), nan))
+            + (lean_add(fetch(a + 2.0 * da), nan) + lean_add(fetch(a + 3.0 * da), nan));
+        a += 4.0 * da;
+    }
+    if ((count - k) & 2) != 0 {
+        acc += lean_add(fetch(a), nan) + lean_add(fetch(a + da), nan);
+        a += 2.0 * da;
+    }
+    if ((count - k) & 1) != 0 {
+        acc += lean_add(fetch(a), nan);
+    }
+    return acc;
+}
+
+fn grid_entry(cell: vec3<u32>) -> vec2<u32> {
+    return grid[cell.x + params.grid_cells.x * (cell.y + params.grid_cells.y * cell.z)];
 }
 
 @fragment
@@ -150,12 +209,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // iDaVIE's step, sqrt(max_length) / max_steps, with the step count lifted so the longest rays (sqrt(3) on
-    // the full cube) reach the far side rather than stopping at max_steps. Capped at about two steps per texel
-    // along the texture's diagonal, so a small texture (a crop, or a heavily downsampled cube) costs less.
-    let max_length = length(params.slice_max - params.slice_min);
-    let max_steps = min(sqrt(max_length) * f32(params.max_steps), ceil(2.0 * length(vec3<f32>(textureDimensions(data_cube)))));
-    let step_length = max_length / max_steps;
+    let step_length = params.step_length;
+    let max_steps = params.step_count;
 
     let direction = normalize(in.ray_direction);
     let t = intersect_box(in.ray_origin, direction, params.slice_min, params.slice_max);
@@ -182,92 +237,122 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let region_scale = 1.0 / (params.slice_max - params.slice_min);
     let region_offset = -(params.slice_min + 0.5);
     var position = (p_near + rand_vector + region_offset) * region_scale;
-    let adjusted_step_vector = step_vector * step_length * region_scale;
-    let highlight_min = (params.highlight_min + region_offset + 0.5) * region_scale;
-    let highlight_max = (params.highlight_max + region_offset + 0.5) * region_scale;
+    let s = step_vector * step_length * region_scale;
+    let h_min = (params.highlight_min + region_offset + 0.5) * region_scale;
+    let h_max = (params.highlight_max + region_offset + 0.5) * region_scale;
 
     // The guard keeps a constant cube from dividing zero by zero.
     let scale_range = select(params.scale_max - params.scale_min, 1.0, params.scale_max == params.scale_min);
 
-    var ray = Ray(select(-F32_MAX, 0.0, params.projection_mode == AVERAGE), 0.0, false, false);
-    // Unrolled so the texture fetches overlap; the step positions are the same as one step at a time.
-    let s = adjusted_step_vector;
-    let h_min = highlight_min;
-    let h_max = highlight_max;
-    if params.projection_mode == AVERAGE {
-        var i = 0;
-        for (; i + 4 <= required_steps; i += 4) {
-            let p1 = position + s;
-            let p2 = p1 + s;
-            let p3 = p2 + s;
-            let v0 = sample_cube(position);
-            let v1 = sample_cube(p1);
-            let v2 = sample_cube(p2);
-            let v3 = sample_cube(p3);
-            ray = average(ray, v0, position, step_length, h_min, h_max);
-            ray = average(ray, v1, p1, step_length, h_min, h_max);
-            ray = average(ray, v2, p2, step_length, h_min, h_max);
-            ray = average(ray, v3, p3, step_length, h_min, h_max);
-            position = p3 + s;
-        }
-        for (; i < required_steps; i++) {
-            ray = average(ray, sample_cube(position), position, step_length, h_min, h_max);
-            position += s;
+    let average_mode = params.projection_mode == AVERAGE;
+    // A selection is shown, so whether a sample is in it counts.
+    let track = params.highlight_saturate_factor != 1.0;
+    // Raw values: under floor_value a Maximum pixel's alpha is 0, and from stop on its colour is saturated.
+    let floor_value = params.threshold_min * scale_range + params.scale_min;
+    let stop = params.threshold_max * scale_range + params.scale_min;
+    var top = vec2(-F32_MAX);
+    var acc = vec3(0.0);
+    // Only the first sample can fall outside the texture (just), where it wraps round.
+    if required_steps > 0 {
+        let value = sample_cube(position);
+        top = max_sample(top, value, position, h_min, h_max);
+        acc = add_sample(acc, value, position, h_min, h_max);
+    }
+    // z in layers from here on, so a sample's layer is its integer part.
+    let zs = vec3(1.0, 1.0, params.layers);
+    let start = position * zs;
+    let da = s * zs;
+    let l_min = h_min * zs;
+    let l_max = h_max * zs;
+    if average_mode {
+        let rest = max(required_steps - 1, 0);
+        if track {
+            // Unrolled so the fetches overlap.
+            var k = 1;
+            for (; k + 4 <= required_steps; k += 4) {
+                let a0 = start + f32(k) * da;
+                let a1 = a0 + da;
+                let a2 = a1 + da;
+                let a3 = a2 + da;
+                let v0 = fetch(a0);
+                let v1 = fetch(a1);
+                let v2 = fetch(a2);
+                let v3 = fetch(a3);
+                acc = add_sample(acc, v0, a0, l_min, l_max);
+                acc = add_sample(acc, v1, a1, l_min, l_max);
+                acc = add_sample(acc, v2, a2, l_min, l_max);
+                acc = add_sample(acc, v3, a3, l_min, l_max);
+            }
+            for (; k < required_steps; k++) {
+                let a = start + f32(k) * da;
+                acc = add_sample(acc, fetch(a), a, l_min, l_max);
+            }
+        } else if params.has_nan != 0u {
+            acc += vec3(segment_sum(start + da, da, rest, true), 0.0);
+        } else {
+            acc += vec3(segment_sum(start + da, da, rest, false), 0.0);
         }
     } else {
-        // Once the maximum is past threshold_max the colour can't change, unless a selection is shown.
-        let can_stop = params.highlight_saturate_factor == 1.0;
-        var i = 0;
-        for (; i + 8 <= required_steps; i += 8) {
-            let p1 = position + s;
-            let p2 = p1 + s;
-            let p3 = p2 + s;
-            let p4 = p3 + s;
-            let p5 = p4 + s;
-            let p6 = p5 + s;
-            let p7 = p6 + s;
-            let v0 = sample_cube(position);
-            let v1 = sample_cube(p1);
-            let v2 = sample_cube(p2);
-            let v3 = sample_cube(p3);
-            let v4 = sample_cube(p4);
-            let v5 = sample_cube(p5);
-            let v6 = sample_cube(p6);
-            let v7 = sample_cube(p7);
-            ray = maximum(ray, v0, position, h_min, h_max);
-            ray = maximum(ray, v1, p1, h_min, h_max);
-            ray = maximum(ray, v2, p2, h_min, h_max);
-            ray = maximum(ray, v3, p3, h_min, h_max);
-            ray = maximum(ray, v4, p4, h_min, h_max);
-            ray = maximum(ray, v5, p5, h_min, h_max);
-            ray = maximum(ray, v6, p6, h_min, h_max);
-            ray = maximum(ray, v7, p7, h_min, h_max);
-            position = p7 + s;
-            if can_stop && (ray.value - params.scale_min) / scale_range >= params.threshold_max {
-                i = required_steps;
-                break;
+        // Front to back a grid cell at a time, stepping over a cell that can't raise the max.
+        let inv_da = 1.0 / da;
+        var k = 1;
+        while k < required_steps {
+            let a = start + f32(k) * da;
+            let cell = clamp(floor(a / params.cell_size), vec3(0.0), vec3<f32>(params.grid_cells - 1u));
+            let lo = cell * params.cell_size;
+            let hi = min(lo + params.cell_size, zs);
+            let t = select(vec3(F32_MAX), (select(lo, hi, da > vec3(0.0)) - start) * inv_da, da != vec3(0.0));
+            let k_exit = clamp(i32(ceil(min(min(min(t.x, t.y), t.z), f32(required_steps)))), k + 1, required_steps);
+            let entry = grid_entry(vec3<u32>(cell));
+            let cell_max = bitcast<f32>(entry.y);
+            if cell_max >= floor_value && (cell_max > top.x || (cell_max == top.x && track)) {
+                if track && all(hi >= l_min) && all(lo <= l_max) {
+                    for (var j = k; j < k_exit; j++) {
+                        let b = start + f32(j) * da;
+                        top = max_sample(top, fetch(b), b, l_min, l_max);
+                    }
+                } else if entry.x != 0u {
+                    top.x = max(top.x, segment_max(a, da, k_exit - k, true));
+                } else {
+                    top.x = max(top.x, segment_max(a, da, k_exit - k, false));
+                }
+            }
+            k = k_exit;
+            // Once the maximum is past threshold_max the colour can't change, unless a selection is shown.
+            if !track && top.x >= stop {
+                return shade((top.x - params.scale_min) / scale_range, false);
             }
         }
-        for (; i < required_steps; i++) {
-            ray = maximum(ray, sample_cube(position), position, h_min, h_max);
-            position += s;
-        }
     }
+    position += f32(required_steps) * s;
     let remaining_step_length = total_length - f32(required_steps + 1) * step_length - length(rand_vector);
     position += step_vector * remaining_step_length * region_scale;
     // iDaVIE weights this sample by remaining_step_length, which is negative and can zero the average.
     let leftover_length = max(total_length - f32(required_steps) * step_length, 0.0);
-    ray = accumulate(ray, position, leftover_length, highlight_min, highlight_max);
-    if params.projection_mode == AVERAGE && ray.cumulative_length > 0.0 {
-        ray.value /= ray.cumulative_length;
+    let value = sample_cube(position);
+    if average_mode {
+        var sum = acc.x * step_length;
+        var weight = acc.y * step_length;
+        var in_highlight = acc.z > 0.0;
+        if !is_nan(value) {
+            sum += value * leftover_length;
+            weight += leftover_length;
+            in_highlight = in_highlight || in_box(position, h_min, h_max);
+        } else if acc.y == 0.0 {
+            return vec4(0.0);
+        }
+        return shade((select(sum, sum / weight, weight > 0.0) - params.scale_min) / scale_range, in_highlight);
     }
-
-    if !ray.has_value {
+    top = max_sample(top, value, position, h_min, h_max);
+    if top.x == -F32_MAX {
         return vec4(0.0);
     }
+    return shade((top.x - params.scale_min) / scale_range, top.y == top.x);
+}
 
-    var ray_value = (ray.value - params.scale_min) / scale_range;
-    ray_value = clamp(ray_value, params.threshold_min, params.threshold_max);
+// Thresholds, scaling and the colour map, for a ray's value normalised to the scale range.
+fn shade(normalised: f32, in_highlight: bool) -> vec4<f32> {
+    let ray_value = clamp(normalised, params.threshold_min, params.threshold_max);
     // Unity's v axis points up the atlas, wgpu's points down, so no "1.0 -" here.
     let color_map_offset = (0.5 + f32(params.color_map_index)) / f32(params.num_color_maps);
     // The guard keeps equal thresholds from dividing zero by zero.
@@ -288,7 +373,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     x = clamp(x - params.scale_bias, 0.0, 1.0);
     x = clamp((x - 0.5) * params.scale_contrast + 0.5, 0.0, 1.0);
 
-    let color_fraction = select(params.highlight_saturate_factor, 1.0, ray.in_highlight);
+    let color_fraction = select(params.highlight_saturate_factor, 1.0, in_highlight);
     let color_map_color = vec4(textureSampleLevel(color_map, color_map_sampler, vec2(x, color_map_offset), 0.0).rgb, x);
     return mix(vec4(x), color_map_color, color_fraction);
 }

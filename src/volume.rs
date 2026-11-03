@@ -6,14 +6,18 @@ use bevy::{
     mesh::MeshVertexBufferLayoutRef,
     pbr::{MaterialPipeline, MaterialPipelineKey},
     prelude::*,
-    render::render_resource::{
-        AsBindGroup, CompareFunction, Extent3d, Face, RenderPipelineDescriptor, ShaderType,
-        SpecializedMeshPipelineError, TextureDimension, TextureFormat,
+    render::{
+        render_resource::{
+            AsBindGroup, CompareFunction, Extent3d, Face, RenderPipelineDescriptor, ShaderType,
+            SpecializedMeshPipelineError, TextureDimension, TextureFormat, TextureViewDescriptor,
+            TextureViewDimension,
+        },
+        storage::ShaderBuffer,
     },
     shader::ShaderRef,
 };
 
-use crate::config::COLOR_MAPS;
+use crate::{config::COLOR_MAPS, fits};
 
 const SHADER: &str = "embedded://bevy_fits_volume_render/volume.wesl";
 
@@ -22,7 +26,8 @@ pub struct VolumePlugin;
 impl Plugin for VolumePlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "volume.wesl");
-        app.add_plugins(MaterialPlugin::<VolumeMaterial>::default());
+        app.add_plugins(MaterialPlugin::<VolumeMaterial>::default())
+            .add_systems(Startup, insert_no_grid);
     }
 }
 
@@ -48,6 +53,12 @@ pub struct VolumeParams {
     pub max_steps: u32,
     pub highlight_saturate_factor: f32,
     pub projection_mode: u32,
+    pub step_length: f32,
+    pub step_count: f32,
+    pub cell_size: Vec3,
+    pub layers: f32,
+    pub grid_cells: UVec3,
+    pub has_nan: u32,
 }
 
 impl Default for VolumeParams {
@@ -73,8 +84,70 @@ impl Default for VolumeParams {
             max_steps: 384,
             highlight_saturate_factor: 1.0,
             projection_mode: 0,
+            step_length: 0.0,
+            step_count: 0.0,
+            cell_size: Vec3::ONE,
+            layers: 1.0,
+            grid_cells: UVec3::ONE,
+            has_nan: 0,
         }
     }
+}
+
+impl VolumeParams {
+    /// iDaVIE's step, sqrt(max_length) / max_steps, with the step count lifted so the longest rays (sqrt(3) on
+    /// the full cube) reach the far side rather than stopping at max_steps. Capped at about two steps per texel
+    /// along the texture's diagonal, so a small texture (a crop, or a heavily downsampled cube) costs less.
+    /// Then the texture's grid, or `NoGrid`'s one cell over all of it while the grid is still to come.
+    pub fn set_texture(&mut self, dims: [usize; 3], grid: Option<&Grid>) {
+        let texels = Vec3::from_array(dims.map(|d| d as f32));
+        let max_length = (self.slice_max - self.slice_min).length();
+        self.step_count =
+            (max_length.sqrt() * self.max_steps as f32).min((2.0 * texels.length()).ceil());
+        self.step_length = max_length / self.step_count;
+        self.layers = texels.z;
+        let edge = fits::CUBELET as f32;
+        (self.cell_size, self.grid_cells, self.has_nan) = match grid {
+            Some(grid) => (
+                Vec3::new(edge / texels.x, edge / texels.y, edge),
+                UVec3::from_array(dims.map(|d| d.div_ceil(fits::CUBELET) as u32)),
+                grid.has_nan as u32,
+            ),
+            None => (Vec3::new(1.0, 1.0, texels.z), UVec3::ONE, 1),
+        };
+    }
+}
+
+/// A texture's `fits::cell_summary` on the GPU, a cell of 64³ texels to an entry: 1 if it has a NaN, then its max,
+/// so a Maximum ray can step over the cell or leave out the NaN test.
+#[derive(Clone)]
+pub struct Grid {
+    pub buffer: Handle<ShaderBuffer>,
+    pub has_nan: bool,
+}
+
+impl Grid {
+    pub fn new(cells: &[fits::Cell], buffers: &mut Assets<ShaderBuffer>) -> Self {
+        let entries: Vec<[u32; 2]> = (cells.iter())
+            .map(|cell| [cell.has_nan as u32, cell.max.to_bits()])
+            .collect();
+        Self {
+            buffer: buffers.add(ShaderBuffer::new(entries, RenderAssetUsages::RENDER_WORLD)),
+            has_nan: cells.iter().any(|cell| cell.has_nan),
+        }
+    }
+}
+
+/// One cell that never skips, with a NaN and a max of +inf, for a texture whose grid is still to come.
+#[derive(Resource)]
+pub struct NoGrid(pub Handle<ShaderBuffer>);
+
+fn insert_no_grid(mut commands: Commands, mut buffers: ResMut<Assets<ShaderBuffer>>) {
+    let never_skips = fits::Cell {
+        max: f32::INFINITY,
+        has_nan: true,
+    };
+    commands.insert_resource(NoGrid(Grid::new(&[never_skips], &mut buffers).buffer));
 }
 
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
@@ -82,12 +155,14 @@ pub struct VolumeMaterial {
     #[uniform(0)]
     pub params: VolumeParams,
     // R32Float is filterable on some devices and not others, so it's declared unfilterable everywhere.
-    #[texture(1, dimension = "3d", sample_type = "float", filterable = false)]
+    #[texture(1, dimension = "2d_array", sample_type = "float", filterable = false)]
     #[sampler(2, sampler_type = "non_filtering")]
     pub data_cube: Handle<Image>,
     #[texture(3)]
     #[sampler(4)]
     pub color_map: Handle<Image>,
+    #[storage(5, read_only)]
+    pub grid: Handle<ShaderBuffer>,
 }
 
 impl Material for VolumeMaterial {
@@ -132,7 +207,8 @@ impl Material for VolumeMaterial {
     }
 }
 
-/// An R32Float texture with no data yet, which `Uploads` fills.
+/// An R32Float 2D array texture with a layer per channel and no data yet, which `Uploads` fills. A 2D array
+/// sample issues faster than a 3D one.
 pub fn empty_cube_image(dims: [usize; 3]) -> Image {
     let size = Extent3d {
         width: dims[0] as u32,
@@ -141,15 +217,20 @@ pub fn empty_cube_image(dims: [usize; 3]) -> Image {
     };
     let mut image = Image::new_uninit(
         size,
-        TextureDimension::D3,
+        TextureDimension::D2,
         TextureFormat::R32Float,
         RenderAssetUsages::RENDER_WORLD,
     );
-    // Point filtering with Repeat wrapping, which is what iDaVIE's `new Texture3D` gets by default.
+    // Without this a single channel would be a plain 2D texture.
+    image.texture_view_descriptor = Some(TextureViewDescriptor {
+        dimension: Some(TextureViewDimension::D2Array),
+        ..default()
+    });
+    // Point filtering with Repeat wrapping, which is what iDaVIE's `new Texture3D` gets by default; the shader
+    // wraps z.
     image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
         address_mode_u: ImageAddressMode::Repeat,
         address_mode_v: ImageAddressMode::Repeat,
-        address_mode_w: ImageAddressMode::Repeat,
         ..ImageSamplerDescriptor::nearest()
     });
     image

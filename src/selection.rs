@@ -1,6 +1,6 @@
 //! Shift-drag region selection, and cropping the volume to it.
 
-use bevy::prelude::*;
+use bevy::{prelude::*, render::renderer::RenderDevice};
 use bevy_egui::input::EguiWantsInput;
 
 use crate::{
@@ -202,6 +202,7 @@ pub fn apply_crop(
     mut images: ResMut<Assets<Image>>,
     mut uploads: ResMut<Uploads>,
     mut orbit: Single<&mut Orbit>,
+    device: Res<RenderDevice>,
 ) {
     let mut framed = false;
     for request in requests.read() {
@@ -216,7 +217,7 @@ pub fn apply_crop(
                 // Cropping back to the region on screen drops a different crop that's on its way.
                 pending.cancel(&data.source);
                 if state.crop.as_ref().is_none_or(|crop| crop.region != region) {
-                    pending.0 = Some(data.texture(region, &mut images, &mut uploads));
+                    pending.0 = Some(data.texture(region, &device, &mut images, &mut uploads));
                 }
             }
             CropRequest::Reset => {

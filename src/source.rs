@@ -10,7 +10,7 @@ use bevy::{
     tasks::{AsyncComputeTaskPool, Task, block_on, poll_once},
 };
 
-use crate::fits::{self, Region};
+use crate::fits::{self, Cell, Region};
 
 pub enum Request {
     /// A region downsampled for `image`, until textures are built from cubelets.
@@ -30,6 +30,7 @@ pub enum Event {
     Texture {
         image: AssetId<Image>,
         data: Vec<f32>,
+        cells: Vec<Cell>,
     },
     PixelValue {
         id: u32,
@@ -68,11 +69,12 @@ impl DataSource {
                     let start = Instant::now();
                     let (dims, data) =
                         fits::crop_and_downsample(&cube, cube_dims, region, factors, max_mode);
+                    let cells = fits::cell_summary(&data, dims, fits::CUBELET);
                     info!(
                         "Texture {dims:?} for {region:?}, downsampled by {factors:?}, in {:.2} s",
                         start.elapsed().as_secs_f32()
                     );
-                    Event::Texture { image, data }
+                    Event::Texture { image, data, cells }
                 });
                 self.textures.lock().unwrap().push((image, task));
             }
