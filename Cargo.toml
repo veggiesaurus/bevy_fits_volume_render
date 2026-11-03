@@ -33,3 +33,8 @@ wasm-bindgen = "0.2"
 [lints.clippy]
 # Bevy systems take their resources and queries as arguments, as Bevy's own crates allow.
 too_many_arguments = "allow"
+
+# Thin LTO for the web build and anything shipped; `--release` stays quick to rebuild while developing.
+[profile.dist]
+inherits = "release"
+lto = "thin"

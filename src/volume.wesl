@@ -153,9 +153,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // iDaVIE takes the square root of max_length here, which leaves max_steps short of the longest rays.
     let max_length = length(params.slice_max - params.slice_min);
-    let step_length = max_length / f32(params.max_steps);
+    // Steps of about half a texel, so a small texture (a crop, or a heavily downsampled cube) doesn't pay
+    // for all of max_steps.
+    let steps = min(f32(params.max_steps), ceil(2.0 * length(vec3<f32>(textureDimensions(data_cube)))));
+    let step_length = max_length / steps;
     let step_vector = normalize(ray_delta);
-    let required_steps = i32(clamp(total_length / step_length, 0.0, f32(params.max_steps)));
+    let required_steps = i32(clamp(total_length / step_length, 0.0, steps));
 
     // Unity's _Time.xy is (t / 20, t)
     let rand_vector = nrand(in.position.xy + vec2(globals.time / 20.0, globals.time)) * step_vector * step_length * params.jitter;

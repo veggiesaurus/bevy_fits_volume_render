@@ -11,14 +11,19 @@ mod wcs;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
-use bevy::{diagnostic::FrameTimeDiagnosticsPlugin, platform::time::Instant, prelude::*};
+use std::{borrow::Cow, sync::Arc, time::Duration};
+
+use bevy::{
+    diagnostic::FrameTimeDiagnosticsPlugin, platform::time::Instant, prelude::*,
+    window::RequestRedraw, winit::WinitSettings,
+};
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 
 use camera::Orbit;
 use config::Config;
 use fits::Cube;
 use outline::{CubeOutline, Outline, OutlineMaterials, SelectionOutline, box_lines};
-use selection::{CropCommand, Gesture, Hover};
+use selection::{CropCommand, Gesture, Hover, PendingCrop};
 use volume::{VolumeMaterial, VolumeParams, VolumePlugin};
 
 /// Bevy's local space is right-handed; iDaVIE's (Unity) object space mirrors z.
@@ -34,6 +39,13 @@ struct Region {
 }
 
 impl Region {
+    fn whole(dims: [usize; 3]) -> Self {
+        Self {
+            min: [0; 3],
+            max: dims.map(|d| d - 1),
+        }
+    }
+
     fn extent(&self) -> [usize; 3] {
         std::array::from_fn(|i| self.max[i] - self.min[i] + 1)
     }
@@ -47,10 +59,28 @@ struct VolumeTexture {
     factors: [usize; 3],
 }
 
+/// A VolumeTexture's image before it's added as an asset, so they can be built off the main thread.
+struct TextureImages {
+    data: Image,
+    dims: [usize; 3],
+    factors: [usize; 3],
+}
+
+impl TextureImages {
+    fn add(self, images: &mut Assets<Image>) -> VolumeTexture {
+        VolumeTexture {
+            handle: images.add(self.data),
+            dims: self.dims,
+            factors: self.factors,
+        }
+    }
+}
+
 #[derive(Resource)]
 struct Dataset {
     name: String,
-    cube: Cube,
+    // Shared with crops being built in the background.
+    cube: Arc<Cube>,
     config: Config,
     wcs: Option<wcs::Wcs>,
     load_seconds: f32,
@@ -61,7 +91,7 @@ impl Dataset {
         let wcs = wcs::Wcs::from_cards(&cube.cards);
         Self {
             name,
-            cube,
+            cube: Arc::new(cube),
             config,
             wcs,
             load_seconds: start.elapsed().as_secs_f32(),
@@ -69,10 +99,7 @@ impl Dataset {
     }
 
     fn full_region(&self) -> Region {
-        Region {
-            min: [0; 3],
-            max: self.cube.dims.map(|d| d - 1),
-        }
+        Region::whole(self.cube.dims)
     }
 }
 
@@ -131,6 +158,7 @@ fn main() {
     .init_resource::<Hover>()
     .init_resource::<grips::Grips>()
     .init_resource::<Gesture>()
+    .init_resource::<PendingCrop>()
     .add_message::<CropCommand>()
     .add_systems(Startup, camera::spawn_camera)
     .add_systems(
@@ -159,10 +187,22 @@ fn main() {
         )
             .chain(),
     )
+    .add_systems(Update, keep_redrawing)
     .add_systems(EguiPrimaryContextPass, (ui::ui, axes::draw_axes));
 
+    // Redraw only on input, so an idle view doesn't keep the GPU ray-marching. SCREENSHOT counts frames, so
+    // it keeps Bevy's continuous default.
+    #[cfg(not(target_arch = "wasm32"))]
+    let continuous = std::env::var("SCREENSHOT").is_ok();
     #[cfg(target_arch = "wasm32")]
-    app.add_systems(PreUpdate, web::poll);
+    let continuous = false;
+    if !continuous {
+        app.insert_resource(WinitSettings::desktop_app());
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(Startup, web::keep_wake_proxy)
+        .add_systems(PreUpdate, web::poll);
     #[cfg(not(target_arch = "wasm32"))]
     app.insert_resource(dataset);
     #[cfg(not(target_arch = "wasm32"))]
@@ -171,6 +211,22 @@ fn main() {
     }
 
     app.run();
+}
+
+/// Frames otherwise only come with input, so keep asking for them while something is still settling: a crop
+/// being built, or a new texture still on its way to the screen.
+fn keep_redrawing(
+    pending: Res<PendingCrop>,
+    state: Option<Res<CubeState>>,
+    mut settle_until: Local<Option<Instant>>,
+    mut redraw: MessageWriter<RequestRedraw>,
+) {
+    if state.is_some_and(|state| state.is_changed()) {
+        *settle_until = Some(Instant::now() + Duration::from_secs(1));
+    }
+    if pending.0.is_some() || settle_until.is_some_and(|until| Instant::now() < until) {
+        redraw.write(RequestRedraw);
+    }
 }
 
 /// `SCREENSHOT=out.png` saves the window once rendering has settled, then exits.
@@ -246,31 +302,31 @@ fn load_native() -> Dataset {
 }
 
 /// Texture for a region of the cube, downsampled to fit the configured GPU budget.
-fn region_texture(data: &Dataset, region: Region, images: &mut Assets<Image>) -> VolumeTexture {
+fn region_images(cube: &Cube, config: &Config, region: Region) -> TextureImages {
     let start = Instant::now();
-    let factors = fits::find_downsample_factors(data.config.gpu_memory_limit_mb, region.extent());
-    let (dims, image) = if region == data.full_region() && factors == [1; 3] {
-        let dims = data.cube.dims;
-        (dims, volume::cube_image(dims, &data.cube.data))
+    let factors = fits::find_downsample_factors(config.gpu_memory_limit_mb, region.extent());
+    let (dims, values) = if region == Region::whole(cube.dims) && factors == [1; 3] {
+        (cube.dims, Cow::Borrowed(&cube.data[..]))
     } else {
         let (dims, values) = fits::crop_and_downsample(
-            &data.cube,
+            cube,
             region.min,
             region.max,
             factors,
-            data.config.max_mode_downsampling,
+            config.max_mode_downsampling,
         );
-        (dims, volume::cube_image(dims, &values))
+        (dims, Cow::Owned(values))
+    };
+    let images = TextureImages {
+        data: volume::cube_image(dims, &values),
+        dims,
+        factors,
     };
     info!(
         "Texture {dims:?} for {region:?}, downsampled by {factors:?}, in {:.2} s",
         start.elapsed().as_secs_f32()
     );
-    VolumeTexture {
-        handle: images.add(image),
-        dims,
-        factors,
-    }
+    images
 }
 
 /// Object-space box of a voxel region, as iDaVIE's CropToRegion and highlight bounds compute it.
@@ -294,7 +350,7 @@ fn spawn_volume(
     for entity in &old {
         commands.entity(entity).despawn();
     }
-    let full = region_texture(&data, data.full_region(), &mut images);
+    let full = region_images(&data.cube, &data.config, data.full_region()).add(&mut images);
 
     let config = &data.config;
     let settings = Settings {
@@ -348,6 +404,7 @@ fn spawn_volume(
     commands.insert_resource(outline);
     commands.insert_resource(settings);
     commands.insert_resource(Gesture::default());
+    commands.insert_resource(PendingCrop::default());
     commands.insert_resource(CubeState {
         material,
         full,

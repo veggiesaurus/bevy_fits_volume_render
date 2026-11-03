@@ -3,15 +3,21 @@
 use bevy::prelude::*;
 use bevy_egui::input::EguiWantsInput;
 
+use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future::poll_once};
+
 use crate::{
-    CubeState, Dataset, Region, UNITY_FROM_LOCAL,
+    CubeState, Dataset, Region, TextureImages, UNITY_FROM_LOCAL,
     camera::{DEFAULT_DISTANCE, Orbit, pointer},
     grips::Grips,
-    region_bounds, region_texture,
+    region_bounds, region_images,
 };
 
 #[derive(Resource, Default)]
 pub struct Hover(pub Option<[usize; 3]>);
+
+/// A crop being built in the background, so a big one doesn't stall the frame.
+#[derive(Resource, Default)]
+pub struct PendingCrop(pub Option<(Region, Task<TextureImages>)>);
 
 #[derive(Message)]
 pub enum CropCommand {
@@ -131,26 +137,47 @@ pub fn select_region(
 }
 
 /// Cropping keeps the selection, as iDaVIE's CropToFeature does, so a reset still shows where the crop was.
+/// The crop's texture is built in the background and swapped in when it's ready.
 pub fn apply_crop(
     mut commands: MessageReader<CropCommand>,
     data: Res<Dataset>,
     mut state: ResMut<CubeState>,
+    mut pending: ResMut<PendingCrop>,
     mut images: ResMut<Assets<Image>>,
     mut orbits: Query<&mut Orbit>,
 ) {
+    let mut framed = false;
     for command in commands.read() {
-        state.crop = match command {
+        match command {
             CropCommand::ToSelection => {
                 let Some(region) = state.selection else {
                     continue;
                 };
-                if state.crop.as_ref().is_some_and(|(crop, _)| *crop == region) {
+                let shown = state.crop.as_ref().map(|(crop, _)| *crop);
+                let building = pending.0.as_ref().map(|(crop, _)| *crop);
+                if shown == Some(region) || building == Some(region) {
                     continue;
                 }
-                Some((region, region_texture(&data, region, &mut images)))
+                let (cube, config) = (data.cube.clone(), data.config.clone());
+                let task = AsyncComputeTaskPool::get()
+                    .spawn(async move { region_images(&cube, &config, region) });
+                pending.0 = Some((region, task));
             }
-            CropCommand::Reset => None,
-        };
+            CropCommand::Reset => {
+                pending.0 = None;
+                state.crop = None;
+                framed = true;
+            }
+        }
+    }
+    let built =
+        (pending.0.as_mut()).and_then(|(region, task)| Some((*region, block_on(poll_once(task))?)));
+    if let Some((region, texture)) = built {
+        pending.0 = None;
+        state.crop = Some((region, texture.add(&mut images)));
+        framed = true;
+    }
+    if framed {
         let (lo, hi) = region_bounds(state.visible(&data), data.cube.dims);
         for mut orbit in &mut orbits {
             orbit.target = (lo + hi) / 2.0 * UNITY_FROM_LOCAL;

@@ -14,9 +14,11 @@ export CC_wasm32_unknown_unknown="$llvm/clang"
 export AR_wasm32_unknown_unknown="$llvm/llvm-ar"
 export CFLAGS_wasm32_unknown_unknown="-isystem $musl/arch/emscripten -isystem $musl/arch/generic -isystem $musl/include"
 
-cargo build --release --target wasm32-unknown-unknown
+# simd128 lets LLVM vectorise the FITS decoding and statistics; every WebGPU browser supports it.
+export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=+simd128"
+cargo build --profile dist --target wasm32-unknown-unknown
 wasm-bindgen --target web --no-typescript --remove-name-section --out-dir web/pkg \
-  target/wasm32-unknown-unknown/release/bevy_fits_volume_render.wasm
+  target/wasm32-unknown-unknown/dist/bevy_fits_volume_render.wasm
 if command -v wasm-opt >/dev/null; then
   wasm-opt -O web/pkg/bevy_fits_volume_render_bg.wasm -o web/pkg/bevy_fits_volume_render_bg.wasm
 fi

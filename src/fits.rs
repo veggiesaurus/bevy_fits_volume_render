@@ -246,10 +246,18 @@ fn read_data<S: Source + ?Sized>(
     };
     let float = |raw: f64| (bzero + bscale * raw) as f32;
 
-    let mut data = Vec::new();
-    data.try_reserve_exact(len)
-        .map_err(|_| format!("cannot allocate {len} voxels"))?;
-    data.resize(len, 0.0);
+    // Natively the OS zeroes these pages lazily, so they're first touched by the parallel tasks rather than
+    // by one thread up front. wasm32 has no overcommit, so there a failed allocation is reported instead.
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut data = vec![0.0; len];
+    #[cfg(target_arch = "wasm32")]
+    let mut data = {
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| format!("cannot allocate {len} voxels"))?;
+        data.resize(len, 0.0);
+        data
+    };
     let decode = |chunk: usize, out: &mut [f32]| -> Result<Moments, String> {
         let mut raw = vec![0u8; out.len() * width];
         source

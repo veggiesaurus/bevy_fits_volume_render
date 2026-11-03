@@ -27,7 +27,7 @@ default_scaling_type = "Linear" # Linear, Log, Sqrt, Square, Power or Gamma
 jitter = 1.0
 ```
 
-Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping reloads that region from the full resolution data and keeps the selection, the same as iDaVIE, and the panel shows the downsampling factors before and after.
+The view only redraws on input (and while a crop is being built), so an idle window leaves the GPU alone. Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping reloads that region from the full resolution data in the background and keeps the selection, the same as iDaVIE, and the panel shows the downsampling factors before and after.
 
 `SCREENSHOT=out.png` saves a frame once rendering has settled and exits, which is handy for side by side comparisons with iDaVIE.
 
@@ -40,7 +40,7 @@ python3 -m http.server -d web 8000
 
 Then open http://localhost:8000 and pick a file, or pass `?file=<url>` for one served from the same origin. `?hdu=N` picks an HDU, any other query parameter overrides a config key (`?file=cube.fits&default_color_map=Viridis`), and a `config.toml` next to `index.html` is read if there is one. It needs a WebGPU browser; it's been tested in Chrome on macOS only.
 
-The build needs rustup's toolchain with the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` 0.2.130, matching the `wasm-bindgen` in `Cargo.lock`. The script puts `~/.cargo/bin` first on `PATH` because Homebrew's Rust has no wasm32 standard library. A cold release build is slow, and the wasm is about 41 MB once `wasm-opt` (from Homebrew's `binaryen`) has run; the script skips it if it isn't installed.
+The build needs rustup's toolchain with the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` 0.2.130, matching the `wasm-bindgen` in `Cargo.lock`. The script puts `~/.cargo/bin` first on `PATH` because Homebrew's Rust has no wasm32 standard library. The script builds the `dist` profile, which adds thin LTO (`cargo build --profile dist` does the same for a native build to ship; plain `--release` leaves it off so rebuilds stay quick), and turns on wasm `simd128`, which every WebGPU browser supports. A cold build is slow, and the wasm is about 47 MB once `wasm-opt` (from Homebrew's `binaryen`) has run; the script skips it if it isn't installed.
 
 starlink-ast is Rust apart from the PAL, ERFA and WCSLIB routines it still vendors as C. `wasm32-unknown-unknown` has no libc headers to compile those against, so the script uses Homebrew's `llvm` clang with the musl headers from Homebrew's `emscripten` (headers only, nothing is built with emcc). The C only needs libm and `strcmp`, which Rust's `compiler_builtins` already provides on wasm, so WCS works the same in the browser as natively.
 
@@ -61,6 +61,8 @@ The shader is a line for line port. The Unity specifics are translated rather th
 - infinite voxels are left out of the range and statistics along with NaN ones, since one would scale every other voxel to zero
 - the selection outline is only white if cropping to it would actually load at full resolution, so the 2048 texel limit counts as well as the memory budget
 - the near plane follows the camera in, so a small crop doesn't end up behind it
+- the step count is capped at about two per texel along the texture's diagonal, so a small crop or a heavily downsampled cube takes fewer than `max_raymarching_steps`. Voxel edges can shift by a fraction of a voxel compared with iDaVIE
+- the view only redraws on input, so the jitter noise holds still while nothing changes; iDaVIE renders every frame
 
 WCS comes from [starlink-ast](https://github.com/Starlink/starlink-ast-rs), the Rust port of AST, with spectral axes shown in MHz or km/s. The port doesn't include AST's `Plot3D`, so the WCS ticks on the bounding box are our own. Each axis is labelled on the box edge that's on the silhouette, at round values found with AST's transforms and formatted with AST's `Format`. The tick spacing is chosen by hand because `astGap` isn't ported either.
 
