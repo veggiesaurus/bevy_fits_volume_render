@@ -22,8 +22,11 @@ use crate::{
     volume::{VolumeMaterial, VolumeParams},
 };
 
-/// SoFiA-2's `scfind.threshold` is 5.
 pub const SIGMA_LEVELS: [f32; 4] = [1.0, 3.0, 5.0, 10.0];
+/// SoFiA-2's default `scfind.threshold`.
+pub const MASK_SIGMAS: f32 = 5.0;
+
+const MEASURING: &str = "measuring the noise";
 
 /// No mask: one voxel, bound until a mask is made.
 pub const NO_MASK: Handle<Image> = uuid_handle!("6f0c1d0e-3b7a-4f53-9a51-2c0b4d8e7a19");
@@ -57,6 +60,17 @@ impl Plugin for ModesPlugin {
 /// A texture as it's shown: which it is, the pyramid its cubelets come from and their processing.
 type Shown = (AssetId<Image>, Mode, Processing);
 
+/// The texture shown, as it's shown. Level 0 is the same in both pyramids.
+fn shown(settings: &Settings, state: &CubeState) -> Shown {
+    let texture = state.shown();
+    let mode = if texture.level == 0 {
+        Mode::Max
+    } else {
+        settings.mode()
+    };
+    (texture.handle.id(), mode, settings.modes.processing)
+}
+
 /// What the data source has measured or made for the texture shown, its noise and its mask, and the span of the
 /// channel colours. One per dataset.
 #[derive(Resource, Default)]
@@ -71,7 +85,7 @@ pub struct Extras {
 }
 
 struct Mask {
-    texture: AssetId<Image>,
+    shown: Shown,
     id: u32,
     sigmas: f32,
     image: Handle<Image>,
@@ -86,26 +100,27 @@ impl Extras {
         self.noise
     }
 
-    /// The mask for `texture`: the level it was made at, and how many texels are in it once it's ready.
-    pub fn mask(&self, texture: AssetId<Image>) -> Option<(f32, Option<usize>)> {
-        (self.mask.as_ref())
-            .filter(|mask| mask.texture == texture)
-            .map(|mask| (mask.sigmas, mask.voxels.filter(|_| mask.ready)))
+    /// The mask, for the texture as it's shown: the threshold it was made at, and how many texels are in it once it's
+    /// ready.
+    pub fn mask(&self) -> Option<(f32, Option<usize>)> {
+        (self.mask.as_ref()).map(|mask| (mask.sigmas, mask.voxels.filter(|_| mask.ready)))
     }
 
-    fn ready_mask(&self, texture: AssetId<Image>) -> Option<&Handle<Image>> {
+    fn ready_mask(&self) -> Option<&Handle<Image>> {
         (self.mask.as_ref())
-            .filter(|mask| mask.texture == texture && mask.ready)
+            .filter(|mask| mask.ready)
             .map(|mask| &mask.image)
     }
 }
 
+/// A mask asked for, at this threshold in σ.
 #[derive(Message)]
-pub struct GenerateMask;
+pub struct GenerateMask(pub f32);
 
 /// Asks for the noise of the texture shown each time it changes or is shown otherwise, once it's the one the view
-/// wants rather than a coarser one on the way to it; drops a mask made for another, and readies one once its parts
-/// are written; and finds the channel colours' span once the coarse level is in.
+/// wants rather than a coarser one on the way to it; drops a mask made for another or for this one as it was shown
+/// before, and readies one once its parts are written; and finds the channel colours' span once the coarse level is
+/// in.
 fn follow_texture(
     settings: Res<Settings>,
     state: Res<CubeState>,
@@ -118,17 +133,8 @@ fn follow_texture(
     {
         extras.channels = Some(channels);
     }
-    let texture = state.shown();
-    let shown = (
-        texture.handle.id(),
-        settings.mode(),
-        settings.modes.processing,
-    );
-    if extras
-        .mask
-        .as_ref()
-        .is_some_and(|mask| mask.texture != shown.0)
-    {
+    let (texture, shown) = (state.shown(), shown(&settings, &state));
+    if extras.mask.as_ref().is_some_and(|mask| mask.shown != shown) {
         extras.mask = None;
     }
     let written =
@@ -154,8 +160,8 @@ fn follow_texture(
     extras.asked = Some((shown, id));
 }
 
-/// A mask for the texture shown as it's shown, at the settings' level, its parts written into an R8 texture of its own
-/// as they come.
+/// A mask for the texture shown as it's shown, at the threshold asked for, its parts written into an R8 texture of its
+/// own as they come.
 fn generate_mask(
     mut requests: MessageReader<GenerateMask>,
     settings: Res<Settings>,
@@ -164,22 +170,22 @@ fn generate_mask(
     mut extras: ResMut<Extras>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    if requests.read().count() == 0 {
+    let Some(&GenerateMask(sigmas)) = requests.read().last() else {
         return;
-    }
-    let texture = state.shown();
+    };
+    let (texture, shown) = (state.shown(), shown(&settings, &state));
     extras.next_id += 1;
-    let (id, sigmas) = (extras.next_id, settings.modes.sigmas);
+    let id = extras.next_id;
     data.source.send(Request::Mask {
         id,
-        mode: settings.mode(),
-        processing: settings.modes.processing,
+        mode: shown.1,
+        processing: shown.2,
         level: texture.level as u8,
         texels: texture.texels,
         threshold: sigmas,
     });
     extras.mask = Some(Mask {
-        texture: texture.handle.id(),
+        shown,
         id,
         sigmas,
         image: images.add(mask_image(texture.dims(), None)),
@@ -323,6 +329,16 @@ impl RenderMode {
         }
     }
 
+    /// `at`, the level, where the mode uses one: not Maximum, Average or depth cued, nor the clipped moments when a
+    /// mask leaves what counts to it.
+    fn level<T>(self, masked: bool, at: T) -> Option<T> {
+        match self {
+            Self::Maximum | Self::Average | Self::DepthCued => None,
+            Self::ClippedMoment | Self::MeanChannel if masked => None,
+            _ => Some(at),
+        }
+    }
+
     /// Maximum's 0 for those taking a ray's brightest voxel, which a max-downsampled texture suits, else Average's 1.
     pub fn projection_mode(self) -> u32 {
         match self {
@@ -335,7 +351,7 @@ impl RenderMode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModeSettings {
     pub mode: RenderMode,
-    /// The level, in σ above the noise median, for the modes that need one and for the mask.
+    /// The level, in σ above the noise median, for the modes that use one.
     pub sigmas: f32,
     pub depth_cue: f32,
     /// The optical depth of a cube's width at threshold Max.
@@ -486,16 +502,9 @@ fn update_material(
         median: info.stats.mean as f32,
         sigma: (info.stats.std as f32).max(f32::MIN_POSITIVE),
     });
-    let mask = extras
-        .ready_mask(texture.handle.id())
-        .filter(|_| m.apply_mask);
+    let mask = extras.ready_mask().filter(|_| m.apply_mask);
     use RenderMode::*;
-    let nominal = noise.median + m.sigmas * noise.sigma;
-    // With a mask, the clipped moments leave what counts to it.
-    let level = match m.mode {
-        ClippedMoment | MeanChannel if mask.is_some() => f32::MIN,
-        _ => nominal,
-    };
+    let level = (m.mode.level(mask.is_some(), noise.at(m.sigmas))).unwrap_or(f32::MIN);
     let floor = view::floor_value(p);
     let layer = |channel: f32| channel / texture.factors[2] as f32 - texture.texels.min[2] as f32;
     let (channel_from, channel_to) = match extras.channels {
@@ -552,15 +561,15 @@ fn line_planes(line_flux: &[f32]) -> Option<(usize, usize)> {
     Some((from.unwrap_or(0), to))
 }
 
-/// The mode, its sliders, the σ level, the mask and the processing. True when a mask is asked for.
+/// The mode, its sliders, the σ level where it uses one, and the processing. `masked` when a mask is applied.
 pub fn ui(
     ui: &mut egui::Ui,
     p: &mut VolumeParams,
     m: &mut ModeSettings,
     noise: Option<Noise>,
-    mask: Option<(f32, Option<usize>)>,
+    masked: bool,
     unit: &str,
-) -> bool {
+) {
     egui::ComboBox::from_label("Rendering mode")
         .selected_text(m.mode.name())
         .show_ui(ui, |ui| {
@@ -600,26 +609,41 @@ pub fn ui(
         }
         _ => {}
     }
-
-    ui.separator();
+    if let Some(level) = m.mode.level(masked, noise.map(|n| n.at(m.sigmas))) {
+        let readout = level.map_or_else(|| MEASURING.into(), |level| format!("{level:.3e}{unit}"));
+        sigma_row(ui, "Level", &mut m.sigmas, readout).on_hover_text(
+            "Above the texture's noise median, in its noise σ: the isosurface, the shells, the clip, and the floor \
+             for the channel colours, attenuation and emission",
+        );
+    }
     ui.horizontal(|ui| {
-        ui.label("Level");
-        for sigmas in SIGMA_LEVELS {
-            if ui.selectable_label(m.sigmas == sigmas, format!("{sigmas}σ")).clicked() {
-                m.sigmas = sigmas;
-            }
-        }
-        ui.label(match noise {
-            Some(n) => format!("{:.3e}{unit}, σ {:.3e}", n.median + m.sigmas * n.sigma, n.sigma),
-            None => "measuring the noise".into(),
-        });
-    })
-    .response
-    .on_hover_text(
-        "Above the texture's noise median, in its noise σ: the isosurface, the shells, the clip, the floor for \
-         the channel colours, attenuation and emission, and the mask's threshold",
-    );
+        ui.checkbox(&mut m.processing.normalise, "Normalise noise")
+            .on_hover_text("Each channel and spectrum scaled to the same noise, as SoFiA-2 does. Changes fluxes");
+        egui::ComboBox::from_label("Smoothing")
+            .selected_text(smoothing_name(m.processing.smoothing))
+            .show_ui(ui, |ui| {
+                for smoothing in [Smoothing::Off, Smoothing::Spectral, Smoothing::Spatial] {
+                    let name = smoothing_name(smoothing);
+                    ui.selectable_value(&mut m.processing.smoothing, smoothing, name);
+                }
+            });
+    });
+}
 
+/// The mask's threshold in σ, making it and applying it. True when a mask is asked for.
+pub fn mask_ui(
+    ui: &mut egui::Ui,
+    m: &mut ModeSettings,
+    sigmas: &mut f32,
+    noise: Option<Noise>,
+    mask: Option<(f32, Option<usize>)>,
+    unit: &str,
+) -> bool {
+    let readout = noise.map_or_else(|| MEASURING.into(), |n| format!("σ {:.3e}{unit}", n.sigma));
+    sigma_row(ui, "Threshold", sigmas, readout).on_hover_text(
+        "Each smoothed copy of the texture is clipped this far above its own noise median, in its own σ, as \
+         SoFiA-2's finder does. The σ shown is the unsmoothed texture's. SoFiA-2's default is 5σ",
+    );
     let mut generate = false;
     ui.horizontal(|ui| match mask {
         Some((sigmas, None)) => {
@@ -627,9 +651,8 @@ pub fn ui(
             ui.spinner();
         }
         mask => {
-            let button = egui::Button::new(format!("Generate mask at {}σ", m.sigmas));
             if ui
-                .add(button)
+                .button("Generate mask")
                 .on_hover_text(
                     "Smooth and clip, as SoFiA-2's finder, without its reliability step. Made from the texture's \
                      level, so at its downsampling",
@@ -652,18 +675,22 @@ pub fn ui(
             egui::Slider::new(&mut m.outside_mask, 0.0..=1.0).text("outside it"),
         );
     });
-
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut m.processing.normalise, "Normalise noise")
-            .on_hover_text("Each channel and spectrum scaled to the same noise, as SoFiA-2 does. Changes fluxes");
-        egui::ComboBox::from_label("Smoothing")
-            .selected_text(smoothing_name(m.processing.smoothing))
-            .show_ui(ui, |ui| {
-                for smoothing in [Smoothing::Off, Smoothing::Spectral, Smoothing::Spatial] {
-                    let name = smoothing_name(smoothing);
-                    ui.selectable_value(&mut m.processing.smoothing, smoothing, name);
-                }
-            });
-    });
     generate
+}
+
+/// A row picking one of SIGMA_LEVELS, then `readout`.
+fn sigma_row(ui: &mut egui::Ui, label: &str, sigmas: &mut f32, readout: String) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        for level in SIGMA_LEVELS {
+            if ui
+                .selectable_label(*sigmas == level, format!("{level}σ"))
+                .clicked()
+            {
+                *sigmas = level;
+            }
+        }
+        ui.label(readout);
+    })
+    .response
 }

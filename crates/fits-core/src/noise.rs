@@ -15,6 +15,13 @@ pub struct Noise {
     pub sigma: f32,
 }
 
+impl Noise {
+    /// `sigmas` σ above the median.
+    pub fn at(self, sigmas: f32) -> f32 {
+        self.median + sigmas * self.sigma
+    }
+}
+
 /// What's done to a level's texels before they're shown.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Processing {
@@ -460,7 +467,7 @@ pub fn find_sources(voxels: &[f32], dims: [usize; 3], noise: Noise, threshold: f
             let Some(noise) = noise else {
                 continue;
             };
-            let cut = noise.median + threshold * noise.sigma;
+            let cut = noise.at(threshold);
             for (m, &v) in mask.iter_mut().zip(data) {
                 *m |= u8::from(v > cut);
             }

@@ -45,6 +45,8 @@ pub fn ui(
     mut crop_requests: MessageWriter<CropRequest>,
     extras: Res<Extras>,
     mut generate: MessageWriter<GenerateMask>,
+    // The mask's threshold, which only the mask it asks for takes.
+    mut mask_sigmas: Local<Option<f32>>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     egui::Window::new("iDaVIE volume renderer")
@@ -67,10 +69,13 @@ pub fn ui(
                 ui.label("Choose a FITS file to load");
                 return;
             };
+            let (noise, unit) = (extras.noise(), data.info.unit());
+            let unit = unit.map_or(String::new(), |u| format!(" {u}"));
             egui::CollapsingHeader::new("Cube")
                 .default_open(true)
                 .show(ui, |ui| {
-                    cube_section(ui, &data, &state, &hover, &mut crop_requests)
+                    let crops = &mut crop_requests;
+                    cube_section(ui, &data, &state, &hover, crops, noise, &unit)
                 });
             if let Some(wcs) = &data.wcs {
                 egui::CollapsingHeader::new("WCS").show(ui, |ui| {
@@ -79,13 +84,22 @@ pub fn ui(
                     }
                 });
             }
+            let mask = extras.mask();
+            let masked = settings.modes.apply_mask && mask.is_some_and(|(_, n)| n.is_some());
             egui::CollapsingHeader::new("Rendering")
                 .default_open(true)
                 .show(ui, |ui| {
-                    let mask = extras.mask(state.shown().handle.id());
-                    if rendering_section(ui, &data, &mut settings, extras.noise(), mask) {
-                        generate.write(GenerateMask);
+                    rendering_section(ui, &data, &mut settings, noise, masked, &unit)
+                });
+            egui::CollapsingHeader::new("Mask")
+                .default_open(true)
+                .show(ui, |ui| {
+                    let sigmas = mask_sigmas.get_or_insert(modes::MASK_SIGMAS);
+                    let mut s = settings.clone();
+                    if modes::mask_ui(ui, &mut s.modes, sigmas, noise, mask, &unit) {
+                        generate.write(GenerateMask(*sigmas));
                     }
+                    settings.set_if_neq(s);
                 });
             ui.separator();
             ui.small(HELP);
@@ -99,11 +113,12 @@ fn cube_section(
     state: &CubeState,
     hover: &Hover,
     crop_requests: &mut MessageWriter<CropRequest>,
+    noise: Option<Noise>,
+    unit: &str,
 ) {
     let info = &data.info;
     let stats = info.stats;
     let gb = (info.dims.iter().product::<usize>() * size_of::<f32>()) as f64 / 1e9;
-    let unit = info.unit().map_or(String::new(), |u| format!(" {u}"));
     let cropped = state.cropped();
     egui::Grid::new("cube").num_columns(2).show(ui, |ui| {
         let mut row = |name: &str, value: String| {
@@ -127,7 +142,8 @@ fn cube_section(
             "Mean, std",
             format!("{:.4e}, {:.4e}", stats.mean, stats.std),
         );
-        if let Some(sigma) = info.sigma {
+        // The shown texture's once it's measured, which the σ settings go by, and until then the cube's at open.
+        if let Some(sigma) = noise.map(|n| f64::from(n.sigma)).or(info.sigma) {
             row("Noise σ", format!("{sigma:.4e}{unit}"));
         }
         row("Non-finite voxels", stats.non_finite.to_string());
@@ -185,14 +201,14 @@ fn cube_section(
     });
 }
 
-/// True when a mask is asked for.
 fn rendering_section(
     ui: &mut egui::Ui,
     data: &Dataset,
     settings: &mut ResMut<Settings>,
     noise: Option<Noise>,
-    mask: Option<(f32, Option<usize>)>,
-) -> bool {
+    masked: bool,
+    unit: &str,
+) {
     let mut s = settings.clone();
     let p = &mut s.params;
     egui::ComboBox::from_label("Colour map")
@@ -249,13 +265,11 @@ fn rendering_section(
     ui.add(
         egui::Slider::new(&mut p.threshold_max, min..=1.0).text(format!("Max ({max_value:.3e})")),
     );
-    let unit = data.info.unit().map_or(String::new(), |u| format!(" {u}"));
-    let generate = modes::ui(ui, p, &mut s.modes, noise, mask, &unit);
+    modes::ui(ui, p, &mut s.modes, noise, masked, unit);
     ui.add(egui::Slider::new(&mut p.jitter, JITTER).text("Jitter"));
     ui.add(egui::Slider::new(&mut p.max_steps, RAYMARCHING_STEPS).text("Ray-marching steps"));
     if data.wcs.is_some() {
         ui.checkbox(&mut s.wcs_axes, "WCS axes");
     }
     settings.set_if_neq(s);
-    generate
 }
