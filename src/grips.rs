@@ -9,6 +9,7 @@ use crate::{
     fits::Region,
     region_bounds,
     selection::Gesture,
+    shape::BoxShape,
 };
 
 // Fractions of the distance to the camera, so grips and their face arrows keep a constant size on screen.
@@ -27,9 +28,9 @@ fn is_face(grip: IVec3) -> bool {
     grip.abs().element_sum() == 1
 }
 
-/// The tip of a face grip's arrow, which starts at the face centre and points outward.
+/// The tip of a face grip's arrow, which starts at the face centre and points outward, in the world.
 fn arrow_tip(grip: IVec3, position: Vec3, eye: Vec3) -> Vec3 {
-    position + grip.as_vec3() * (eye - position).length() * ARROW_LENGTH
+    position + grip.as_vec3() * UNITY_FROM_LOCAL * (eye - position).length() * ARROW_LENGTH
 }
 
 /// A grip's position in iDaVIE (Unity) object space, on the box `lo`..`hi`.
@@ -42,8 +43,8 @@ fn grip_position(grip: IVec3, (lo, hi): (Vec3, Vec3)) -> Vec3 {
     )
 }
 
-/// Where the pointer ray (object space) meets a grip's constraint: the axis line through a face grip,
-/// or the plane facing the camera for a corner grip.
+/// Where the pointer ray meets a grip's constraint: the axis line through a face grip, or the plane facing the
+/// camera for a corner grip. In the world, since the z scale would skew both in object space.
 fn grip_hit(grip: IVec3, anchor: Vec3, origin: Vec3, dir: Vec3, forward: Vec3) -> Option<Vec3> {
     if is_face(grip) {
         // Closest point on the line anchor + s * axis to the ray.
@@ -93,10 +94,15 @@ pub fn drag_grips(
     window: Single<&Window>,
     camera: Single<(&Camera, &GlobalTransform), With<Orbit>>,
     data: Res<Dataset>,
+    shape: Res<BoxShape>,
     mut state: ResMut<CubeState>,
     mut grips: ResMut<Grips>,
     mut gesture: ResMut<Gesture>,
 ) {
+    // A drag's start is in the world of the shape it began in.
+    if shape.is_changed() && matches!(*gesture, Gesture::Grip(_)) {
+        *gesture = Gesture::Idle;
+    }
     let Some(selection) = state.selection else {
         grips.hovered = None;
         return;
@@ -107,8 +113,9 @@ pub fn drag_grips(
     };
     let dims = data.info.dims;
     let screen = |p: Vec3| camera.world_to_viewport(camera_transform, p).ok();
-    let forward = camera_transform.forward().as_vec3() * UNITY_FROM_LOCAL;
-    let eye = camera_transform.translation() * UNITY_FROM_LOCAL;
+    let forward = camera_transform.forward().as_vec3();
+    let eye = camera_transform.translation();
+    let world = |grip, bounds| shape.to_world(grip_position(grip, bounds));
 
     if let Gesture::Grip(GripDrag {
         grip,
@@ -116,11 +123,12 @@ pub fn drag_grips(
         start_hit,
     }) = *gesture
     {
-        let anchor = grip_position(grip, region_bounds(start, dims));
+        let anchor = world(grip, region_bounds(start, dims));
         let Some(hit) = grip_hit(grip, anchor, ray.origin, *ray.direction, forward) else {
             return;
         };
-        let selection = resize(start, grip, anchor + hit - start_hit, dims, state.visible);
+        let target = shape.to_object(anchor + hit - start_hit);
+        let selection = resize(start, grip, target, dims, state.visible);
         if state.selection != Some(selection) {
             state.selection = Some(selection);
         }
@@ -133,11 +141,11 @@ pub fn drag_grips(
     } else {
         grip_ids()
             .filter_map(|g| {
-                let at = grip_position(g, bounds);
-                let p = screen(at * UNITY_FROM_LOCAL)?;
+                let at = world(g, bounds);
+                let p = screen(at)?;
                 // A face grip is its whole arrow; a corner grip is a point.
                 let distance = if is_face(g) {
-                    let tip = screen(arrow_tip(g, at, eye) * UNITY_FROM_LOCAL)?;
+                    let tip = screen(arrow_tip(g, at, eye))?;
                     cursor.distance(Segment2d::new(p, tip).closest_point(cursor))
                 } else {
                     p.distance(cursor)
@@ -152,7 +160,7 @@ pub fn drag_grips(
         && let Some(grip) = grips.hovered
         && let Some(start_hit) = grip_hit(
             grip,
-            grip_position(grip, bounds),
+            world(grip, bounds),
             ray.origin,
             *ray.direction,
             forward,
@@ -169,6 +177,7 @@ pub fn drag_grips(
 pub fn draw_grips(
     mut gizmos: Gizmos,
     data: Res<Dataset>,
+    shape: Res<BoxShape>,
     state: Res<CubeState>,
     grips: Res<Grips>,
     gesture: Res<Gesture>,
@@ -191,11 +200,10 @@ pub fn draw_grips(
         Gesture::Grip(drag) => Some(drag.grip),
         _ => grips.hovered,
     };
-    let eye = transform.translation * UNITY_FROM_LOCAL;
+    let eye = transform.translation;
     for grip in grip_ids() {
-        let at = grip_position(grip, bounds);
-        let p = at * UNITY_FROM_LOCAL;
-        let size = (transform.translation - p).length() * GRIP_SIZE;
+        let p = shape.to_world(grip_position(grip, bounds));
+        let size = (eye - p).length() * GRIP_SIZE;
         let color = if Some(grip) == active {
             Color::srgb(1.0, 0.85, 0.0)
         } else {
@@ -203,7 +211,7 @@ pub fn draw_grips(
         };
         if is_face(grip) {
             // An arrow along the direction the face moves.
-            let tip = arrow_tip(grip, at, eye) * UNITY_FROM_LOCAL;
+            let tip = arrow_tip(grip, p, eye);
             // Arrows fade in as the pointer comes within 65 pixels of them, and are solid within 20.
             let near = match (cursor, screen(p), screen(tip)) {
                 (Some(c), Some(a), Some(b)) => c.distance(Segment2d::new(a, b).closest_point(c)),

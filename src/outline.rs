@@ -2,9 +2,7 @@
 
 use bevy::{asset::RenderAssetUsages, mesh::PrimitiveTopology, prelude::*};
 
-use crate::{
-    CubeState, Dataset, DatasetEntity, UNITY_FROM_LOCAL, camera::Orbit, fits::Region, region_bounds,
-};
+use crate::{CubeState, Dataset, DatasetEntity, camera::Orbit, shape::BoxShape};
 
 #[derive(Component)]
 pub struct SelectionOutline;
@@ -158,15 +156,11 @@ pub fn shade_hidden_edges(
     }
 }
 
-pub fn box_transform(region: Region, dims: [usize; 3]) -> Transform {
-    let (lo, hi) = region_bounds(region, dims);
-    Transform::from_translation((lo + hi) / 2.0 * UNITY_FROM_LOCAL).with_scale(hi - lo)
-}
-
 /// The visible outline follows the visible (cropped) region; the selection outline follows the selection.
 pub fn update_outlines(
     data: Res<Dataset>,
     state: Res<CubeState>,
+    shape: Res<BoxShape>,
     outline_materials: Res<OutlineMaterials>,
     mut visible_outline: Query<&mut Transform, (With<VisibleOutline>, Without<SelectionOutline>)>,
     mut selection_outline: Query<
@@ -180,7 +174,7 @@ pub fn update_outlines(
     >,
 ) {
     for mut transform in &mut visible_outline {
-        *transform = box_transform(state.visible, data.info.dims);
+        *transform = shape.transform(state.visible, data.info.dims);
     }
     let Ok((mut transform, mut visibility, mut material, mut outline)) =
         selection_outline.single_mut()
@@ -191,7 +185,7 @@ pub fn update_outlines(
         *visibility = Visibility::Hidden;
         return;
     };
-    *transform = box_transform(selection, data.info.dims);
+    *transform = shape.transform(selection, data.info.dims);
     // iDaVIE colours the region white, with tinted axes, when cropping to it would load at full resolution, and
     // yellow otherwise.
     let full_res = state.levels.for_region(selection) == 0;

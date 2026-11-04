@@ -65,6 +65,7 @@ pub struct VolumeParams {
     pub texture_min: Vec3,
     pub texture_max: Vec3,
     pub grid_offset: Vec3,
+    pub box_size: Vec3,
 }
 
 impl Default for VolumeParams {
@@ -99,6 +100,7 @@ impl Default for VolumeParams {
             texture_min: Vec3::splat(-0.5),
             texture_max: Vec3::splat(0.5),
             grid_offset: Vec3::ZERO,
+            box_size: Vec3::ONE,
         }
     }
 }
@@ -107,8 +109,8 @@ impl VolumeParams {
     /// iDaVIE's step, sqrt(max_length) / max_steps, with the step count lifted so the longest rays (sqrt(3) on
     /// the full cube) reach the far side rather than stopping at max_steps. Capped at about two steps per texel
     /// along the diagonal of the `visible` texels, those inside the clip box, so a small crop or a heavily
-    /// downsampled cube costs less. Then the texture's grid: `cells` cubelets, the first starting `offset` texels
-    /// before the texture.
+    /// downsampled cube costs less. Both are in object space, so the samples per voxel don't change with the z scale.
+    /// Then the texture's grid: `cells` cubelets, the first starting `offset` texels before the texture.
     pub fn set_texture(
         &mut self,
         dims: [usize; 3],

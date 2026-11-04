@@ -8,10 +8,11 @@ use bevy_egui::{EguiContexts, egui};
 
 use crate::{
     CubeState, Dataset, Settings,
-    config::{ASINH, COLOR_MAPS, GAMMA, JITTER, RAYMARCHING_STEPS, SCALING_TYPES},
+    config::{ASINH, COLOR_MAPS, GAMMA, JITTER, RAYMARCHING_STEPS, SCALING_TYPES, ZScale},
     fits::{Noise, PERCENTILES, Region},
     modes::{self, Extras, GenerateMask},
     selection::{CropRequest, Hover},
+    shape::z_scale_range,
 };
 
 const HELP: &str = "Drag: orbit. Right or middle drag: pan. Scroll: zoom. Shift+drag: select region. \
@@ -268,8 +269,49 @@ fn rendering_section(
     modes::ui(ui, p, &mut s.modes, noise, masked, unit);
     ui.add(egui::Slider::new(&mut p.jitter, JITTER).text("Jitter"));
     ui.add(egui::Slider::new(&mut p.max_steps, RAYMARCHING_STEPS).text("Ray-marching steps"));
+    z_scale_row(ui, data.info.dims, &mut s.z_scale);
     if data.wcs.is_some() {
         ui.checkbox(&mut s.wcs_axes, "WCS axes");
     }
     settings.set_if_neq(s);
+}
+
+/// The z axis's scale relative to cubic voxels: a preset, or any value in `z_scale_range`.
+fn z_scale_row(ui: &mut egui::Ui, dims: [usize; 3], z_scale: &mut f32) {
+    ui.horizontal(|ui| {
+        ui.label("Z scale")
+            .on_hover_text("How deep the box is drawn, relative to cubic voxels");
+        let presets = [
+            (
+                ZScale::Cube,
+                "Cube",
+                "The whole cube as deep as its wider side",
+            ),
+            (
+                ZScale::Voxels,
+                "Cubic voxels",
+                "Each voxel as deep as it's wide",
+            ),
+        ];
+        // Only the first, when a cube's presets are the same.
+        let current = presets
+            .iter()
+            .position(|(preset, ..)| preset.value(dims) == *z_scale);
+        for (i, (preset, name, about)) in presets.into_iter().enumerate() {
+            if ui
+                .selectable_label(current == Some(i), name)
+                .on_hover_text(about)
+                .clicked()
+            {
+                *z_scale = preset.value(dims);
+            }
+        }
+        // A percent of the value per pixel, so a drag goes as far at 0.1 as at 100.
+        let speed = *z_scale * 0.01;
+        ui.add(
+            egui::DragValue::new(z_scale)
+                .range(z_scale_range(dims))
+                .speed(speed),
+        );
+    });
 }

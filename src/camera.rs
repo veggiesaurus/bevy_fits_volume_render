@@ -8,13 +8,19 @@ use bevy::{
 };
 use bevy_egui::input::EguiWantsInput;
 
-use crate::{UNITY_FROM_LOCAL, selection::Gesture};
+use crate::{fits::Region, selection::Gesture, shape::BoxShape};
 
-pub const DEFAULT_DISTANCE: f32 = 2.0;
+const DEFAULT_DISTANCE: f32 = 2.0;
 
 /// The near plane as a fraction of the orbit distance: iDaVIE's 0.05 at the default distance, and it
 /// follows the camera in when a crop or zoom brings it close.
 const NEAR_FRACTION: f32 = 0.025;
+/// How far in and out the camera zooms, as fractions of the distance that frames the visible region: 0.01 to 20 for
+/// a unit box.
+const ZOOM: (f32, f32) = (0.005, 10.0);
+/// The far plane as a fraction of the framed distance: past the region at the furthest zoom, since its far corner is
+/// less than half the framed distance behind its middle.
+const FAR_FRACTION: f32 = ZOOM.1 + 1.0;
 
 #[derive(Component)]
 pub struct Orbit {
@@ -22,6 +28,8 @@ pub struct Orbit {
     pub yaw: f32,
     pub pitch: f32,
     pub distance: f32,
+    /// The distance that frames the visible region, which the zoom limits and the far plane follow.
+    pub framed: f32,
 }
 
 impl Default for Orbit {
@@ -31,11 +39,22 @@ impl Default for Orbit {
             yaw: 0.0,
             pitch: 0.0,
             distance: DEFAULT_DISTANCE,
+            framed: DEFAULT_DISTANCE,
         }
     }
 }
 
-/// The cursor's window position, and the ray under it in iDaVIE (Unity) object space.
+impl Orbit {
+    /// Aims at a region's middle, from twice its largest side in the box `shape` draws.
+    pub fn frame(&mut self, shape: BoxShape, region: Region, dims: [usize; 3]) {
+        let framed = shape.transform(region, dims);
+        self.target = framed.translation;
+        self.framed = DEFAULT_DISTANCE * framed.scale.max_element();
+        self.distance = self.framed;
+    }
+}
+
+/// The cursor's window position, and the ray under it in the world.
 pub struct Pointer {
     pub cursor: Vec2,
     pub ray: Ray3d,
@@ -44,14 +63,7 @@ pub struct Pointer {
 pub fn pointer(window: &Window, camera: &Camera, view: &GlobalTransform) -> Option<Pointer> {
     let cursor = window.cursor_position()?;
     let ray = camera.viewport_to_world(view, cursor).ok()?;
-    Some(Pointer {
-        cursor,
-        // Mirroring keeps the direction a unit vector.
-        ray: Ray3d::new(
-            ray.origin * UNITY_FROM_LOCAL,
-            Dir3::new_unchecked(*ray.direction * UNITY_FROM_LOCAL),
-        ),
-    })
+    Some(Pointer { cursor, ray })
 }
 
 pub fn spawn_camera(mut commands: Commands) {
@@ -61,6 +73,7 @@ pub fn spawn_camera(mut commands: Commands) {
         Projection::Perspective(PerspectiveProjection {
             fov: 60f32.to_radians(),
             near: DEFAULT_DISTANCE * NEAR_FRACTION,
+            far: DEFAULT_DISTANCE * FAR_FRACTION,
             ..default()
         }),
         // Unity's linear colour space pipeline: no tone curve, sRGB encode on output.
@@ -98,7 +111,8 @@ pub fn orbit_camera(
             // A browser wheel notch is about 100 px.
             MouseScrollUnit::Pixel => scroll.delta.y / 100.0,
         };
-        orbit.distance = (orbit.distance * (-0.1 * lines).exp()).clamp(0.01, 20.0);
+        let (closest, furthest) = (orbit.framed * ZOOM.0, orbit.framed * ZOOM.1);
+        orbit.distance = (orbit.distance * (-0.1 * lines).exp()).clamp(closest, furthest);
     }
     let rotation = Quat::from_euler(EulerRot::YXZ, orbit.yaw, orbit.pitch, 0.0);
     if !egui.wants_pointer_input() && buttons.any_pressed([MouseButton::Right, MouseButton::Middle])
@@ -112,11 +126,11 @@ pub fn orbit_camera(
         Transform::from_translation(orbit.target + offset).looking_at(orbit.target, Vec3::Y),
     );
     // Written only when it moves, so the projection isn't marked changed every frame.
-    let near = orbit.distance * NEAR_FRACTION;
+    let planes = (orbit.distance * NEAR_FRACTION, orbit.framed * FAR_FRACTION);
     if let Projection::Perspective(perspective) = projection.bypass_change_detection()
-        && perspective.near != near
+        && (perspective.near, perspective.far) != planes
     {
-        perspective.near = near;
+        (perspective.near, perspective.far) = planes;
         projection.set_changed();
     }
 }

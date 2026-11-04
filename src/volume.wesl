@@ -39,6 +39,8 @@ struct VolumeParams {
     texture_min: vec3<f32>,
     texture_max: vec3<f32>,
     grid_offset: vec3<f32>,
+    // The whole cube's size in the world, which the z scale stretches.
+    box_size: vec3<f32>,
 };
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> params: VolumeParams;
@@ -299,7 +301,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         let tail = position + f32(required_steps) * s + step_vector * (total_length - f32(required_steps + 1) * step_length - length(rand_vector)) * region_scale;
         let tail_steps = max(total_length - f32(required_steps) * step_length, 0.0) / step_length;
         let jittered = t_near + length(rand_vector);
-        return march(Ray(start, da, 1.0 / da, required_steps, tail * zs, tail_steps, jittered, step_length, direction, in.ray_origin, region_scale * zs, key_light(in.instance_index), l_min, l_max));
+        return march(display_ray(start, da, required_steps, tail * zs, tail_steps, jittered, step_length, direction, in.ray_origin, region_scale * zs, in.instance_index, l_min, l_max));
     }
     if average_mode {
         let rest = max(required_steps - 1, 0);
@@ -470,7 +472,7 @@ fn fetch(a: vec3<f32>) -> f32 {
 }
 
 // A ray's samples, z in layers: `steps` from `start`, `da` apart, then the tail, weighing `tail_steps` of a step.
-// Distances and directions are in object space.
+// Distances and directions are in display space (see display_ray).
 struct Ray {
     start: vec3<f32>,
     da: vec3<f32>,
@@ -483,13 +485,24 @@ struct Ray {
     step_length: f32,
     direction: vec3<f32>,
     origin: vec3<f32>,
-    // Texture coordinates, z in layers, per object-space unit.
+    // Texture coordinates, z in layers, per display-space unit.
     scale: vec3<f32>,
     light: vec3<f32>,
     // The selection's box, z in layers.
     selection_min: vec3<f32>,
     selection_max: vec3<f32>,
+    // The clip box.
+    clip_min: vec3<f32>,
+    clip_max: vec3<f32>,
 };
+
+// A Ray from the fragment's object-space distances and directions, converted to display space: object space scaled
+// to params.box_size, so that depth, opacity per unit length and lighting follow the z scale.
+fn display_ray(start: vec3<f32>, da: vec3<f32>, steps: i32, tail: vec3<f32>, tail_steps: f32, t0: f32, step_length: f32, direction: vec3<f32>, origin: vec3<f32>, scale: vec3<f32>, instance: u32, selection_min: vec3<f32>, selection_max: vec3<f32>) -> Ray {
+    let size = params.box_size;
+    let stretch = length(direction * size);
+    return Ray(start, da, 1.0 / da, steps, tail, tail_steps, t0 * stretch, step_length * stretch, normalize(direction * size), origin * size, scale / size, key_light(instance), selection_min, selection_max, params.slice_min * size, params.slice_max * size);
+}
 
 fn in_selection(r: Ray, a: vec3<f32>) -> bool {
     return in_box(a, r.selection_min, r.selection_max);
@@ -603,8 +616,8 @@ fn march(r: Ray) -> vec4<f32> {
     let at = select(sample_at(r, i32(best.y)), r.tail, best.y >= f32(r.steps));
     let color = shade(normalised(best.x), in_selection(r, at));
     // Darker by up to depth_cue from the box's nearest point (about) to its far side.
-    let diag = length(params.slice_max - params.slice_min);
-    let near = length(r.origin - 0.5 * (params.slice_min + params.slice_max)) - 0.5 * diag;
+    let diag = length(r.clip_max - r.clip_min);
+    let near = length(r.origin - 0.5 * (r.clip_min + r.clip_max)) - 0.5 * diag;
     let t = r.t0 + best.y * r.step_length;
     return vec4(color.rgb * (1.0 - modes.depth_cue * clamp((t - near) / diag, 0.0, 1.0)), color.a);
 }
@@ -808,16 +821,16 @@ fn march(r: Ray) -> vec4<f32> {
     return saturated(color, crosses_selection(r));
 }
 
-fn to_local(local_from_world: mat4x4<f32>, world: vec3<f32>) -> vec3<f32> {
-    return normalize((local_from_world * vec4(world, 0.0)).xyz * UNITY_FROM_LOCAL);
+fn to_display(local_from_world: mat4x4<f32>, world: vec3<f32>) -> vec3<f32> {
+    return normalize((local_from_world * vec4(world, 0.0)).xyz * UNITY_FROM_LOCAL * params.box_size);
 }
 
 // A key light about 50 degrees above left of the view, so shading shows relief and shadows fall down to the right.
 fn key_light(instance: u32) -> vec3<f32> {
     let local_from_world = get_local_from_world(instance);
-    let right = to_local(local_from_world, view.world_from_view[0].xyz);
-    let up = to_local(local_from_world, view.world_from_view[1].xyz);
-    let back = to_local(local_from_world, view.world_from_view[2].xyz);
+    let right = to_display(local_from_world, view.world_from_view[0].xyz);
+    let up = to_display(local_from_world, view.world_from_view[1].xyz);
+    let back = to_display(local_from_world, view.world_from_view[2].xyz);
     return normalize(back + up - 0.7 * right);
 }
 

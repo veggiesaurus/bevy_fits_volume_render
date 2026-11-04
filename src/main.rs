@@ -5,6 +5,7 @@ mod grips;
 mod modes;
 mod outline;
 mod selection;
+mod shape;
 mod source;
 mod ui;
 mod upload;
@@ -38,13 +39,14 @@ use camera::Orbit;
 use config::Config;
 use fits::{FileInfo, Region};
 use selection::{CropRequest, Gesture, Hover};
+use shape::BoxShape;
 use source::{DataSource, Event, Mode, Request};
 use upload::{UploadPlugin, Uploads, Upsamples};
 use view::{CubeState, Levels, VolumeTexture};
 use volume::{VolumeMaterial, VolumeParams, VolumePlugin};
 
 /// Bevy's local space is right-handed; iDaVIE's (Unity) object space mirrors z. Its own inverse, so it
-/// converts either way.
+/// converts either way. `BoxShape` adds the box's scale.
 const UNITY_FROM_LOCAL: Vec3 = Vec3::new(1.0, 1.0, -1.0);
 /// iDaVIE's VolumeDataSetRenderer.SelectionSaturateFactor.
 const SELECTION_SATURATE_FACTOR: f32 = 0.7;
@@ -117,12 +119,20 @@ struct Settings {
     params: VolumeParams,
     modes: modes::ModeSettings,
     wcs_axes: bool,
+    /// The z axis's scale relative to cubic voxels.
+    z_scale: f32,
 }
 
 impl Settings {
     /// The config's rendering defaults, scaled to the cube's range.
     fn new(data: &Dataset) -> Self {
-        let config = &data.config;
+        let (config, dims) = (&data.config, data.info.dims);
+        let asked = config.z_scale.value(dims);
+        let range = shape::z_scale_range(dims);
+        let z_scale = asked.clamp(*range.start(), *range.end());
+        if z_scale != asked {
+            warn!("z_scale {asked} is outside {range:?} for this cube, so it opens at {z_scale}");
+        }
         Self {
             params: VolumeParams {
                 scale_min: data.info.stats.min,
@@ -137,6 +147,7 @@ impl Settings {
             },
             modes: default(),
             wcs_axes: true,
+            z_scale,
         }
     }
 
@@ -200,8 +211,9 @@ fn main() {
             selection::end_gesture,
             spawn_volume.run_if(resource_exists_and_changed::<Dataset>),
             // Grips go first so grabbing one takes the click away from orbiting and shift-drag selection,
-            // and a crop retargets the orbit before the camera moves this frame.
+            // and a crop or a new z scale retargets the orbit before the camera moves this frame.
             (
+                shape::reshape.run_if(resource_exists_and_changed::<Settings>),
                 grips::drag_grips,
                 selection::select_region,
                 selection::selection_keys,
@@ -221,7 +233,10 @@ fn main() {
                 axes::update_axes,
                 // Each outline is moved before its hidden edges are worked out.
                 (
-                    outline::update_outlines.run_if(resource_exists_and_changed::<CubeState>),
+                    outline::update_outlines.run_if(
+                        resource_exists_and_changed::<CubeState>
+                            .or_eager(resource_exists_and_changed::<BoxShape>),
+                    ),
                     outline::shade_hidden_edges,
                 )
                     .chain(),
@@ -419,6 +434,7 @@ fn spawn_volume(
     );
 
     let settings = Settings::new(&data);
+    let shape = BoxShape::new(dims, settings.z_scale);
     let material = materials.add(VolumeMaterial {
         params: settings.params,
         data_cube: full.handle.clone(),
@@ -431,7 +447,7 @@ fn spawn_volume(
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
         MeshMaterial3d(material.clone()),
-        Transform::IDENTITY,
+        Transform::from_scale(shape.size()),
         // Until its texture has been filled.
         Visibility::Hidden,
         DatasetEntity,
@@ -442,13 +458,16 @@ fn spawn_volume(
     commands.insert_resource(Gesture::default());
     commands.insert_resource(Hover::default());
     commands.insert_resource(CubeState::new(material, levels, full, dims));
+    commands.insert_resource(shape);
     **orbit = Orbit::default();
+    orbit.frame(shape, Region::whole(dims), dims);
 }
 
 fn update_material(
     settings: Res<Settings>,
     state: Res<CubeState>,
     data: Res<Dataset>,
+    shape: Res<BoxShape>,
     mut materials: ResMut<Assets<VolumeMaterial>>,
 ) {
     let Some(mut material) = materials.get_mut(&state.material) else {
@@ -456,6 +475,7 @@ fn update_material(
     };
     let dims = data.info.dims;
     let mut params = settings.params;
+    params.box_size = shape.size();
     (params.slice_min, params.slice_max) = region_bounds(state.visible, dims);
     if let Some(selection) = state.selection {
         (params.highlight_min, params.highlight_max) = region_bounds(selection, dims);

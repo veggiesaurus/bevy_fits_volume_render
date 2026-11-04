@@ -4,8 +4,8 @@ use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 
 use crate::{
-    CubeState, Dataset, Settings, UNITY_FROM_LOCAL, camera::Orbit, fits::Region,
-    outline::edge_ends, region_bounds, wcs,
+    CubeState, Dataset, Settings, camera::Orbit, fits::Region, outline::edge_ends, region_bounds,
+    shape::BoxShape, wcs,
 };
 
 /// WCS ticks for the 12 edges of the visible box (see `edge_ends`), recomputed when it changes.
@@ -55,6 +55,7 @@ pub fn draw_axes(
     mut gizmos: Gizmos,
     data: Res<Dataset>,
     settings: Res<Settings>,
+    shape: Res<BoxShape>,
     axes: Res<AxisAnnotation>,
     camera: Single<(&Camera, &Transform), With<Orbit>>,
 ) -> Result {
@@ -65,13 +66,13 @@ pub fn draw_axes(
     // The local transform is already this frame's orbit; GlobalTransform may not be propagated yet.
     let view = GlobalTransform::from(*transform);
     let (lo, hi) = region_bounds(axes.visible, data.info.dims);
-    let local = |u: [f32; 3]| (lo + (hi - lo) * Vec3::from_array(u)) * UNITY_FROM_LOCAL;
+    let world = |u: [f32; 3]| shape.to_world(lo + (hi - lo) * Vec3::from_array(u));
     let screen = |p: Vec3| camera.world_to_viewport(&view, p).ok();
-    let centre = local([0.5; 3]);
+    let centre = world([0.5; 3]);
     let Some(centre_on_screen) = screen(centre) else {
         return Ok(());
     };
-    let tick_length = 0.03 * (hi - lo).max_element();
+    let tick_length = 0.03 * ((hi - lo) * shape.size()).max_element();
     let painter = contexts
         .ctx_mut()?
         .layer_painter(egui::LayerId::background());
@@ -104,13 +105,13 @@ pub fn draw_axes(
         let edge_on_screen = |e: usize| {
             let (start, end) = edge_ends(e);
             let mid = std::array::from_fn(|i| (start[i] + end[i]) / 2.0);
-            screen(local(mid)).map_or(f32::MIN, |p| p.distance(centre_on_screen) + 0.001 * p.y)
+            screen(world(mid)).map_or(f32::MIN, |p| p.distance(centre_on_screen) + 0.001 * p.y)
         };
         let e = (axis * 4..axis * 4 + 4)
             .max_by(|a, b| edge_on_screen(*a).total_cmp(&edge_on_screen(*b)))
             .unwrap();
         let (start, end) = edge_ends(e);
-        let (start, end) = (local(start), local(end));
+        let (start, end) = (world(start), world(end));
         let mid = (start + end) / 2.0;
         let along = (end - start).normalize();
         let outward = {

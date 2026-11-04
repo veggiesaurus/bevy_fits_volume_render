@@ -354,7 +354,7 @@ pub struct ModeSettings {
     /// The level, in σ above the noise median, for the modes that use one.
     pub sigmas: f32,
     pub depth_cue: f32,
-    /// The optical depth of a cube's width at threshold Max.
+    /// The optical depth of the box's wider side at threshold Max.
     pub attenuation: f32,
     pub opacity: f32,
     /// -1 emission-absorption, 0 MIDA, 1 the maximum.

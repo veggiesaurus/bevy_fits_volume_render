@@ -16,7 +16,7 @@ cargo run --release -- --help
 
 `--config PATH` picks a config file, `--hdu N` picks an HDU (0 is the primary; by default it takes the first image with two or more axes) and any config key can be overridden as `--key value`, e.g. `--gpu-memory-limit-mb 128 --default-color-map Viridis`.
 
-The config lives at `$XDG_CONFIG_HOME/idavie-bevy/config.toml` (`~/.config/idavie-bevy/config.toml` when that's unset) and is written with the defaults on first run. The keys are the rendering subset of iDaVIE's `config.json`, with the same defaults, plus `jitter`, which iDaVIE sets on the material, and the starting thresholds, which iDaVIE always starts at 0 and 1:
+The config lives at `$XDG_CONFIG_HOME/idavie-bevy/config.toml` (`~/.config/idavie-bevy/config.toml` when that's unset) and is written with the defaults on first run. The keys are the rendering subset of iDaVIE's `config.json`, with the same defaults, plus `jitter`, which iDaVIE sets on the material, the starting thresholds, which iDaVIE always starts at 0 and 1, and the z scale a cube opens at:
 
 ```toml
 gpu_memory_limit_mb = 384       # texture budget; the cube is downsampled to fit, as in iDaVIE
@@ -26,6 +26,7 @@ default_scaling_type = "Linear" # Linear, Log, Sqrt, Square, Power, Gamma or Asi
 jitter = 1.0
 threshold_min = 0.0             # where the colour map starts and ends, as fractions of the data range
 threshold_max = 1.0
+z_scale = "cube"                # "cube" (as deep as it's wide), "voxels" (cubic voxels) or a number relative to cubic voxels
 ```
 
 The view only redraws on input (and while data is still arriving), so an idle window leaves the GPU alone. Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping keeps the selection, the same as iDaVIE. A crop the texture on screen already holds finely enough is immediate; otherwise it starts from the current view and sharpens as the finer data arrives, and the panel shows the downsampling factors before and after. Every cube comes up the same way, coarse first.
@@ -56,7 +57,7 @@ The shader takes the same samples as iDaVIE's, apart from the step changes below
 - after a crop the outline shrinks to the crop and the camera re-frames it, and again on reset. iDaVIE keeps the full cube's outline with the crop inside it and leaves the camera where it is
 - no foveated rendering for now, so every pixel gets the full step count, as in iDaVIE with `foveatedRendering` off. iDaVIE's default config turns it on, so turn it off in its `config.json` for side by side comparisons
 - only point filtering (iDaVIE's `bilinearFiltering` is off by default)
-- uncompressed FITS only (funpack a tile-compressed `.fits.fz` first), showing the first three axes longer than 1 (a 2D image is one plane) and the first plane of any others (Stokes I of an IQU cube), and the cube is always shown with X=Y=Z proportions
+- uncompressed FITS only (funpack a tile-compressed `.fits.fz` first), showing the first three axes longer than 1 (a 2D image is one plane) and the first plane of any others (Stokes I of an IQU cube)
 - integer BLANK values become NaN; iDaVIE turns off cfitsio's null check and shows them as `BZERO + BSCALE * BLANK`
 - the cube is downsampled to a fixed set of power-of-two levels, plus iDaVIE's factors for the whole cube when they aren't one of them, with blocks aligned to the whole cube. So a crop can get up to 2.6x fewer texels than in iDaVIE, whose factors step through 1, 2, 3, 4, 5
 - Maximum reads a max-downsampled copy and Average a mean-downsampled one, where iDaVIE's config picks one for both
@@ -67,9 +68,10 @@ The shader takes the same samples as iDaVIE's, apart from the step changes below
 - the selection outline is only white if cropping to it would actually load at full resolution, so the 2048 texel limit counts as well as the memory budget. It stays white or yellow after the drag, where iDaVIE swaps it for a pulsing white box
 - everything outside the selection stays desaturated for as long as there is one, including after a crop or reset. iDaVIE only desaturates while the selection is being drawn
 - a selection is clamped to the visible crop, so cropping can only narrow the view. In iDaVIE a selection can reach outside the crop, and cropping to it widens the view without a reset
+- x and y keep the voxels' proportions, where iDaVIE always draws them the same length. So the z scale's Cube preset is iDaVIE's X=Y=Z and Cubic voxels its X=Y only for a square cube, and any other scale can be typed in
 - WCS ticks are drawn on the box by default (the WCS axes checkbox turns them off); iDaVIE has none
 - percentile buttons (90 to 100%) set the thresholds to keep the middle share of the voxels, from an exact histogram built while the cube loads (about 20 ms per GB natively, 0.2 s per GB in the browser); iDaVIE has none
-- the near plane follows the camera in, so a small crop doesn't end up behind it
+- the near plane follows the camera in, so a small crop doesn't end up behind it, and the far plane and zoom limits follow the region shown, so a deep box isn't cut off
 - the step count is capped at two per texel along the texture's diagonal, so a small crop or a heavily downsampled cube takes fewer steps than in iDaVIE. Voxel edges can shift by a fraction of a voxel compared with iDaVIE
 - the view only redraws on input, so the jitter noise holds still while nothing changes; iDaVIE renders every frame
 - rendering modes past Maximum and Average: depth cued and attenuated maximum, peak and mean channel colours, emission-absorption with MIDA, S/N opacity and lighting, an isosurface, translucent shells and a clipped moment 0. Asinh scaling starts from the noise, and the noise can be normalised, the cube smoothed and a SoFiA-style smooth-and-clip mask made, all by the data source (the worker, in the browser). The noise and the mask come from the shown texture's level, so from a downsampled cube when that's what's shown

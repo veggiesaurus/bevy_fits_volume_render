@@ -17,6 +17,7 @@ use crate::{
         FileInfo,
         wire::{self, Wire},
     },
+    shape::BoxShape,
     source::{Event, Request},
     upload::Upsamples,
     view::CubeState,
@@ -145,6 +146,7 @@ pub fn poll(
             commands.remove_resource::<Dataset>();
             commands.remove_resource::<CubeState>();
             commands.remove_resource::<AxisAnnotation>();
+            commands.remove_resource::<BoxShape>();
         }
         None => {}
     }

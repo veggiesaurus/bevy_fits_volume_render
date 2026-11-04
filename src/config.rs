@@ -16,6 +16,7 @@ pub struct Config {
     pub jitter: f32,
     pub threshold_min: f32,
     pub threshold_max: f32,
+    pub z_scale: ZScale,
     /// Gone, now that each projection mode reads its own pyramid, but still read so that older files parse.
     #[serde(skip_serializing)]
     max_mode_downsampling: serde::de::IgnoredAny,
@@ -31,7 +32,48 @@ impl Default for Config {
             jitter: 1.0,
             threshold_min: 0.0,
             threshold_max: 1.0,
+            z_scale: ZScale::Cube,
             max_mode_downsampling: serde::de::IgnoredAny,
+        }
+    }
+}
+
+/// The z scale a cube opens at: "cube" for as deep as it's wide, "voxels" for cubic voxels, or a number relative to
+/// cubic voxels.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(try_from = "toml::Value", into = "toml::Value")]
+pub enum ZScale {
+    Cube,
+    Voxels,
+    Factor(f32),
+}
+
+impl TryFrom<toml::Value> for ZScale {
+    type Error = String;
+    fn try_from(value: toml::Value) -> Result<Self, String> {
+        let factor = match &value {
+            toml::Value::String(s) if s.eq_ignore_ascii_case("cube") => return Ok(Self::Cube),
+            toml::Value::String(s) if s.eq_ignore_ascii_case("voxels") => return Ok(Self::Voxels),
+            toml::Value::Float(f) => *f as f32,
+            toml::Value::Integer(i) => *i as f32,
+            _ => f32::NAN,
+        };
+        if factor > 0.0 && factor.is_finite() {
+            Ok(Self::Factor(factor))
+        } else {
+            Err(format!(
+                "z_scale must be \"cube\", \"voxels\" or a number above 0, got {value}"
+            ))
+        }
+    }
+}
+
+impl From<ZScale> for toml::Value {
+    fn from(scale: ZScale) -> Self {
+        match scale {
+            ZScale::Cube => "cube".into(),
+            ZScale::Voxels => "voxels".into(),
+            ZScale::Factor(f) => f64::from(f).into(),
         }
     }
 }
@@ -269,5 +311,18 @@ mod tests {
         // A key that's gone, which the default file used to have.
         let config = from_toml(Some("max_mode_downsampling = true"), &[]).unwrap();
         assert!(!toml::to_string(&config).unwrap().contains("max_mode"));
+
+        // A preset by name, or a number, which an override of "2" makes an integer.
+        let written = toml::to_string(&Config::default()).unwrap();
+        assert_eq!(
+            from_toml(Some(&written), &[]).unwrap().z_scale,
+            ZScale::Cube
+        );
+        let z_scale =
+            |value: &str| from_toml(None, &[("z-scale".into(), value.into())]).map(|c| c.z_scale);
+        assert_eq!(z_scale("Voxels"), Ok(ZScale::Voxels));
+        assert_eq!(z_scale("2"), Ok(ZScale::Factor(2.0)));
+        assert_eq!(z_scale("0.25"), Ok(ZScale::Factor(0.25)));
+        assert!(z_scale("0").is_err() && z_scale("flat").is_err());
     }
 }

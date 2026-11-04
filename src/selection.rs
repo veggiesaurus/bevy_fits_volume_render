@@ -4,12 +4,12 @@ use bevy::prelude::*;
 use bevy_egui::input::EguiWantsInput;
 
 use crate::{
-    CubeState, Dataset, UNITY_FROM_LOCAL,
-    camera::{DEFAULT_DISTANCE, Orbit, pointer},
+    CubeState, Dataset,
+    camera::{Orbit, pointer},
     fits::Region,
     grips::GripDrag,
-    outline::box_transform,
     region_bounds,
+    shape::BoxShape,
     source::{DataSource, Request},
 };
 
@@ -90,6 +90,7 @@ pub fn select_region(
     window: Single<&Window>,
     camera: Single<(&Camera, &GlobalTransform), With<Orbit>>,
     data: Res<Dataset>,
+    shape: Res<BoxShape>,
     mut state: ResMut<CubeState>,
     mut hover: ResMut<Hover>,
     mut gesture: ResMut<Gesture>,
@@ -99,7 +100,9 @@ pub fn select_region(
     let visible = state.visible;
     let axis = match *gesture {
         Gesture::Select(drag) => drag.axis,
-        _ => (camera_transform.forward().as_vec3() * UNITY_FROM_LOCAL)
+        // The face that covers the most of the screen.
+        _ => shape
+            .to_object(camera_transform.forward().as_vec3())
             .abs()
             .max_position(),
     };
@@ -108,10 +111,8 @@ pub fn select_region(
     let middle = normal * ((lo[axis] + hi[axis]) / 2.0);
 
     let voxel = pointer(&window, camera, camera_transform)
-        .and_then(|p| {
-            p.ray
-                .plane_intersection_point(middle, InfinitePlane3d::new(normal))
-        })
+        .and_then(|p| shape.ray_to_object(p.ray))
+        .and_then(|ray| ray.plane_intersection_point(middle, InfinitePlane3d::new(normal)))
         .map(|p| {
             std::array::from_fn::<i64, 3, _>(|i| ((p[i] + 0.5) * dims[i] as f32).floor() as i64)
         });
@@ -184,6 +185,7 @@ pub fn selection_keys(
 pub fn apply_crop(
     mut requests: MessageReader<CropRequest>,
     data: Res<Dataset>,
+    shape: Res<BoxShape>,
     mut state: ResMut<CubeState>,
     mut orbit: Single<&mut Orbit>,
 ) {
@@ -196,8 +198,6 @@ pub fn apply_crop(
     }
     if visible != state.visible {
         state.visible = visible;
-        let framed = box_transform(visible, data.info.dims);
-        orbit.target = framed.translation;
-        orbit.distance = DEFAULT_DISTANCE * framed.scale.max_element();
+        orbit.frame(*shape, visible, data.info.dims);
     }
 }
