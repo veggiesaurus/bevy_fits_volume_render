@@ -137,12 +137,6 @@ pub fn from_toml(text: Option<&str>, overrides: &[(String, String)]) -> Result<C
     Ok(config)
 }
 
-pub fn parse_hdu(value: &str) -> Result<usize, String> {
-    value
-        .parse()
-        .map_err(|_| format!("hdu needs a number, got '{value}'"))
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 pub fn default_path() -> Option<PathBuf> {
     let var = |name| {
@@ -217,7 +211,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>
             .ok_or_else(|| format!("--{key} needs a value\n{USAGE}"))?;
         match key {
             "config" => config = Some(PathBuf::from(value)),
-            "hdu" => hdu = Some(parse_hdu(&value)?),
+            "hdu" => hdu = Some(crate::fits::parse_hdu(&value)?),
             _ => overrides.push((key.to_string(), value)),
         }
     }

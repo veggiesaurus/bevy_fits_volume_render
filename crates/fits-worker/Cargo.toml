@@ -1,0 +1,13 @@
+[package]
+name = "fits-worker"
+version = "0.1.0"
+edition = "2024"
+
+# The browser's Web Worker, loaded by web/worker.js. Natively there's nothing in it: the viewer runs the engine itself.
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+fits-core = { path = "../fits-core" }
+js-sys = "0.3"
+wasm-bindgen = "0.2"

@@ -35,9 +35,9 @@ use fits_core as fits;
 use axes::AxisAnnotation;
 use camera::Orbit;
 use config::Config;
-use fits::{Cube, FileInfo, Region};
+use fits::{FileInfo, Region};
 use selection::{CropRequest, Gesture, Hover};
-use source::{DataSource, Event, Mode};
+use source::{DataSource, Event, Mode, Request};
 use upload::{UploadPlugin, Uploads, Upsamples};
 use view::{CubeState, Levels, VolumeTexture};
 use volume::{VolumeMaterial, VolumeParams, VolumePlugin};
@@ -72,14 +72,20 @@ struct Dataset {
 }
 
 impl Dataset {
-    fn new(name: String, cube: Cube, config: Config, start: Instant) -> Self {
+    fn new(
+        name: String,
+        info: FileInfo,
+        source: DataSource,
+        config: Config,
+        load_seconds: f32,
+    ) -> Self {
         Self {
             name,
-            wcs: wcs::Wcs::from_cards(&cube.info.cards, cube.info.axes),
-            info: cube.info.clone(),
-            source: DataSource::local(cube),
+            wcs: wcs::Wcs::from_cards(&info.cards, info.axes),
+            info,
+            source,
             config,
-            load_seconds: start.elapsed().as_secs_f32(),
+            load_seconds,
         }
     }
 
@@ -351,7 +357,9 @@ fn load_native() -> Dataset {
         || args.file.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
-    let dataset = Dataset::new(name, cube, config, start);
+    let info = cube.info.clone();
+    let seconds = start.elapsed().as_secs_f32();
+    let dataset = Dataset::new(name, info, DataSource::local(cube), config, seconds);
     // Printed, since logging only starts with the app.
     println!("Config: {}", config_path.display());
     println!("{}", dataset.summary());
@@ -390,7 +398,10 @@ fn spawn_volume(
     // iDaVIE's 2048 layers at most.
     let layers = device.limits().max_texture_array_layers.min(2048) as usize;
     let levels = Levels::new(dims, data.config.gpu_memory_limit_mb, layers);
-    data.source.open(levels.factors.clone(), levels.chain);
+    data.source.send(Request::Levels {
+        factors: levels.factors.clone(),
+        chain: levels.chain,
+    });
     let full = VolumeTexture::new(
         &levels,
         Region::whole(dims),

@@ -119,6 +119,9 @@ fn cube_section(
             "Mean, std",
             format!("{:.4e}, {:.4e}", stats.mean, stats.std),
         );
+        if let Some(sigma) = info.sigma {
+            row("Noise σ", format!("{sigma:.4e}{unit}"));
+        }
         row("Non-finite voxels", stats.non_finite.to_string());
         row("Load time", format!("{:.2} s", data.load_seconds));
         let texture = state.shown();

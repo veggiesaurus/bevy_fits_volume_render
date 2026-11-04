@@ -2711,6 +2711,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fits-worker"
+version = "0.1.0"
+dependencies = [
+ "fits-core",
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

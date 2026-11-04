@@ -6,6 +6,8 @@ use bevy_tasks::{ComputeTaskPool, TaskPool};
 use bevy_tasks::{ParallelSlice, ParallelSliceMut};
 
 mod cubelet;
+pub mod engine;
+pub mod wire;
 pub use cubelet::{
     CUBELET, Cell, Cubelet, Level, Levels, Voxels, cubelet, cubelet_region, grow, levels,
 };
@@ -146,6 +148,8 @@ pub struct FileInfo {
     pub hdu: usize,
     pub stats: Stats,
     pub histogram: Histogram,
+    /// `Cube::sigma`, taken at open.
+    pub sigma: Option<f64>,
 }
 
 impl FileInfo {
@@ -182,6 +186,13 @@ pub struct Stats {
     pub std: f64,
     /// NaN and infinite voxels, which the other statistics leave out.
     pub non_finite: usize,
+}
+
+/// An HDU number as given on the command line or in the page's URL.
+pub fn parse_hdu(value: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| format!("hdu needs a number, got '{value}'"))
 }
 
 pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Cube, String> {
@@ -254,7 +265,7 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
             }
             let (data, stats, histogram) =
                 read_data(source, offset, &cards, bitpix, width as usize, len)?;
-            return Ok(Cube {
+            let mut cube = Cube {
                 info: FileInfo {
                     dims,
                     axes: picked,
@@ -262,9 +273,12 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
                     hdu: index,
                     stats,
                     histogram,
+                    sigma: None,
                 },
                 data,
-            });
+            };
+            cube.info.sigma = cube.sigma();
+            return Ok(cube);
         }
 
         let pcount: u64 = num(&cards, "PCOUNT")?.unwrap_or(0);
@@ -806,6 +820,7 @@ mod tests {
                 hdu: 0,
                 stats: Moments::EMPTY.stats(0),
                 histogram: Histogram(vec![0]),
+                sigma: None,
             },
             data,
         }

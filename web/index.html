@@ -36,7 +36,7 @@
   <div id="status" role="status">Starting</div>
 </div>
 <script type="module">
-import init, { load_fits } from "./pkg/bevy_fits_volume_render.js";
+import init, { clear, connect, opened, receive } from "./pkg/bevy_fits_volume_render.js";
 
 const status = document.getElementById("status");
 const picker = document.getElementById("picker");
@@ -45,116 +45,69 @@ const params = new URLSearchParams(location.search);
 // "host.example/path/cube.fits" with no scheme means https; anything else is relative to the page.
 const file = params.get("file")?.replace(/^(?![a-z][a-z0-9+.-]*:|\/)([^/]+\.[^/]+\/)/i, "https://$1");
 params.delete("file");
+const hdu = params.get("hdu");
+params.delete("hdu");
 const overrides = [...params].map(([k, v]) => `${k}=${v}`).join("\n");
 const mb = n => `${(n / 1e6).toFixed(1)} MB`;
 
+// The file goes to a Web Worker, which reads it and serves the viewer's requests off this thread. After a failure
+// its state can't be trusted, so the next load starts another.
+let worker = startWorker();
+function startWorker() {
+  const w = new Worker("worker.js", { type: "module" });
+  w.onmessage = ({ data }) => w === worker && fromWorker(data);
+  // A module worker that doesn't load gets a plain Event, with no message.
+  w.onerror = (e) => w === worker && failed(e.message || "worker.js did not load");
+  return w;
+}
+function failed(message) {
+  worker.terminate();
+  worker = null;
+  workerHolds(undefined);
+  status.textContent = `The data worker failed: ${message}`;
+}
+
+// The load whose file is on screen. Once the worker no longer holds it nothing would answer the view, so it goes.
+let shown;
+function workerHolds(load) {
+  if (shown !== undefined && load !== shown) {
+    clear();
+    shown = undefined;
+  }
+}
+
 // Only the latest load may touch the status or the viewer, so a slow download can't replace a file picked
 // after it started.
-let latest;
+let latest = { id: 0 };
 
-const progress = (got, total) => (status.textContent = `Downloading ${mb(got)}${total ? ` of ${mb(total)}` : ""}`);
-
-// A big file comes down as four ranges at once: in Chrome one stream only reached about half the line speed.
-const PARTS = 4;
-async function download(url, signal) {
-  const head = await fetch(url, { method: "HEAD", signal }).catch(() => null);
-  const total = head?.ok && !head.headers.get("Content-Encoding") ? Number(head.headers.get("Content-Length")) : 0;
-  if (total >= PARTS << 23) {
-    try {
-      return await downloadRanges(url, total, signal);
-    } catch (e) {
-      if (signal.aborted) throw e;
-    }
-  }
-  return downloadStream(url, signal);
+function load(name, source) {
+  latest = { id: latest.id + 1, name };
+  worker ??= startWorker();
+  status.textContent = `Loading ${name}`;
+  worker.postMessage({ load: latest.id, source, hdu });
 }
 
-// A BYOB read transfers the buffer it fills, so the ranges can't share one: each reads into its own scratch
-// buffer and copies from it into the result.
-async function downloadRanges(url, total, signal) {
-  const abort = new AbortController();
-  signal.addEventListener("abort", () => abort.abort(), { once: true });
-  const bytes = new Uint8Array(total);
-  const size = Math.ceil(total / PARTS);
-  let got = 0;
-  try {
-    await Promise.all(Array.from({ length: PARTS }, async (_, i) => {
-      const start = i * size, end = Math.min(total, start + size);
-      const res = await fetch(url, { headers: { Range: `bytes=${start}-${end - 1}` }, signal: abort.signal });
-      if (res.status !== 206) throw new Error(`no range support (${res.status})`);
-      const reader = res.body.getReader({ mode: "byob" });
-      let scratch = new ArrayBuffer(1 << 20);
-      for (let at = start; at < end; ) {
-        const { done, value } = await reader.read(new Uint8Array(scratch));
-        if (done || at + value.length > end) throw new Error("range doesn't match its request");
-        bytes.set(value, at);
-        at += value.length;
-        got += value.length;
-        scratch = value.buffer;
-        progress(got, total);
-      }
-    }));
-  } catch (e) {
-    abort.abort();
-    throw e;
-  }
-  return bytes;
-}
-
-// Reads into one buffer sized from Content-Length, so the file is held once rather than as chunks plus a copy.
-async function downloadStream(url, signal) {
-  const res = await fetch(url, { signal });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  // With a Content-Encoding it's the compressed size, so the buffer grows instead.
-  const total = res.headers.get("Content-Encoding") ? 0 : Number(res.headers.get("Content-Length"));
-  let got = 0;
-  // A BYOB reader fills the buffer in place, where the default reader hands back a new array per chunk that
-  // piles up as garbage until the load is over.
-  let byob = null;
-  try {
-    if (total) byob = res.body.getReader({ mode: "byob" });
-  } catch {}
-  if (byob) {
-    let buffer = new ArrayBuffer(total);
-    while (got < total) {
-      const { done, value } = await byob.read(new Uint8Array(buffer, got));
-      if (done) break;
-      // Each read transfers the buffer, so carry on with the one it hands back.
-      buffer = value.buffer;
-      got += value.length;
-      progress(got, total);
-    }
-    return new Uint8Array(buffer, 0, got);
-  }
-  const reader = res.body.getReader();
-  let bytes = new Uint8Array(total || 1 << 20);
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (got + value.length > bytes.length) {
-      const grown = new Uint8Array(Math.max(2 * bytes.length, got + value.length));
-      grown.set(bytes.subarray(0, got));
-      bytes = grown;
-    }
-    bytes.set(value, got);
-    got += value.length;
-    progress(got, total);
-  }
-  return bytes.subarray(0, got);
-}
-
-async function load(name, getBytes) {
-  latest?.abort();
-  const current = (latest = new AbortController());
-  try {
-    const bytes = await getBytes(current.signal);
-    if (current.signal.aborted) return;
+function fromWorker(data) {
+  if (data instanceof ArrayBuffer) return receive(data);
+  if (data.failed) return failed(data.failed);
+  if (data.load !== latest.id) return;
+  const { name } = latest;
+  if (data.got !== undefined) {
+    status.textContent = `Downloading ${mb(data.got)}${data.total ? ` of ${mb(data.total)}` : ""}`;
+  } else if (data.reading) {
     status.textContent = `Loading ${name}`;
-    load_fits(name, bytes, config, overrides);
-    canvas.focus();
-    status.textContent = name;
-  } catch (e) {
-    if (!current.signal.aborted) status.textContent = `Could not load ${name}: ${e.message ?? e}`;
+  } else {
+    try {
+      if (data.error) throw new Error(data.error);
+      opened(data.load, name, data.info, data.seconds, config, overrides);
+      shown = data.load;
+      canvas.focus();
+      status.textContent = name;
+    } catch (e) {
+      // The worker may have dropped the file shown to read this one, or one that came between.
+      workerHolds(data.error ? data.held : data.load);
+      status.textContent = `Could not load ${name}: ${e.message ?? e}`;
+    }
   }
 }
 
@@ -181,13 +134,16 @@ try {
     throw e;
   }
 }
+// Without a worker this throws, which the viewer logs.
+connect(message => worker.postMessage(message, [message]));
 
-status.textContent = "Open a FITS file";
+// Unless the worker failed while this started.
+if (worker) status.textContent = "Open a FITS file";
 picker.disabled = false;
 // winit doesn't take focus on a drag, and keys (shift-drag, C, R, Esc) only reach the focused canvas.
 canvas.addEventListener("pointerdown", () => canvas.focus());
-picker.addEventListener("change", () => picker.files[0] && load(picker.files[0].name, () => picker.files[0].bytes()));
-if (file) load(fileName(file), signal => download(file, signal));
+picker.addEventListener("change", () => picker.files[0] && load(picker.files[0].name, picker.files[0]));
+if (file) load(fileName(file), new URL(file, location.href).href);
 </script>
 </body>
 </html>

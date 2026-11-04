@@ -17,10 +17,13 @@ export CFLAGS_wasm32_unknown_unknown="-isystem $musl/arch/emscripten -isystem $m
 
 # simd128 lets LLVM vectorise the FITS decoding and statistics; every WebGPU browser supports it.
 export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=+simd128"
-# Not the thin LTO dist profile, which made the wasm 18% larger, no faster and slow to relink.
-cargo build --release --target wasm32-unknown-unknown
-wasm-bindgen --target web --no-typescript --remove-name-section --out-dir web/pkg \
-  target/wasm32-unknown-unknown/release/bevy_fits_volume_render.wasm
-if command -v wasm-opt >/dev/null; then
-  wasm-opt -O1 web/pkg/bevy_fits_volume_render_bg.wasm -o web/pkg/bevy_fits_volume_render_bg.wasm
-fi
+# Not the thin LTO dist profile, which made the wasm 18% larger, no faster and slow to relink. The viewer, and the
+# Web Worker that holds the file.
+cargo build --release --target wasm32-unknown-unknown -p bevy_fits_volume_render -p fits-worker
+for name in bevy_fits_volume_render fits_worker; do
+  wasm-bindgen --target web --no-typescript --remove-name-section --out-dir web/pkg \
+    "target/wasm32-unknown-unknown/release/$name.wasm"
+  if command -v wasm-opt >/dev/null; then
+    wasm-opt -O1 "web/pkg/${name}_bg.wasm" -o "web/pkg/${name}_bg.wasm"
+  fi
+done

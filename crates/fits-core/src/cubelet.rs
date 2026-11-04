@@ -1,7 +1,5 @@
 //! Cubes travel as cubelets of up to CUBELET³ voxels, cut from a fixed list of levels per file.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crate::{Cube, Region, downsample, downsampled_dims, find_downsample_factors};
 
 pub const CUBELET: usize = 64;
@@ -161,8 +159,9 @@ pub struct Level {
     pub dims: [usize; 3],
     pub data: Vec<f32>,
     pub max_mode: bool,
-    /// For a mean, the finite level 0 voxels behind each voxel, which keep the means of coarser levels exact.
-    counts: Vec<u32>,
+    /// For a mean, the finite level 0 voxels behind each voxel, which keep the means of coarser levels exact. Only
+    /// needed until the next level is built.
+    pub(crate) counts: Vec<u32>,
 }
 
 impl Level {
@@ -208,36 +207,6 @@ impl Level {
             max_mode,
             counts,
         }
-    }
-
-    /// The levels at `factors`, finest first, the first built from the cube and each of the rest from the one before,
-    /// or None once `cancel` is set, which is checked between levels. A mean's counts go once the next level is built
-    /// from them.
-    pub fn pyramid(
-        cube: &Cube,
-        factors: &[[usize; 3]],
-        max_mode: bool,
-        cancel: &AtomicBool,
-    ) -> Option<Vec<Self>> {
-        let mut levels: Vec<Self> = Vec::with_capacity(factors.len());
-        for &f in factors {
-            if cancel.load(Ordering::Relaxed) {
-                return None;
-            }
-            let level = match levels.last_mut() {
-                None => Self::new(cube, f, max_mode),
-                Some(finer) => {
-                    let level = finer.chain(f);
-                    finer.counts = Vec::new();
-                    level
-                }
-            };
-            levels.push(level);
-        }
-        if let Some(last) = levels.last_mut() {
-            last.counts = Vec::new();
-        }
-        Some(levels)
     }
 
     /// The cubelet at `at` in this level's grid, or None when `at` is outside it.
