@@ -3,7 +3,7 @@
 //! that the receiver can copy those straight into a vector of their own.
 
 use crate::{
-    Cell, Cubelet, FileInfo, Histogram, Stats, Voxels,
+    Cell, Cubelet, FileInfo, Histogram, Noise, Processing, Region, Smoothing, Stats, Voxels,
     engine::{CubeletId, Event, Mode, Request},
 };
 
@@ -156,15 +156,78 @@ impl<T: Wire> Wire for Option<T> {
 
 impl Wire for String {
     fn write(&self, w: &mut Writer) {
-        (self.len() as u32).write(w);
-        w.bytes(self.as_bytes());
+        write_bytes(self.as_bytes(), w);
     }
 
     fn read(r: &mut Reader) -> Option<Self> {
-        let len = u32::read(r)? as usize;
-        let bytes = r.header.get(..len)?;
-        r.header = &r.header[len..];
-        String::from_utf8(bytes.to_vec()).ok()
+        String::from_utf8(read_bytes(r)?).ok()
+    }
+}
+
+/// Raw bytes after their length, rather than a byte at a time as a `Vec<u8>`.
+fn write_bytes(bytes: &[u8], w: &mut Writer) {
+    (bytes.len() as u32).write(w);
+    w.bytes(bytes);
+}
+
+fn read_bytes(r: &mut Reader) -> Option<Vec<u8>> {
+    let len = u32::read(r)? as usize;
+    let bytes = r.header.get(..len)?;
+    r.header = &r.header[len..];
+    Some(bytes.to_vec())
+}
+
+impl Wire for Region {
+    fn write(&self, w: &mut Writer) {
+        self.min.write(w);
+        self.max.write(w);
+    }
+
+    fn read(r: &mut Reader) -> Option<Self> {
+        Some(Self {
+            min: Wire::read(r)?,
+            max: Wire::read(r)?,
+        })
+    }
+}
+
+impl Wire for Noise {
+    fn write(&self, w: &mut Writer) {
+        self.median.write(w);
+        self.sigma.write(w);
+    }
+
+    fn read(r: &mut Reader) -> Option<Self> {
+        Some(Self {
+            median: Wire::read(r)?,
+            sigma: Wire::read(r)?,
+        })
+    }
+}
+
+/// Normalise in the lowest bit, the smoothing in the two above it.
+impl Wire for Processing {
+    fn write(&self, w: &mut Writer) {
+        let smoothing = match self.smoothing {
+            Smoothing::Off => 0,
+            Smoothing::Spectral => 1,
+            Smoothing::Spatial => 2,
+        };
+        (u8::from(self.normalise) | smoothing << 1).write(w);
+    }
+
+    fn read(r: &mut Reader) -> Option<Self> {
+        let bits = u8::read(r)?;
+        let smoothing = match bits >> 1 {
+            0 => Smoothing::Off,
+            1 => Smoothing::Spectral,
+            2 => Smoothing::Spatial,
+            _ => return None,
+        };
+        Some(Self {
+            normalise: bits & 1 != 0,
+            smoothing,
+        })
     }
 }
 
@@ -201,14 +264,17 @@ impl Wire for Mode {
 impl Wire for CubeletId {
     fn write(&self, w: &mut Writer) {
         self.mode.write(w);
+        self.processing.write(w);
         self.level.write(w);
         [self.x, self.y, self.z].write(w);
     }
 
     fn read(r: &mut Reader) -> Option<Self> {
-        let (mode, level, [x, y, z]) = (Mode::read(r)?, u8::read(r)?, <[u16; 3]>::read(r)?);
+        let (mode, processing) = (Mode::read(r)?, Processing::read(r)?);
+        let (level, [x, y, z]) = (u8::read(r)?, <[u16; 3]>::read(r)?);
         Some(Self {
             mode,
+            processing,
             level,
             x,
             y,
@@ -238,6 +304,36 @@ impl Wire for Request {
                 id.write(w);
                 voxel.write(w);
             }
+            Request::Measure {
+                id,
+                mode,
+                processing,
+                level,
+                texels,
+            } => {
+                4u8.write(w);
+                id.write(w);
+                mode.write(w);
+                processing.write(w);
+                level.write(w);
+                texels.write(w);
+            }
+            Request::Mask {
+                id,
+                mode,
+                processing,
+                level,
+                texels,
+                threshold,
+            } => {
+                5u8.write(w);
+                id.write(w);
+                mode.write(w);
+                processing.write(w);
+                level.write(w);
+                texels.write(w);
+                threshold.write(w);
+            }
         }
     }
 
@@ -256,6 +352,21 @@ impl Wire for Request {
             3 => Request::PixelValue {
                 id: Wire::read(r)?,
                 voxel: Wire::read(r)?,
+            },
+            4 => Request::Measure {
+                id: Wire::read(r)?,
+                mode: Wire::read(r)?,
+                processing: Wire::read(r)?,
+                level: Wire::read(r)?,
+                texels: Wire::read(r)?,
+            },
+            5 => Request::Mask {
+                id: Wire::read(r)?,
+                mode: Wire::read(r)?,
+                processing: Wire::read(r)?,
+                level: Wire::read(r)?,
+                texels: Wire::read(r)?,
+                threshold: Wire::read(r)?,
             },
             _ => return None,
         })
@@ -306,6 +417,28 @@ impl Wire for Event {
                 id.write(w);
                 value.write(w);
             }
+            Event::Measured { id, noise } => {
+                2u8.write(w);
+                id.write(w);
+                noise.write(w);
+            }
+            Event::Mask { id, voxels } => {
+                3u8.write(w);
+                id.write(w);
+                voxels.write(w);
+            }
+            Event::MaskPart {
+                id,
+                origin,
+                dims,
+                mask,
+            } => {
+                4u8.write(w);
+                id.write(w);
+                origin.write(w);
+                dims.write(w);
+                write_bytes(mask, w);
+            }
         }
     }
 
@@ -315,7 +448,7 @@ impl Wire for Event {
                 Voxels::Data(data) => data,
                 _ => &[],
             },
-            Event::PixelValue { .. } => &[],
+            _ => &[],
         }
     }
 
@@ -328,6 +461,20 @@ impl Wire for Event {
             1 => Event::PixelValue {
                 id: Wire::read(r)?,
                 value: Wire::read(r)?,
+            },
+            2 => Event::Measured {
+                id: Wire::read(r)?,
+                noise: Wire::read(r)?,
+            },
+            3 => Event::Mask {
+                id: Wire::read(r)?,
+                voxels: Wire::read(r)?,
+            },
+            4 => Event::MaskPart {
+                id: Wire::read(r)?,
+                origin: Wire::read(r)?,
+                dims: Wire::read(r)?,
+                mask: read_bytes(r)?,
             },
             _ => return None,
         })
@@ -405,7 +552,11 @@ mod tests {
 
     #[test]
     fn messages_survive_the_trip_and_a_short_one_is_an_error() {
-        let id = CubeletId::new(Mode::Mean, 3, [1, 700, 2]);
+        let processing = Processing {
+            normalise: true,
+            smoothing: Smoothing::Spatial,
+        };
+        let id = CubeletId::new(Mode::Mean, processing, 3, [1, 700, 2]);
         round_trip((
             9,
             Request::Levels {
@@ -414,8 +565,54 @@ mod tests {
             },
         ));
         round_trip(Request::AddCubelets {
-            ids: vec![id, CubeletId::new(Mode::Max, 0, [0; 3])],
+            ids: vec![
+                id,
+                CubeletId::new(Mode::Max, Processing::default(), 0, [0; 3]),
+            ],
         });
+        let texels = Region {
+            min: [3, 0, 64],
+            max: [618, 617, 195],
+        };
+        round_trip(Request::Measure {
+            id: 4,
+            mode: Mode::Mean,
+            processing,
+            level: 1,
+            texels,
+        });
+        round_trip((
+            2,
+            Request::Mask {
+                id: 5,
+                mode: Mode::Max,
+                processing: Processing::default(),
+                level: 0,
+                texels,
+                threshold: 5.0,
+            },
+        ));
+        round_trip(Event::Measured {
+            id: 4,
+            noise: Some(Noise {
+                median: -2e-4,
+                sigma: 6.4e-3,
+            }),
+        });
+        round_trip(Event::Measured { id: 4, noise: None });
+        round_trip(Event::Mask {
+            id: 5,
+            voxels: 696_888,
+        });
+        round_trip((
+            7,
+            Event::MaskPart {
+                id: 5,
+                origin: [61, 0, 0],
+                dims: [3, 2, 1],
+                mask: vec![0, 1, 1, 0, 0, 1],
+            },
+        ));
         round_trip(Request::RemoveCubelets { ids: vec![] });
         round_trip(Request::PixelValue {
             id: u32::MAX,

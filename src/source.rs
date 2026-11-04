@@ -157,10 +157,10 @@ mod local {
 
             // The Mean ones wait on a level job, which takes one of the IN_FLIGHT, and level 0 fills the rest.
             let mean: Vec<_> = (0..16)
-                .map(|i| CubeletId::new(Mode::Mean, 1, [i % 4, i / 4, 0]))
+                .map(|i| CubeletId::new(Mode::Mean, default(), 1, [i % 4, i / 4, 0]))
                 .collect();
             let full: Vec<_> = (0..64)
-                .map(|i| CubeletId::new(Mode::Max, 0, [i % 8, i / 8, 0]))
+                .map(|i| CubeletId::new(Mode::Max, default(), 0, [i % 8, i / 8, 0]))
                 .collect();
             source.send(Request::AddCubelets {
                 ids: [&mean[..], &full[..]].concat(),
@@ -179,7 +179,7 @@ mod local {
                 assert!(start.elapsed().as_secs() < 10, "{} of 76", arrived.len());
                 arrived.extend(source.drain().into_iter().filter_map(|event| match event {
                     Event::Cubelet { id, .. } => Some(id),
-                    Event::PixelValue { .. } => None,
+                    _ => None,
                 }));
                 std::thread::yield_now();
             }

@@ -8,8 +8,9 @@ use bevy_egui::{EguiContexts, egui};
 
 use crate::{
     CubeState, Dataset, Settings,
-    config::{COLOR_MAPS, GAMMA, JITTER, RAYMARCHING_STEPS, SCALING_TYPES},
-    fits::{PERCENTILES, Region},
+    config::{ASINH, COLOR_MAPS, GAMMA, JITTER, RAYMARCHING_STEPS, SCALING_TYPES},
+    fits::{Noise, PERCENTILES, Region},
+    modes::{self, Extras, GenerateMask},
     selection::{CropRequest, Hover},
 };
 
@@ -42,6 +43,8 @@ pub fn ui(
     diagnostics: Res<DiagnosticsStore>,
     windows: Query<&Window>,
     mut crop_requests: MessageWriter<CropRequest>,
+    extras: Res<Extras>,
+    mut generate: MessageWriter<GenerateMask>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     egui::Window::new("iDaVIE volume renderer")
@@ -78,7 +81,12 @@ pub fn ui(
             }
             egui::CollapsingHeader::new("Rendering")
                 .default_open(true)
-                .show(ui, |ui| rendering_section(ui, &data, &mut settings));
+                .show(ui, |ui| {
+                    let mask = extras.mask(state.shown().handle.id());
+                    if rendering_section(ui, &data, &mut settings, extras.noise(), mask) {
+                        generate.write(GenerateMask);
+                    }
+                });
             ui.separator();
             ui.small(HELP);
         });
@@ -177,7 +185,14 @@ fn cube_section(
     });
 }
 
-fn rendering_section(ui: &mut egui::Ui, data: &Dataset, settings: &mut ResMut<Settings>) {
+/// True when a mask is asked for.
+fn rendering_section(
+    ui: &mut egui::Ui,
+    data: &Dataset,
+    settings: &mut ResMut<Settings>,
+    noise: Option<Noise>,
+    mask: Option<(f32, Option<usize>)>,
+) -> bool {
     let mut s = settings.clone();
     let p = &mut s.params;
     egui::ComboBox::from_label("Colour map")
@@ -196,6 +211,17 @@ fn rendering_section(ui: &mut egui::Ui, data: &Dataset, settings: &mut ResMut<Se
         });
     if p.scale_type == GAMMA {
         ui.add(egui::Slider::new(&mut p.scale_gamma, 0.0..=5.0).text("Gamma"));
+    }
+    if p.scale_type == ASINH {
+        ui.add(
+            egui::Slider::new(&mut s.modes.asinh_sigma, 0.1..=20.0)
+                .logarithmic(true)
+                .text("Softening (σ)"),
+        )
+        .on_hover_text(
+            "Zero at the noise median, or for the maximum modes at the brightest the noise alone likely reaches \
+             along the ray; linear up to the softening, logarithmic above",
+        );
     }
     ui.horizontal_wrapped(|ui| {
         for percent in PERCENTILES {
@@ -223,15 +249,13 @@ fn rendering_section(ui: &mut egui::Ui, data: &Dataset, settings: &mut ResMut<Se
     ui.add(
         egui::Slider::new(&mut p.threshold_max, min..=1.0).text(format!("Max ({max_value:.3e})")),
     );
-    ui.horizontal(|ui| {
-        ui.radio_value(&mut p.projection_mode, 0, "Maximum");
-        ui.radio_value(&mut p.projection_mode, 1, "Average");
-        ui.label("intensity projection");
-    });
+    let unit = data.info.unit().map_or(String::new(), |u| format!(" {u}"));
+    let generate = modes::ui(ui, p, &mut s.modes, noise, mask, &unit);
     ui.add(egui::Slider::new(&mut p.jitter, JITTER).text("Jitter"));
     ui.add(egui::Slider::new(&mut p.max_steps, RAYMARCHING_STEPS).text("Ray-marching steps"));
     if data.wcs.is_some() {
         ui.checkbox(&mut s.wcs_axes, "WCS axes");
     }
     settings.set_if_neq(s);
+    generate
 }

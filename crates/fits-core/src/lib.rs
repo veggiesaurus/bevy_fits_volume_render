@@ -11,6 +11,10 @@ pub mod wire;
 pub use cubelet::{
     CUBELET, Cell, Cubelet, Level, Levels, Voxels, cubelet, cubelet_region, grow, levels,
 };
+mod noise;
+pub use noise::{
+    LevelOf, Noise, Normaliser, Processing, Shown, Smoothing, find_sources, noise, smooth,
+};
 
 const BLOCK: usize = 2880;
 /// Voxels read, decoded and summarised per task: 4 MB of output, small enough to stay in cache.
@@ -97,39 +101,10 @@ pub struct Cube {
 
 impl Cube {
     /// The noise σ: from the median absolute deviation of the quietest channels, sampled on a grid, leaving out
-    /// channels where it's zero, such as zero-filled or flagged ones. Where every channel is like that, the
-    /// histogram's IQR / 1.349, as for heavily quantised data. None when the cube has no finite voxels.
+    /// channels where it's zero, such as zero-filled or flagged ones. Where every channel is like that, the IQR /
+    /// 1.349 of a histogram of the samples, as for heavily quantised data. None when it samples no finite voxels.
     pub fn sigma(&self) -> Option<f64> {
-        // About 64 x 64 voxels a channel, stepping x and y apart so that the step can't alias with the width, in
-        // up to 256 channels.
-        const GRID: usize = 64;
-        const CHANNELS: usize = 256;
-        let [width, height, depth] = self.info.dims;
-        let (step_x, step_y) = (width.div_ceil(GRID), height.div_ceil(GRID));
-        let mut mads: Vec<f32> = (self.data.chunks(width * height))
-            .step_by(depth.div_ceil(CHANNELS))
-            .filter_map(|channel| {
-                let mut values: Vec<f32> = (channel.chunks(width).step_by(step_y))
-                    .flat_map(|row| row.iter().step_by(step_x))
-                    .copied()
-                    .filter(|v| v.is_finite())
-                    .collect();
-                let centre = median(&mut values)?;
-                values.iter_mut().for_each(|v| *v = (*v - centre).abs());
-                median(&mut values).filter(|&mad| mad > 0.0)
-            })
-            .collect();
-        mads.sort_by(f32::total_cmp);
-        // The middle of the quietest quarter, so that neither emission nor a few unusually flat channels set it.
-        if let Some(&mad) = mads.get(mads.len().div_ceil(4) / 2) {
-            return Some(1.4826 * f64::from(mad));
-        }
-        let Stats { min, max, .. } = self.info.stats;
-        let range = f64::from(max) - f64::from(min);
-        range.is_finite().then(|| {
-            let (lo, hi) = self.info.histogram.clip(50.0);
-            f64::from(hi - lo) * range / 1.349
-        })
+        noise(&self.data, self.info.dims).map(|noise| f64::from(noise.sigma))
     }
 }
 
@@ -501,11 +476,7 @@ fn read_data<S: Source + ?Sized>(
     for part in parts {
         counts.iter_mut().zip(part).for_each(|(c, n)| *c += n);
     }
-    let cumulative = counts.iter().scan(0, |below, &n| {
-        *below += n;
-        Some(*below)
-    });
-    Ok((data, stats, Histogram(cumulative.collect())))
+    Ok((data, stats, Histogram::of_counts(&counts)))
 }
 
 /// At most u16::MAX bins, so a u16 slot can't overrun a table and its last slot takes the non-finite voxels.
@@ -555,6 +526,14 @@ pub const PERCENTILES: [f64; 8] = [90.0, 95.0, 99.0, 99.5, 99.9, 99.95, 99.99, 1
 pub struct Histogram(Vec<u64>);
 
 impl Histogram {
+    fn of_counts(counts: &[u64]) -> Self {
+        let cumulative = counts.iter().scan(0, |below, &n| {
+            *below += n;
+            Some(*below)
+        });
+        Histogram(cumulative.collect())
+    }
+
     /// The fraction of the range below which `rank` (0..=1) of the voxels lie, interpolating linearly within the
     /// bin, as CARTA does.
     fn fraction_below(&self, rank: f64) -> f64 {

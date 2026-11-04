@@ -10,10 +10,10 @@ use bevy::{prelude::*, render::storage::ShaderBuffer};
 
 use crate::{
     Dataset, Settings,
-    fits::{self, CUBELET, Cell, Cubelet, Region, Voxels},
+    fits::{self, CUBELET, Cell, Cubelet, Processing, Region, Voxels},
     source::{CubeletId, DataSource, Mode, Request},
     upload::{Uploads, Upsample, Upsamples},
-    volume::{self, VolumeMaterial},
+    volume::{self, VolumeMaterial, VolumeParams},
 };
 
 /// What a cell is before its cubelet comes, when nothing bounds it.
@@ -192,11 +192,14 @@ fn placement(texels: Region, at: [usize; 3], dims: [usize; 3]) -> Option<(Region
     Some((part, origin))
 }
 
+/// Which pyramid a cubelet comes from, and what's done to it.
+type Kind = (Mode, Processing);
+
 #[derive(Clone, Copy, PartialEq)]
 enum Have {
     No,
-    Asked(Mode),
-    Got(Mode),
+    Asked(Kind),
+    Got(Kind),
 }
 
 /// A dense texture over `texels` of one level, filled cubelet by cubelet. Its grid has an entry per cubelet it
@@ -215,8 +218,8 @@ pub struct VolumeTexture {
     cells: Vec<Cell>,
     have: Vec<Have>,
     cells_changed: bool,
-    /// The mode, Maximum floor and whether culling was possible when it was last planned.
-    planned: Option<(Mode, Option<u32>, bool)>,
+    /// The kind, Maximum floor and whether culling was possible when it was last planned.
+    planned: Option<(Kind, Option<u32>, bool)>,
 }
 
 impl VolumeTexture {
@@ -311,6 +314,12 @@ impl VolumeTexture {
         covers(self.factors, self.texels, region)
     }
 
+    /// Whether it holds a processed cubelet.
+    fn processed(&self) -> bool {
+        (self.have.iter())
+            .any(|have| matches!(have, Have::Got((_, processing)) if !processing.is_none()))
+    }
+
     pub fn drawable(&self) -> bool {
         self.filled || (self.placeholder.as_ref()).is_some_and(|done| done.load(Ordering::Relaxed))
     }
@@ -318,44 +327,46 @@ impl VolumeTexture {
     fn asked(&self) -> Vec<CubeletId> {
         (self.have.iter().enumerate())
             .filter_map(|(i, have)| match *have {
-                Have::Asked(mode) => Some(CubeletId::new(mode, self.level, self.at(i))),
+                Have::Asked((mode, processing)) => {
+                    Some(CubeletId::new(mode, processing, self.level, self.at(i)))
+                }
                 _ => None,
             })
             .collect()
     }
 
-    /// What to ask for and what to stop asking for, after the mode, the floor or the coarse level has changed since
+    /// What to ask for and what to stop asking for, after the kind, the floor or the coarse level has changed since
     /// the last time. Only a texture with a placeholder leaves cubelets out, since the rest of it would be empty.
     fn plan(
         &mut self,
         dims: [usize; 3],
         centre: Vec3,
         coarse: Option<&Coarse>,
-        mode: Mode,
+        (mode, processing): Kind,
         floor: Option<f32>,
     ) -> (Vec<CubeletId>, Vec<CubeletId>) {
-        let mode = if self.level == 0 { Mode::Max } else { mode };
+        let kind = (if self.level == 0 { Mode::Max } else { mode }, processing);
         let coarse = coarse.filter(|_| self.placeholder.is_some());
         let floor = floor.filter(|_| coarse.is_some());
-        let key = (mode, floor.map(f32::to_bits), coarse.is_some());
+        let key = (kind, floor.map(f32::to_bits), coarse.is_some());
         if self.planned.replace(key) == Some(key) {
             return default();
         }
         let mut remove = Vec::new();
         for i in 0..self.have.len() {
             if let Have::Asked(asked) = self.have[i]
-                && asked != mode
+                && asked != kind
             {
-                remove.push(CubeletId::new(asked, self.level, self.at(i)));
+                remove.push(CubeletId::new(asked.0, asked.1, self.level, self.at(i)));
                 self.have[i] = Have::No;
             }
         }
         let mut add = Vec::new();
         for at in plan(dims, self.factors, self.texels, centre, coarse, floor) {
             let i = self.index(at).unwrap();
-            if !matches!(self.have[i], Have::Asked(m) | Have::Got(m) if m == mode) {
-                self.have[i] = Have::Asked(mode);
-                add.push(CubeletId::new(mode, self.level, at));
+            if !matches!(self.have[i], Have::Asked(k) | Have::Got(k) if k == kind) {
+                self.have[i] = Have::Asked(kind);
+                add.push(CubeletId::new(kind.0, kind.1, self.level, at));
             }
         }
         (add, remove)
@@ -363,16 +374,15 @@ impl VolumeTexture {
 
     fn wants(&self, id: CubeletId) -> bool {
         id.level as usize == self.level
-            && self
-                .index(id.at())
-                .is_some_and(|i| self.have[i] == Have::Asked(id.mode))
+            && (self.index(id.at()))
+                .is_some_and(|i| self.have[i] == Have::Asked((id.mode, id.processing)))
     }
 
     fn receive(&mut self, id: CubeletId, cubelet: Cubelet, uploads: &mut Uploads) {
         let Some(i) = self.index(id.at()) else {
             return;
         };
-        self.have[i] = Have::Got(id.mode);
+        self.have[i] = Have::Got((id.mode, id.processing));
         self.cells[i] = cubelet.cell;
         self.cells_changed = true;
         let Some((part, origin)) = placement(self.texels, id.at(), cubelet.dims) else {
@@ -481,9 +491,20 @@ impl CubeState {
             && uploads.is_empty()
     }
 
+    /// Each of the coarse level's planes' flux over `cut`, and the level 0 channels a plane takes in, once it's here.
+    pub fn line_flux(&self, cut: f32) -> Option<(Vec<f32>, usize)> {
+        let coarse = self.coarse.as_ref()?;
+        let plane = coarse.dims[0] * coarse.dims[1];
+        let flux = (coarse.data.chunks(plane))
+            .map(|plane| plane.iter().map(|&v| (v - cut).max(0.0)).sum())
+            .collect();
+        Some((flux, coarse.factors[2]))
+    }
+
     pub fn receive(&mut self, id: CubeletId, cubelet: Cubelet, uploads: &mut Uploads) {
         let level = id.level as usize;
-        if level == self.levels.coarsest() && id.mode == Mode::Max && self.coarse.is_none() {
+        let plain = id.mode == Mode::Max && id.processing.is_none();
+        if level == self.levels.coarsest() && plain && self.coarse.is_none() {
             self.coarse = Some(Coarse::new(self.levels.factors[level], &cubelet));
         }
         let textures = std::iter::once(&mut self.full)
@@ -493,6 +514,15 @@ impl CubeState {
             texture.receive(id, cubelet, uploads);
         }
     }
+}
+
+/// The shader's floor_value: a Maximum ray under it shows nothing.
+pub fn floor_value(params: &VolumeParams) -> f32 {
+    let range = match params.scale_max - params.scale_min {
+        0.0 => 1.0,
+        range => range,
+    };
+    params.threshold_min * range + params.scale_min
 }
 
 /// Keeps the textures in step with what's visible: a finer texture when the shown one is too coarse, started from it
@@ -509,13 +539,9 @@ pub fn refine(
 ) {
     let (dims, source) = (data.info.dims, &data.source);
     let whole = Region::whole(dims);
-    let (params, mode) = (&settings.params, settings.mode());
-    // The shader's floor_value: a Maximum ray under it shows nothing.
-    let range = match params.scale_max - params.scale_min {
-        0.0 => 1.0,
-        range => range,
-    };
-    let floor = (mode == Mode::Max).then_some(params.threshold_min * range + params.scale_min);
+    let (params, mode, processing) = (&settings.params, settings.mode(), settings.modes.processing);
+    // The coarse level only bounds unprocessed data.
+    let floor = (mode == Mode::Max && processing.is_none()).then(|| floor_value(params));
     let s = state.bypass_change_detection();
     let mut changed = false;
 
@@ -548,7 +574,8 @@ pub fn refine(
     } else if shown.drawable()
         && !(s.next.as_ref()).is_some_and(|next| next.level == level && next.covers(s.visible))
     {
-        let coarse = s.coarse.as_ref();
+        // The placeholder is the shown texture's data, which only the coarse level bounds while it's unprocessed.
+        let coarse = (s.coarse.as_ref()).filter(|_| processing.is_none() && !shown.processed());
         let next = VolumeTexture::new(
             &s.levels,
             s.visible,
@@ -570,7 +597,8 @@ pub fn refine(
     }));
     // The whole cube's after a crop's, so that a reset shows this mode too.
     for texture in s.next.iter_mut().chain(&mut s.crop).chain([&mut s.full]) {
-        let (add, remove) = texture.plan(dims, centre, s.coarse.as_ref(), mode, floor);
+        let kind = (mode, processing);
+        let (add, remove) = texture.plan(dims, centre, s.coarse.as_ref(), kind, floor);
         if !remove.is_empty() {
             source.send(Request::RemoveCubelets { ids: remove });
         }
@@ -581,7 +609,12 @@ pub fn refine(
     // The max coarsest cubelet bounds and culls the rest, so it's asked for again on a switch to Maximum when a
     // switch before it came cancelled it.
     let switched = s.mode.replace(mode) != Some(mode);
-    let coarsest = CubeletId::new(Mode::Max, s.levels.coarsest(), [0; 3]);
+    let coarsest = CubeletId::new(
+        Mode::Max,
+        Processing::default(),
+        s.levels.coarsest(),
+        [0; 3],
+    );
     let mut textures = std::iter::once(&s.full).chain(&s.crop).chain(&s.next);
     if switched && mode == Mode::Max && s.coarse.is_none() && !textures.any(|t| t.wants(coarsest)) {
         source.send(Request::AddCubelets {
@@ -646,14 +679,18 @@ mod tests {
         let at = |ids: Vec<CubeletId>| ids.iter().map(|id| [id.x, id.y]).collect::<Vec<_>>();
 
         // Maximum at a floor of 9.5 leaves out all but 10, 11, 13, 14 and 15, and never the NaN cubelet's 12.
-        let (add, remove) = texture.plan(dims, centre, Some(&coarse), Mode::Max, Some(9.5));
+        let (max, mean) = (
+            (Mode::Max, Processing::default()),
+            (Mode::Mean, Processing::default()),
+        );
+        let (add, remove) = texture.plan(dims, centre, Some(&coarse), max, Some(9.5));
         assert_eq!(at(add), [[2, 2], [3, 2], [2, 3], [3, 3], [1, 3]]);
         assert!(remove.is_empty());
-        let again = texture.plan(dims, centre, Some(&coarse), Mode::Max, Some(9.5));
+        let again = texture.plan(dims, centre, Some(&coarse), max, Some(9.5));
         assert_eq!(again, default());
 
         // Lowering the floor asks for what it left out, nearest first; [3, 0], with its one NaN, comes in.
-        let (add, _) = texture.plan(dims, centre, Some(&coarse), Mode::Max, Some(1.5));
+        let (add, _) = texture.plan(dims, centre, Some(&coarse), max, Some(1.5));
         let want = [
             [2, 1],
             [1, 2],
@@ -667,7 +704,7 @@ mod tests {
         assert_eq!(at(add), want);
 
         // Average has no floor and level 0 is the same in both pyramids, so it only adds the two under 1.5.
-        let (add, remove) = texture.plan(dims, centre, Some(&coarse), Mode::Mean, None);
+        let (add, remove) = texture.plan(dims, centre, Some(&coarse), mean, None);
         assert_eq!((at(add), remove), (vec![[1, 0], [0, 0]], vec![]));
     }
 

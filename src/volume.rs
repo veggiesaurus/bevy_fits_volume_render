@@ -17,7 +17,11 @@ use bevy::{
     shader::ShaderRef,
 };
 
-use crate::{config::COLOR_MAPS, fits};
+use crate::{
+    config::COLOR_MAPS,
+    fits,
+    modes::{ModeParams, VolumeKey},
+};
 
 const SHADER: &str = "embedded://bevy_fits_volume_render/volume.wesl";
 
@@ -141,6 +145,7 @@ pub fn grid_buffer(
 }
 
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
+#[bind_group_data(VolumeKey)]
 pub struct VolumeMaterial {
     #[uniform(0)]
     pub params: VolumeParams,
@@ -153,6 +158,12 @@ pub struct VolumeMaterial {
     pub color_map: Handle<Image>,
     #[storage(5, read_only)]
     pub grid: Handle<ShaderBuffer>,
+    #[uniform(6)]
+    pub modes: ModeParams,
+    // R8Unorm, read through data_sampler.
+    #[texture(7, dimension = "2d_array", sample_type = "float", filterable = false)]
+    pub mask: Handle<Image>,
+    pub key: VolumeKey,
 }
 
 impl Material for VolumeMaterial {
@@ -181,8 +192,9 @@ impl Material for VolumeMaterial {
         _pipeline: &MaterialPipeline,
         descriptor: &mut RenderPipelineDescriptor,
         layout: &MeshVertexBufferLayoutRef,
-        _key: MaterialPipelineKey<Self>,
+        key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        key.bind_group_data.add_shader_defs(descriptor);
         descriptor.vertex.buffers = vec![
             layout
                 .0

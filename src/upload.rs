@@ -36,7 +36,7 @@ struct Upload {
     image: AssetId<Image>,
     origin: [usize; 3],
     dims: [usize; 3],
-    voxels: Arc<Vec<f32>>,
+    texels: Texels,
     /// Held back until set: a placeholder the voxels would otherwise be written under.
     after: Option<Arc<AtomicBool>>,
     planes_written: Arc<AtomicUsize>,
@@ -48,7 +48,30 @@ impl Upload {
     }
 }
 
-/// Voxels still to be written into R32Float textures, oldest first.
+/// R32Float voxels, or an R8 mask's bytes.
+#[derive(Clone)]
+enum Texels {
+    F32(Arc<Vec<f32>>),
+    U8(Arc<Vec<u8>>),
+}
+
+impl Texels {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Texels::F32(voxels) => bytemuck::cast_slice(voxels),
+            Texels::U8(bytes) => bytes,
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            Texels::F32(_) => 4,
+            Texels::U8(_) => 1,
+        }
+    }
+}
+
+/// Texels still to be written into textures, oldest first.
 #[derive(Resource, Clone, Default, ExtractResource)]
 #[extract_app(RenderApp)]
 pub struct Uploads(Vec<Upload>);
@@ -68,8 +91,27 @@ impl Uploads {
             image,
             origin,
             dims,
-            voxels: Arc::new(voxels),
+            texels: Texels::F32(Arc::new(voxels)),
             after,
+            planes_written: Arc::default(),
+        });
+    }
+
+    /// Writes `dims` bytes into an R8 `image` from `origin`.
+    pub fn push_bytes(
+        &mut self,
+        image: AssetId<Image>,
+        origin: [usize; 3],
+        dims: [usize; 3],
+        bytes: Vec<u8>,
+    ) {
+        debug_assert_eq!(bytes.len(), dims.iter().product::<usize>());
+        self.0.push(Upload {
+            image,
+            origin,
+            dims,
+            texels: Texels::U8(Arc::new(bytes)),
+            after: None,
             planes_written: Arc::default(),
         });
     }
@@ -139,7 +181,8 @@ fn write_slabs(
             continue;
         };
         let [width, height, depth] = upload.dims;
-        let plane = width * height * 4;
+        let size = upload.texels.size();
+        let plane = width * height * size;
         let start = upload.planes_written.load(Ordering::Relaxed);
         let end = (start + (budget / plane).max(1)).min(depth);
         if start == end {
@@ -156,10 +199,10 @@ fn write_slabs(
                 },
                 aspect: TextureAspect::All,
             },
-            &bytemuck::cast_slice(&upload.voxels)[start * plane..end * plane],
+            &upload.texels.bytes()[start * plane..end * plane],
             TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(width as u32 * 4),
+                bytes_per_row: Some((width * size) as u32),
                 rows_per_image: Some(height as u32),
             },
             Extent3d {

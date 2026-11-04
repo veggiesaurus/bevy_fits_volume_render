@@ -113,7 +113,7 @@ pub fn work() -> bool {
         return false;
     };
     let start = now();
-    let event = job.run();
+    let events = job.run();
     let seconds = (now() - start) / 1000.0;
     if seconds >= 0.1 {
         // Cuts of the overview from level 0 are slow on a big cube, and there are a lot of them.
@@ -124,7 +124,7 @@ pub fn work() -> bool {
             log(&line);
         }
     }
-    if let Some(event) = event {
+    for event in events {
         post(&(load, event));
     }
     true

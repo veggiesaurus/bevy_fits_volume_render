@@ -45,9 +45,11 @@ pub const COLOR_MAPS: [&str; 80] = [
     "RdBu", "RdGy", "RdPu", "RdYlBu", "RdYlGn", "Reds", "Seismic", "Set1", "Set2", "Set3", "Spectral", "Spring", "Summer", "Tab10", "Tab20",
     "Tab20B", "Tab20C", "Terrain", "Viridis", "Winter", "Wistia", "YlGn", "YlGnBu", "YlOrBr", "YlOrRd", "Turbo",
 ];
-pub const SCALING_TYPES: [&str; 6] = ["Linear", "Log", "Sqrt", "Square", "Power", "Gamma"];
+pub const SCALING_TYPES: [&str; 7] = ["Linear", "Log", "Sqrt", "Square", "Power", "Gamma", "Asinh"];
 /// The index of Gamma in `SCALING_TYPES`, as volume.wesl's GAMMA.
 pub const GAMMA: u32 = 5;
+/// Asinh's, which volume.wesl compiles as a pipeline of its own.
+pub const ASINH: u32 = 6;
 
 /// A name from `COLOR_MAPS`, matched case-insensitively and held as its row in the atlas.
 #[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug, PartialEq)]

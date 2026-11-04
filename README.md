@@ -22,7 +22,7 @@ The config lives at `$XDG_CONFIG_HOME/idavie-bevy/config.toml` (`~/.config/idavi
 gpu_memory_limit_mb = 384       # texture budget; the cube is downsampled to fit, as in iDaVIE
 max_raymarching_steps = 384
 default_color_map = "Inferno"   # any name from iDaVIE's ColorMapEnum
-default_scaling_type = "Linear" # Linear, Log, Sqrt, Square, Power or Gamma
+default_scaling_type = "Linear" # Linear, Log, Sqrt, Square, Power, Gamma or Asinh
 jitter = 1.0
 threshold_min = 0.0             # where the colour map starts and ends, as fractions of the data range
 threshold_max = 1.0
@@ -51,7 +51,7 @@ starlink-ast is Rust apart from the PAL, ERFA and WCSLIB routines it still vendo
 
 The shader takes the same samples as iDaVIE's, apart from the step changes below, and adds guards so a constant cube or equal thresholds don't divide zero by zero. It's rearranged for speed (an unrolled loop, and Maximum rays stop once their colour can't change) without changing the image. The Unity specifics are translated rather than copied: the mirrored z axis of Unity's object space, the colour map atlas row order, linear colour space with an sRGB colour map, point sampling with Repeat wrapping and `_Time` for the jitter. Things that are deliberately different or missing:
 
-- no masks, moment maps, catalogues, vignette or cursor voxel box
+- no mask files, catalogues, vignette or cursor voxel box
 - the outlines are opaque line meshes, so the shader's depth clamp lets the volume cover their back edges, and edges behind the box are drawn dark grey. iDaVIE draws every edge on top, which reads fine in stereo but not on a flat screen
 - after a crop the outline shrinks to the crop and the camera re-frames it, and again on reset. iDaVIE keeps the full cube's outline with the crop inside it and leaves the camera where it is
 - no foveated rendering for now, so every pixel gets the full step count, as in iDaVIE with `foveatedRendering` off. iDaVIE's default config turns it on, so turn it off in its `config.json` for side by side comparisons
@@ -72,6 +72,7 @@ The shader takes the same samples as iDaVIE's, apart from the step changes below
 - the near plane follows the camera in, so a small crop doesn't end up behind it
 - the step count is capped at two per texel along the texture's diagonal, so a small crop or a heavily downsampled cube takes fewer steps than in iDaVIE. Voxel edges can shift by a fraction of a voxel compared with iDaVIE
 - the view only redraws on input, so the jitter noise holds still while nothing changes; iDaVIE renders every frame
+- rendering modes past Maximum and Average: depth cued and attenuated maximum, peak and mean channel colours, emission-absorption with MIDA, S/N opacity and lighting, an isosurface, translucent shells and a clipped moment 0. Asinh scaling starts from the noise, and the noise can be normalised, the cube smoothed and a SoFiA-style smooth-and-clip mask made, all by the data source (the worker, in the browser). The noise and the mask come from the shown texture's level, so from a downsampled cube when that's what's shown
 
 WCS comes from [starlink-ast](https://github.com/Starlink/starlink-ast-rs), the Rust port of AST, with spectral axes shown in MHz or km/s. The port doesn't include AST's `Plot3D`, so the WCS ticks on the bounding box are our own. Each axis is labelled on the box edge that's on the silhouette, at round values found with AST's transforms and formatted with AST's `Format`. The tick spacing is chosen by hand because `astGap` isn't ported either.
 

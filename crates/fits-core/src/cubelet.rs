@@ -47,7 +47,7 @@ pub enum Voxels {
 }
 
 impl Cubelet {
-    fn new(dims: [usize; 3], data: Vec<f32>, cell: Cell) -> Self {
+    pub(crate) fn new(dims: [usize; 3], data: Vec<f32>, cell: Cell) -> Self {
         let voxels = if data.iter().all(|v| v.is_nan()) {
             Voxels::AllNan
         } else if data.iter().all(|v| v.to_bits() == data[0].to_bits()) {
@@ -72,7 +72,7 @@ pub fn cubelet_region(dims: [usize; 3], factors: [usize; 3], at: [usize; 3]) -> 
 }
 
 /// The voxels of `region` of `data`, a cube of `dims`, a row at a time.
-fn copy(data: &[f32], dims: [usize; 3], region: Region) -> Vec<f32> {
+pub(crate) fn copy(data: &[f32], dims: [usize; 3], region: Region) -> Vec<f32> {
     let Region { min, max } = region;
     let mut out = Vec::with_capacity(region.extent().iter().product());
     for z in min[2]..=max[2] {

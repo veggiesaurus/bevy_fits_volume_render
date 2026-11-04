@@ -66,6 +66,36 @@ impl Wcs {
             .collect()
     }
 
+    /// Whether velocity falls as the cube's z rises, from the spectral axis at its first and last channels: a
+    /// frequency, energy or wavenumber that rises, or a velocity, redshift or wavelength that falls. False without
+    /// a spectral axis.
+    pub fn velocity_falls(&self, dims: [usize; 3]) -> bool {
+        let fs = self.frames.lock().unwrap();
+        let frame = fs.current();
+        let spectral =
+            (1..=frame.naxes()).find_map(|axis| Some((axis, spec_frame(frame, axis)?.system())));
+        let Some((axis, system)) = spectral else {
+            return false;
+        };
+        let middle = |z: usize| {
+            let [x, y] = [dims[0], dims[1]].map(|d| (d as f64 + 1.0) / 2.0);
+            self.grid_point(fs.nin(), [x, y, z as f64])
+        };
+        let Ok(world) = fs.transform(&PointSet::from_rows([middle(1), middle(dims[2])]), true)
+        else {
+            return false;
+        };
+        let [first, last] = [0, 1].map(|p| world.point(p)[axis - 1]);
+        if is_bad(first) || is_bad(last) || first == last {
+            return false;
+        }
+        let frequency = matches!(
+            system,
+            SpecSystem::Freq | SpecSystem::Energy | SpecSystem::Wavenum
+        );
+        frequency == (last > first)
+    }
+
     pub fn summary(&self) -> Vec<String> {
         let fs = self.frames.lock().unwrap();
         let frame = fs.current();
@@ -335,6 +365,27 @@ mod tests {
             wcs.grid_to_world([270.5, 270.5, 11.0]).unwrap(),
             ["2:21:36.5", "-5:31:16", "1409.82 MHz"]
         );
+    }
+
+    #[test]
+    fn velocity_falls_where_frequency_rises_with_the_channel() {
+        let falls = |cards: &[&str]| {
+            let wcs = Wcs::from_cards(&padded(cards), [0, 1, 2]).unwrap();
+            wcs.velocity_falls([540, 540, 21])
+        };
+        assert!(falls(&CARDS));
+        // A PC matrix turning the axis round, which CDELT3 alone doesn't show.
+        assert!(!falls(&[&CARDS[..], &["PC3_3   = -1.0"]].concat()));
+        let velocity: Vec<&str> = (CARDS.iter())
+            .map(|card| match &card[..6] {
+                "CTYPE3" => "CTYPE3  = 'VRAD'",
+                "CRVAL3" => "CRVAL3  = 5.0E5",
+                "CDELT3" => "CDELT3  = 2.5E3",
+                "CUNIT3" => "CUNIT3  = 'm/s'",
+                _ => card,
+            })
+            .collect();
+        assert!(!falls(&velocity));
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod axes;
 mod camera;
 mod config;
 mod grips;
+mod modes;
 mod outline;
 mod selection;
 mod source;
@@ -114,6 +115,7 @@ impl Dataset {
 #[derive(Resource, Clone, PartialEq)]
 struct Settings {
     params: VolumeParams,
+    modes: modes::ModeSettings,
     wcs_axes: bool,
 }
 
@@ -133,6 +135,7 @@ impl Settings {
                 scale_type: config.default_scaling_type.0,
                 ..default()
             },
+            modes: default(),
             wcs_axes: true,
         }
     }
@@ -182,6 +185,7 @@ fn main() {
         FrameTimeDiagnosticsPlugin::default(),
         VolumePlugin,
         UploadPlugin,
+        modes::ModesPlugin,
     ))
     .insert_resource(ClearColor(Color::BLACK))
     .init_resource::<Hover>()
@@ -268,6 +272,7 @@ fn receive(
     mut uploads: ResMut<Uploads>,
     mut hover: ResMut<Hover>,
     mut state: Option<ResMut<CubeState>>,
+    mut extras: ResMut<modes::Extras>,
 ) {
     for event in data.source.drain() {
         match event {
@@ -279,6 +284,7 @@ fn receive(
                 }
             }
             Event::PixelValue { id, value } => hover.receive(id, value),
+            event => modes::receive(event, &mut extras, &mut uploads),
         }
     }
 }
@@ -418,6 +424,9 @@ fn spawn_volume(
         data_cube: full.handle.clone(),
         color_map: images.add(volume::color_map_image()),
         grid: full.grid.clone(),
+        modes: default(),
+        mask: modes::NO_MASK,
+        key: default(),
     });
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
@@ -429,6 +438,7 @@ fn spawn_volume(
     ));
     outline::spawn_outlines(&mut commands, &mut meshes, &mut line_materials);
     commands.insert_resource(settings);
+    commands.insert_resource(modes::Extras::default());
     commands.insert_resource(Gesture::default());
     commands.insert_resource(Hover::default());
     commands.insert_resource(CubeState::new(material, levels, full, dims));
