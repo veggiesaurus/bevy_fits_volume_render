@@ -42,6 +42,10 @@ use tokio::{
 
 /// The largest message a client may send: a level's worth of cubelets for a big cube, many times over.
 const MAX_REQUEST: usize = 4 << 20;
+/// Messages that arrive while a file is opening are held until it's open. Once this many are held, or `MAX_HELD_BYTES`
+/// of them, the session stops reading the socket until the open is done, and the client's further messages wait there.
+const MAX_HELD: usize = 1024;
+const MAX_HELD_BYTES: usize = 2 * MAX_REQUEST;
 /// Compressed cubelets kept for every session.
 const CACHE_BYTES: usize = 1 << 30;
 /// A client that doesn't say what it can hold gets the viewer's defaults.
@@ -570,14 +574,22 @@ impl Session {
         deferred: &mut VecDeque<Bytes>,
     ) {
         let out = self.out.clone();
+        let mut held: usize = deferred.iter().map(Bytes::len).sum();
         let gone = {
             let opening = self.open(request_id, open);
             tokio::pin!(opening);
             loop {
+                let full = deferred.len() >= MAX_HELD || held >= MAX_HELD_BYTES;
                 tokio::select! {
+                    biased;
                     () = &mut opening => break None,
-                    message = stream.next() => match message {
-                        Some(Ok(Message::Binary(bytes))) => deferred.push_back(bytes),
+                    message = stream.next(), if !full => match message {
+                        Some(Ok(Message::Binary(bytes))) => {
+                            held += bytes.len();
+                            // Copied, since the message is a slice of the socket's read buffer, and holding the
+                            // slice would keep the whole buffer in memory.
+                            deferred.push_back(Bytes::copy_from_slice(&bytes));
+                        }
                         Some(Ok(Message::Text(text))) if text.as_str() == "PING" => {
                             let _ = out.send(Message::Text("PONG".into()));
                         }
@@ -1071,9 +1083,9 @@ mod tests {
         assert!(session.server.cache().get(&key).is_some());
     }
 
-    #[tokio::test]
-    async fn an_open_waiting_to_read_is_given_up_when_the_client_goes() {
-        let root = std::env::temp_dir().join(format!("fits-server-unit-{}", std::process::id()));
+    /// A root of its own with a small cube in it, and the OPEN_FILE for it.
+    fn root_with_cube(test: &str) -> (PathBuf, Vec<u8>) {
+        let root = std::env::temp_dir().join(format!("fits-server-{test}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let mut bytes: Vec<u8> = [
             "SIMPLE  =                    T",
@@ -1089,16 +1101,21 @@ mod tests {
         .collect();
         bytes.resize(2 * 2880, 0);
         std::fs::write(root.join("cube.fits"), bytes).unwrap();
-        let (mut session, _finished, _outgoing) = session(&root);
-
-        // Another session's read has the only place.
-        let held = session.server.opens.clone().try_acquire_owned().unwrap();
         let open = proto::OpenFile {
             file: "cube.fits".into(),
             file_id: 1,
             ..Default::default()
         };
-        let message = frame(EventType::OpenFile, 0, &open);
+        (root, frame(EventType::OpenFile, 0, &open))
+    }
+
+    #[tokio::test]
+    async fn an_open_waiting_to_read_is_given_up_when_the_client_goes() {
+        let (root, message) = root_with_cube("unit-gone");
+        let (mut session, _finished, _outgoing) = session(&root);
+
+        // Another session's read has the only place.
+        let held = session.server.opens.clone().try_acquire_owned().unwrap();
         let mut gone = futures_util::stream::empty::<Result<Message, axum::Error>>();
         let mut deferred = VecDeque::new();
         let handled = session.handle(&message, &mut gone, &mut deferred);
@@ -1107,6 +1124,35 @@ mod tests {
         assert!(session.closing.is_some() && session.file.is_none());
         drop(held);
         assert_eq!(session.server.opens.available_permits(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_session_stops_reading_while_a_file_opens_once_it_holds_its_limit() {
+        let (root, message) = root_with_cube("unit-held");
+        // Past the message limit, then past the byte limit.
+        for (count, size, holds) in [(MAX_HELD + 1, 8, MAX_HELD), (3, MAX_REQUEST, 2)] {
+            let (mut session, _finished, _outgoing) = session(&root);
+            let permit = session.server.opens.clone().try_acquire_owned().unwrap();
+            let sent = (0..count).map(|_| Ok(Message::Binary(vec![0; size].into())));
+            let mut stream =
+                futures_util::stream::iter(sent).chain(futures_util::stream::pending());
+            let mut deferred = VecDeque::new();
+            {
+                let handled = session.handle(&message, &mut stream, &mut deferred);
+                tokio::pin!(handled);
+                // The open waits for the read permit while the client sends.
+                let waiting = tokio::time::timeout(Duration::from_millis(300), &mut handled);
+                assert!(waiting.await.is_err(), "the open ended early");
+                drop(permit);
+                let handled = tokio::time::timeout(Duration::from_secs(10), handled).await;
+                handled.expect("the open done").unwrap();
+            }
+            assert_eq!(deferred.len(), holds);
+            assert!(session.closing.is_none() && session.file.is_some());
+            // What it didn't read is still there for the session to read next.
+            assert!(matches!(stream.next().await, Some(Ok(Message::Binary(_)))));
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }
