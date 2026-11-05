@@ -95,6 +95,10 @@ pub fn ui(
             egui::CollapsingHeader::new("Mask")
                 .default_open(true)
                 .show(ui, |ui| {
+                    if data.source.is_remote() {
+                        ui.label(modes::REMOTE);
+                        return;
+                    }
                     let sigmas = mask_sigmas.get_or_insert(modes::MASK_SIGMAS);
                     let mut s = settings.clone();
                     if modes::mask_ui(ui, &mut s.modes, sigmas, noise, mask, &unit) {
@@ -266,7 +270,15 @@ fn rendering_section(
     ui.add(
         egui::Slider::new(&mut p.threshold_max, min..=1.0).text(format!("Max ({max_value:.3e})")),
     );
-    modes::ui(ui, p, &mut s.modes, noise, masked, unit);
+    modes::ui(
+        ui,
+        p,
+        &mut s.modes,
+        noise,
+        masked,
+        data.source.is_remote(),
+        unit,
+    );
     ui.add(egui::Slider::new(&mut p.jitter, JITTER).text("Jitter"));
     ui.add(egui::Slider::new(&mut p.max_steps, RAYMARCHING_STEPS).text("Ray-marching steps"));
     z_scale_row(ui, data.info.dims, &mut s.z_scale);

@@ -1,0 +1,3 @@
+[submodule "crates/fits-core/carta-protobuf"]
+	path = crates/fits-core/carta-protobuf
+	url = https://github.com/CARTAvis/carta-protobuf

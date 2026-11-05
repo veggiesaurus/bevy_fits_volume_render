@@ -1,12 +1,44 @@
 //! The viewer's only way to the voxels. Requests go out and their events come back on a later frame, so nothing
 //! else reads the cube. The source is fits-core's engine: natively in-process, its jobs on the async compute pool,
-//! and in the browser in a Web Worker (web.rs). It wakes the app when there's something to collect.
+//! and in the browser in a Web Worker (web.rs); or natively a server (remote.rs). It wakes the app when there's
+//! something to collect.
 
 pub use crate::fits::engine::{CubeletId, Event, Mode, Request};
 #[cfg(target_arch = "wasm32")]
 pub use crate::web::DataSource;
+
 #[cfg(not(target_arch = "wasm32"))]
-pub use local::DataSource;
+pub enum DataSource {
+    Local(local::DataSource),
+    Remote(crate::remote::Source),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DataSource {
+    pub fn local(cube: crate::fits::Cube) -> Self {
+        Self::Local(local::DataSource::local(cube))
+    }
+
+    pub fn send(&self, request: Request) {
+        match self {
+            Self::Local(source) => source.send(request),
+            Self::Remote(source) => source.send(request),
+        }
+    }
+
+    /// The events that have arrived since the last call.
+    pub fn drain(&self) -> Vec<Event> {
+        match self {
+            Self::Local(source) => source.drain(),
+            Self::Remote(source) => source.drain(),
+        }
+    }
+
+    /// A server has no noise measures or masks to give, nor processed cubelets.
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote(_))
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 mod local {

@@ -134,6 +134,17 @@ fn follow_texture(
         extras.channels = Some(channels);
     }
     let (texture, shown) = (state.shown(), shown(&settings, &state));
+    // A server measures nothing, so the noise is the cube's at open scaled to the level shown, with no baseline.
+    if data.source.is_remote() {
+        let noise = data.info.sigma.map(|sigma| Noise {
+            median: 0.0,
+            sigma: (sigma * shown.1.noise_ratio(texture.factors)) as f32,
+        });
+        if extras.noise != noise {
+            extras.noise = noise;
+        }
+        return;
+    }
     if extras.mask.as_ref().is_some_and(|mask| mask.shown != shown) {
         extras.mask = None;
     }
@@ -561,13 +572,15 @@ fn line_planes(line_flux: &[f32]) -> Option<(usize, usize)> {
     Some((from.unwrap_or(0), to))
 }
 
-/// The mode, its sliders, the σ level where it uses one, and the processing. `masked` when a mask is applied.
+/// The mode, its sliders, the σ level where it uses one, and the processing, which a server doesn't do. `masked` when a
+/// mask is applied.
 pub fn ui(
     ui: &mut egui::Ui,
     p: &mut VolumeParams,
     m: &mut ModeSettings,
     noise: Option<Noise>,
     masked: bool,
+    remote: bool,
     unit: &str,
 ) {
     egui::ComboBox::from_label("Rendering mode")
@@ -616,19 +629,26 @@ pub fn ui(
              for the channel colours, attenuation and emission",
         );
     }
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut m.processing.normalise, "Normalise noise")
-            .on_hover_text("Each channel and spectrum scaled to the same noise, as SoFiA-2 does. Changes fluxes");
-        egui::ComboBox::from_label("Smoothing")
-            .selected_text(smoothing_name(m.processing.smoothing))
-            .show_ui(ui, |ui| {
-                for smoothing in [Smoothing::Off, Smoothing::Spectral, Smoothing::Spatial] {
-                    let name = smoothing_name(smoothing);
-                    ui.selectable_value(&mut m.processing.smoothing, smoothing, name);
-                }
-            });
+    let processing = ui.add_enabled_ui(!remote, |ui| {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut m.processing.normalise, "Normalise noise")
+                .on_hover_text("Each channel and spectrum scaled to the same noise, as SoFiA-2 does. Changes fluxes");
+            egui::ComboBox::from_label("Smoothing")
+                .selected_text(smoothing_name(m.processing.smoothing))
+                .show_ui(ui, |ui| {
+                    for smoothing in [Smoothing::Off, Smoothing::Spectral, Smoothing::Spatial] {
+                        let name = smoothing_name(smoothing);
+                        ui.selectable_value(&mut m.processing.smoothing, smoothing, name);
+                    }
+                });
+        });
     });
+    processing.response.on_disabled_hover_text(REMOTE);
 }
+
+/// Why a cube on a server has no processing or mask, and its level goes by the noise at open.
+pub const REMOTE: &str = "Not available for a cube on a server yet, which sends its cubelets unprocessed. Levels in σ \
+    use the cube's noise from when it was opened";
 
 /// The mask's threshold in σ, making it and applying it. True when a mask is asked for.
 pub fn mask_ui(

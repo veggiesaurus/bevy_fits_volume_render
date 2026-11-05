@@ -31,6 +31,19 @@ pub fn levels(dims: [usize; 3], gpu_memory_limit_mb: u64, max_depth: usize) -> L
     }
 }
 
+impl Levels {
+    /// The levels a cube is shown at: the chain, then the overview when it isn't one of them; and which is the
+    /// overview.
+    pub fn list(&self) -> (Vec<[usize; 3]>, usize) {
+        let mut factors = self.chain.clone();
+        let overview = (factors.iter().position(|&f| f == self.overview)).unwrap_or_else(|| {
+            factors.push(self.overview);
+            self.chain.len()
+        });
+        (factors, overview)
+    }
+}
+
 /// A cubelet at its true size, which is smaller than CUBELET³ at the cube's far edges, and its `Cell`.
 #[derive(Debug)]
 pub struct Cubelet {

@@ -33,6 +33,17 @@ pub struct CubeletId {
     pub z: u16,
 }
 
+impl Mode {
+    /// A level's noise over level 0's: 1/√N for a mean level whose voxels each average N, as for independent noise,
+    /// and 1 for a max level, which is no quieter. A tolerance set in units of the noise scales the same way.
+    pub fn noise_ratio(self, factors: [usize; 3]) -> f64 {
+        match self {
+            Mode::Max => 1.0,
+            Mode::Mean => 1.0 / (factors.iter().product::<usize>() as f64).sqrt(),
+        }
+    }
+}
+
 impl CubeletId {
     /// Level 0 is the same in both pyramids, so it always goes as Max.
     pub fn new(mode: Mode, processing: Processing, level: usize, at: [usize; 3]) -> Self {

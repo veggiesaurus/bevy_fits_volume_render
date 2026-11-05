@@ -9,6 +9,8 @@ I'm one of the original authors of [iDaVIE](https://github.com/idia-astro/iDaVIE
 
 ## Running
 
+CARTA's protocol definitions are a submodule, so clone with `--recursive`, or run `git submodule update --init` in a clone.
+
 ```
 cargo run --release -- ~/cubes/m25n512_hicube_gal15.fits
 cargo run --release -- --help
@@ -27,11 +29,21 @@ jitter = 1.0
 threshold_min = 0.0             # where the colour map starts and ends, as fractions of the data range
 threshold_max = 1.0
 z_scale = "cube"                # "cube" (as deep as it's wide), "voxels" (cubic voxels) or a number relative to cubic voxels
+zfp_tolerance_sigmas = 1.0      # how far a server's cubelets may be off, in the cube's noise σ: 0.5, 1 or 2
 ```
 
 The view only redraws on input (and while data is still arriving), so an idle window leaves the GPU alone. Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping keeps the selection, the same as iDaVIE. A crop the texture on screen already holds finely enough is immediate; otherwise it starts from the current view and sharpens as the finer data arrives, and the panel shows the downsampling factors before and after. Every cube comes up the same way, coarse first.
 
 `SCREENSHOT=out.png` saves a frame once rendering has settled and exits, which is handy for side by side comparisons with iDaVIE.
+
+## Server
+
+```
+cargo run --release -p fits-server -- --root ~/cubes
+cargo run --release -- --server 'ws://127.0.0.1:3002/?token=...' [path/under/the/root.fits]
+```
+
+`fits-server` serves the FITS files under `--root` as compressed cubelets, over a subset of CARTA's protocol with messages for volumes added to it (`crates/fits-core/carta-protobuf`, a submodule on carta-protobuf's `angus/volumes` branch). It listens on 127.0.0.1:3002 by default (`--host`, `--port`) and takes its token from `CARTA_AUTH_TOKEN`, or makes one and prints the URL with it. It holds the cube it opens in memory, as the viewer does. The viewer's Server panel lists the folders and cubes under the root and opens one, or a path after the URL opens it straight away. Cubelets come within 0.5, 1 or 2σ of the cube's noise (1σ by default), and the mean pyramid's coarser levels within the same share of their own, lower, noise. The statistics, histogram and cursor values are exact. Masks, noise normalisation and smoothing aren't served yet, and only the native viewer connects for now.
 
 ## Browser
 

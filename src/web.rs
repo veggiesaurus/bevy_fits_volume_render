@@ -10,17 +10,13 @@ use js_sys::{ArrayBuffer, Float32Array, Function, Uint8Array};
 use wasm_bindgen::{JsValue, prelude::wasm_bindgen};
 
 use crate::{
-    Dataset, DatasetEntity,
-    axes::AxisAnnotation,
-    config,
+    Dataset, DatasetEntity, config,
     fits::{
         FileInfo,
         wire::{self, Wire},
     },
-    shape::BoxShape,
     source::{Event, Request},
     upload::Upsamples,
-    view::CubeState,
     wake,
 };
 
@@ -49,6 +45,10 @@ impl DataSource {
             }
             None => error!("No worker to post to"),
         });
+    }
+
+    pub fn is_remote(&self) -> bool {
+        false
     }
 
     pub fn drain(&self) -> Vec<Event> {
@@ -138,16 +138,7 @@ pub fn poll(
 ) {
     match PENDING.lock().unwrap().take() {
         Some(Some(dataset)) => commands.insert_resource(dataset),
-        Some(None) => {
-            for entity in &old {
-                commands.entity(entity).despawn();
-            }
-            upsamples.0.clear();
-            commands.remove_resource::<Dataset>();
-            commands.remove_resource::<CubeState>();
-            commands.remove_resource::<AxisAnnotation>();
-            commands.remove_resource::<BoxShape>();
-        }
+        Some(None) => crate::clear_dataset(&mut commands, &old, &mut upsamples),
         None => {}
     }
 }

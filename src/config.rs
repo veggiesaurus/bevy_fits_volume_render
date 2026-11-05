@@ -17,6 +17,8 @@ pub struct Config {
     pub threshold_min: f32,
     pub threshold_max: f32,
     pub z_scale: ZScale,
+    /// What a server's cubelets may be off by, in units of the cube's noise σ: one of `TOLERANCES`.
+    pub zfp_tolerance_sigmas: f64,
     /// Gone, now that each projection mode reads its own pyramid, but still read so that older files parse.
     #[serde(skip_serializing)]
     max_mode_downsampling: serde::de::IgnoredAny,
@@ -33,6 +35,7 @@ impl Default for Config {
             threshold_min: 0.0,
             threshold_max: 1.0,
             z_scale: ZScale::Cube,
+            zfp_tolerance_sigmas: 1.0,
             max_mode_downsampling: serde::de::IgnoredAny,
         }
     }
@@ -87,6 +90,8 @@ pub const COLOR_MAPS: [&str; 80] = [
     "RdBu", "RdGy", "RdPu", "RdYlBu", "RdYlGn", "Reds", "Seismic", "Set1", "Set2", "Set3", "Spectral", "Spring", "Summer", "Tab10", "Tab20",
     "Tab20B", "Tab20C", "Terrain", "Viridis", "Winter", "Wistia", "YlGn", "YlGnBu", "YlOrBr", "YlOrRd", "Turbo",
 ];
+/// The zfp tolerances a server's cubelets can come at, in σ.
+pub const TOLERANCES: [f64; 3] = [0.5, 1.0, 2.0];
 pub const SCALING_TYPES: [&str; 7] = ["Linear", "Log", "Sqrt", "Square", "Power", "Gamma", "Asinh"];
 /// The index of Gamma in `SCALING_TYPES`, as volume.wesl's GAMMA.
 pub const GAMMA: u32 = 5;
@@ -175,6 +180,12 @@ pub fn from_toml(text: Option<&str>, overrides: &[(String, String)]) -> Result<C
             "threshold_min and threshold_max must satisfy 0 <= min <= max <= 1, got {min} and {max}"
         ));
     }
+    if !TOLERANCES.contains(&config.zfp_tolerance_sigmas) {
+        return Err(format!(
+            "zfp_tolerance_sigmas must be one of {TOLERANCES:?}, got {}",
+            config.zfp_tolerance_sigmas
+        ));
+    }
     if config.gpu_memory_limit_mb == 0 {
         return Err("gpu_memory_limit_mb must be > 0".into());
     }
@@ -220,7 +231,9 @@ pub fn load(path: &Path, overrides: &[(String, String)]) -> Result<Config, Strin
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct Args {
-    pub file: PathBuf,
+    /// A local file, or with `server` a path under the server's root.
+    pub file: Option<PathBuf>,
+    pub server: Option<String>,
     pub config: Option<PathBuf>,
     pub hdu: Option<usize>,
     pub overrides: Vec<(String, String)>,
@@ -231,6 +244,10 @@ pub const USAGE: &str = concat!(
     "usage: ",
     env!("CARGO_PKG_NAME"),
     " [--config PATH] [--hdu N] [--<config-key> VALUE]... CUBE.fits\n",
+    "       ",
+    env!("CARGO_PKG_NAME"),
+    " --server URL [OPTIONS]... [PATH]\n",
+    "  --server URL        a fits-server's ws://host:port/?token=... URL, to browse its files or open PATH under its root\n",
     "  --config PATH       config file (default: $XDG_CONFIG_HOME/idavie-bevy/config.toml)\n",
     "  --hdu N             HDU index, 0 = primary (default: first image with NAXIS >= 3)\n",
     "  --<config-key> V    override any config key, e.g. --gpu-memory-limit-mb 512"
@@ -240,6 +257,7 @@ pub const USAGE: &str = concat!(
 #[cfg(not(target_arch = "wasm32"))]
 pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     let (mut file, mut config, mut hdu, mut overrides) = (None, None, None, Vec::new());
+    let mut server = None;
     while let Some(arg) = args.next() {
         if arg == "-h" || arg == "--help" {
             return Ok(None);
@@ -255,12 +273,17 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>
             .ok_or_else(|| format!("--{key} needs a value\n{USAGE}"))?;
         match key {
             "config" => config = Some(PathBuf::from(value)),
+            "server" => server = Some(value),
             "hdu" => hdu = Some(crate::fits::parse_hdu(&value)?),
             _ => overrides.push((key.to_string(), value)),
         }
     }
+    if file.is_none() && server.is_none() {
+        return Err(USAGE.into());
+    }
     Ok(Some(Args {
-        file: file.ok_or(USAGE)?,
+        file,
+        server,
         config,
         hdu,
         overrides,

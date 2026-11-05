@@ -2,10 +2,12 @@
 name = "bevy_fits_volume_render"
 version = "0.1.0"
 edition = "2024"
+# fits-server is a default member with a binary too.
+default-run = "bevy_fits_volume_render"
 
 [workspace]
-members = ["crates/fits-core", "crates/fits-worker"]
-default-members = [".", "crates/fits-core"]
+members = ["crates/fits-core", "crates/fits-server", "crates/fits-worker"]
+default-members = [".", "crates/fits-core", "crates/fits-server"]
 # Agents' git worktrees, so that cargo doesn't take them for members of this one.
 exclude = [".claude"]
 

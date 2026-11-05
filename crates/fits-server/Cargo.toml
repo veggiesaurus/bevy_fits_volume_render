@@ -1,0 +1,17 @@
+[package]
+name = "fits-server"
+version = "0.1.0"
+edition = "2024"
+
+# FITS cubes under a root folder, served to the viewer as cubelets over CARTA's protocol.
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
+fits-core = { path = "../fits-core" }
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"] }
+getrandom = "0.3"
+prost = "0.14"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time"] }
+tungstenite = "0.29"

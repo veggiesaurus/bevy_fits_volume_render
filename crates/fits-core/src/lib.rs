@@ -5,8 +5,11 @@ use bevy_tasks::{ComputeTaskPool, TaskPool};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_tasks::{ParallelSlice, ParallelSliceMut};
 
+pub mod carta;
+pub mod codec;
 mod cubelet;
 pub mod engine;
+pub mod remote;
 pub mod wire;
 pub use cubelet::{
     CUBELET, Cell, Cubelet, Level, Levels, Voxels, cubelet, cubelet_region, grow, levels,
@@ -128,6 +131,15 @@ pub struct FileInfo {
 }
 
 impl FileInfo {
+    pub fn header(&self) -> ImageHeader {
+        ImageHeader {
+            hdu: self.hdu,
+            cards: self.cards.clone(),
+            dims: self.dims,
+            axes: self.axes,
+        }
+    }
+
     /// The data unit from BUNIT, e.g. "Jy/beam" (or CASA's "beam-1 Jy").
     pub fn unit(&self) -> Option<String> {
         Some(value(&self.cards, "BUNIT")?.trim_start().to_string()).filter(|u| !u.is_empty())
@@ -171,6 +183,59 @@ pub fn parse_hdu(value: &str) -> Result<usize, String> {
 }
 
 pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Cube, String> {
+    let image = find_image(source, hdu)?;
+    let (data, stats, histogram) = read_data(
+        source,
+        image.offset,
+        &image.header.cards,
+        image.bitpix,
+        image.width,
+        image.len,
+    )?;
+    let header = image.header;
+    let mut cube = Cube {
+        info: FileInfo {
+            dims: header.dims,
+            axes: header.axes,
+            cards: header.cards,
+            hdu: header.hdu,
+            stats,
+            histogram,
+            sigma: None,
+        },
+        data,
+    };
+    cube.info.sigma = cube.sigma();
+    Ok(cube)
+}
+
+/// What `read_fits` reads of an image's header.
+#[derive(Clone, Debug)]
+pub struct ImageHeader {
+    pub hdu: usize,
+    pub cards: Vec<String>,
+    pub dims: [usize; 3],
+    pub axes: [usize; 3],
+}
+
+/// The header of the image `read_fits` would read, without reading its data.
+pub fn read_image_header<S: Source + ?Sized>(
+    source: &S,
+    hdu: Option<usize>,
+) -> Result<ImageHeader, String> {
+    find_image(source, hdu).map(|image| image.header)
+}
+
+/// An image's header and where its data is.
+struct Image {
+    header: ImageHeader,
+    bitpix: i64,
+    width: usize,
+    len: usize,
+    offset: u64,
+}
+
+fn find_image<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Image, String> {
     let size = source.size().map_err(|e| e.to_string())?;
     let (mut index, mut offset) = (0, 0);
     let (mut primary, mut compressed): (Vec<String>, _) = (Vec::new(), None);
@@ -188,10 +253,8 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
             });
         };
         let bitpix: i64 = num(&cards, "BITPIX")?.ok_or("missing BITPIX")?;
-        let naxis: u64 = num(&cards, "NAXIS")?.ok_or("missing NAXIS")?;
-        let axes = (1..=naxis)
-            .map(|i| num::<u64>(&cards, &format!("NAXIS{i}"))?.ok_or(format!("missing NAXIS{i}")))
-            .collect::<Result<Vec<_>, _>>()?;
+        let axes = axis_lengths(&cards)?;
+        let naxis = axes.len();
         if ![8, 16, 32, 64, -32, -64].contains(&bitpix) {
             return Err(format!("HDU {index}: unsupported BITPIX {bitpix}"));
         }
@@ -212,13 +275,7 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
                     false => format!("HDU {index} is not an image with two or more non-empty axes"),
                 });
             }
-            let picked = pick_axes(&axes);
-            let lengths = picked.map(|a| axes.get(a).copied().unwrap_or(1));
-            let len = checked_product(&lengths)
-                .and_then(|n| usize::try_from(n).ok())
-                .ok_or(format!("HDU {index}: image too large"))?;
-            // Each axis is at most `len`, which fits.
-            let dims = lengths.map(|n| n as usize);
+            let (dims, picked, len) = shown_axes(&axes).map_err(|e| format!("HDU {index}: {e}"))?;
             // Checked before allocating, so a header can't claim more memory than its file backs.
             if (len as u64)
                 .checked_mul(width)
@@ -238,22 +295,18 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
                         && !commentary.contains(&key)
                 }));
             }
-            let (data, stats, histogram) =
-                read_data(source, offset, &cards, bitpix, width as usize, len)?;
-            let mut cube = Cube {
-                info: FileInfo {
+            return Ok(Image {
+                header: ImageHeader {
+                    hdu: index,
+                    cards,
                     dims,
                     axes: picked,
-                    cards,
-                    hdu: index,
-                    stats,
-                    histogram,
-                    sigma: None,
                 },
-                data,
-            };
-            cube.info.sigma = cube.sigma();
-            return Ok(cube);
+                bitpix,
+                width: width as usize,
+                len,
+                offset,
+            });
         }
 
         let pcount: u64 = num(&cards, "PCOUNT")?.unwrap_or(0);
@@ -283,6 +336,27 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
 
 /// The first three axes longer than 1, then length-1 axes, then ones past NAXIS. Leaving out length-1 axes
 /// keeps the first x * y * z values in order, so CASA's RA, DEC, STOKES(1), FREQ loads every channel.
+/// NAXISn for each of an image's NAXIS axes, of which FITS allows 999.
+fn axis_lengths(cards: &[String]) -> Result<Vec<u64>, String> {
+    let naxis: u64 = num(cards, "NAXIS")?
+        .filter(|&n| n <= 999)
+        .ok_or("missing NAXIS")?;
+    (1..=naxis)
+        .map(|i| num::<u64>(cards, &format!("NAXIS{i}"))?.ok_or(format!("missing NAXIS{i}")))
+        .collect()
+}
+
+/// The dims of the axes shown, which axes they are, and their voxels, which fit in memory.
+fn shown_axes(lengths: &[u64]) -> Result<([usize; 3], [usize; 3], usize), String> {
+    let picked = pick_axes(lengths);
+    let shown = picked.map(|a| lengths.get(a).copied().unwrap_or(1));
+    let len = checked_product(&shown)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or("image too large")?;
+    // Each axis is at most `len`, which fits.
+    Ok((shown.map(|n| n as usize), picked, len))
+}
+
 fn pick_axes(lengths: &[u64]) -> [usize; 3] {
     let n = lengths.len();
     let mut picked = (0..n)

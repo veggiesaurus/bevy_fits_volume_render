@@ -34,15 +34,9 @@ pub struct Levels {
 
 impl Levels {
     pub fn new(dims: [usize; 3], gpu_memory_limit_mb: u64, max_depth: usize) -> Self {
-        let fits::Levels {
-            chain: mut factors,
-            overview,
-        } = fits::levels(dims, gpu_memory_limit_mb, max_depth);
-        let chain = factors.len();
-        let overview = (factors.iter().position(|&f| f == overview)).unwrap_or_else(|| {
-            factors.push(overview);
-            chain
-        });
+        let levels = fits::levels(dims, gpu_memory_limit_mb, max_depth);
+        let chain = levels.chain.len();
+        let (factors, overview) = levels.list();
         Self {
             factors,
             chain,

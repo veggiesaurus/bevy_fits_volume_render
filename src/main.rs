@@ -4,6 +4,8 @@ mod config;
 mod grips;
 mod modes;
 mod outline;
+#[cfg(not(target_arch = "wasm32"))]
+mod remote;
 mod selection;
 mod shape;
 mod source;
@@ -165,9 +167,9 @@ impl Settings {
 #[derive(Component)]
 struct DatasetEntity;
 
-fn main() {
+fn main() -> AppExit {
     #[cfg(not(target_arch = "wasm32"))]
-    let dataset = load_native();
+    let start = load_native();
 
     let mut app = App::new();
     app.add_plugins(
@@ -267,7 +269,17 @@ fn main() {
     app.add_systems(PreUpdate, web::poll);
     #[cfg(not(target_arch = "wasm32"))]
     {
-        app.insert_resource(dataset);
+        app.add_systems(Last, log_view.run_if(resource_exists::<Dataset>));
+        match start {
+            Start::Local(dataset) => {
+                app.insert_resource(dataset);
+            }
+            Start::Remote(remote) => {
+                app.insert_resource(remote)
+                    .add_systems(PreUpdate, remote::poll.before(receive))
+                    .add_systems(EguiPrimaryContextPass, remote::browser);
+            }
+        }
         if let Ok(path) = std::env::var("SCREENSHOT") {
             // Frames count from when the view is in, however long the source took to cut it.
             let settled = |state: Option<Res<CubeState>>, uploads: Res<Uploads>| {
@@ -277,7 +289,7 @@ fn main() {
         }
     }
 
-    app.run();
+    app.run()
 }
 
 /// Takes what the data source has sent since the last frame. Only `view::refine` marks the state changed, once a
@@ -323,25 +335,84 @@ fn keep_redrawing(
     }
 }
 
-/// `SCREENSHOT=out.png` saves the window once rendering has settled, then exits.
+/// When the view of a cube is first drawn and when it's all in, counted from when the open began, which for a local
+/// file is when it began to be read.
 #[cfg(not(target_arch = "wasm32"))]
-fn screenshot_and_exit(path: String) -> impl FnMut(Commands, Local<u32>, MessageWriter<AppExit>) {
+fn log_view(
+    data: Res<Dataset>,
+    state: Option<Res<CubeState>>,
+    uploads: Res<Uploads>,
+    mut since: Local<Option<(Instant, bool)>>,
+) {
+    if data.is_changed() {
+        *since = Some((
+            Instant::now() - Duration::from_secs_f32(data.load_seconds),
+            false,
+        ));
+    }
+    let (Some(state), Some((start, drawn))) = (state, since.as_mut()) else {
+        return;
+    };
+    let seconds = start.elapsed().as_secs_f32();
+    if !*drawn && state.shown().drawable() {
+        *drawn = true;
+        info!(
+            "{}: first drawn {seconds:.2} s after the open began",
+            data.name
+        );
+    }
+    let texture = state.shown();
+    if *drawn
+        && state.settled(&uploads)
+        && state
+            .levels
+            .shows(texture.level, texture.texels, state.visible)
+    {
+        let [x, y, z] = texture.factors;
+        info!(
+            "{}: all in at {x} x {y} x {z}, {seconds:.2} s after the open began",
+            data.name
+        );
+        *since = None;
+    }
+}
+
+/// Frames since rendering settled, and when the 30th was.
+#[cfg(not(target_arch = "wasm32"))]
+type Frames<'a> = Local<'a, (u32, Option<Instant>)>;
+
+/// `SCREENSHOT=out.png` saves the window once rendering has settled, logs the frame time after it, then exits.
+#[cfg(not(target_arch = "wasm32"))]
+fn screenshot_and_exit(path: String) -> impl FnMut(Commands, Frames<'_>, MessageWriter<AppExit>) {
     use bevy::render::view::screenshot::{Screenshot, save_to_disk};
     move |mut commands, mut frames, mut exit| {
+        let (frames, since) = &mut *frames;
         *frames += 1;
+        if *frames == 30 {
+            *since = Some(Instant::now());
+        }
         if *frames == 60 {
             commands
                 .spawn(Screenshot::primary_window())
                 .observe(save_to_disk(path.clone()));
         }
         if *frames == 90 {
+            let ms = since.map_or(0.0, |since| since.elapsed().as_secs_f32() * 1000.0 / 60.0);
+            info!("Frame time {ms:.2} ms over the 60 frames from the 30th after settling");
             exit.write(AppExit::Success);
         }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn load_native() -> Dataset {
+#[allow(clippy::large_enum_variant, reason = "made once, at start")]
+enum Start {
+    Local(Dataset),
+    Remote(remote::Remote),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_native() -> Start {
     fn fail(msg: impl std::fmt::Display) -> ! {
         eprintln!("{msg}");
         std::process::exit(1)
@@ -367,24 +438,29 @@ fn load_native() -> Dataset {
     let config = config::load(&config_path, &args.overrides)
         .unwrap_or_else(|e| fail(format!("{}: {e}", config_path.display())));
 
+    // Printed, since logging only starts with the app.
+    println!("Config: {}", config_path.display());
+    if let Some(url) = args.server {
+        let path = args.file.map(|path| path.to_string_lossy().into_owned());
+        return Start::Remote(remote::Remote::connect(url, config, path, args.hdu));
+    }
+    let path = args.file.expect("a file without a server");
     // Bevy's own task pools, made before the app so loading doesn't leave it a differently sized one.
     bevy::app::TaskPoolOptions::default().create_default_pools();
     let start = Instant::now();
-    let file = std::fs::File::open(&args.file)
-        .unwrap_or_else(|e| fail(format!("{}: {e}", args.file.display())));
+    let file =
+        std::fs::File::open(&path).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
     let cube = fits::read_fits(&file, args.hdu)
-        .unwrap_or_else(|e| fail(format!("{}: {e}", args.file.display())));
-    let name = args.file.file_name().map_or_else(
-        || args.file.display().to_string(),
+        .unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
     let info = cube.info.clone();
     let seconds = start.elapsed().as_secs_f32();
     let dataset = Dataset::new(name, info, DataSource::local(cube), config, seconds);
-    // Printed, since logging only starts with the app.
-    println!("Config: {}", config_path.display());
     println!("{}", dataset.summary());
-    dataset
+    Start::Local(dataset)
 }
 
 /// Object-space box of a voxel region, as iDaVIE's CropToRegion and highlight bounds compute it.
@@ -393,6 +469,28 @@ fn region_bounds(region: Region, dims: [usize; 3]) -> (Vec3, Vec3) {
     let min = Vec3::from_array(region.min.map(|v| v as f32));
     let max = Vec3::from_array(region.max.map(|v| v as f32));
     (min / dims - 0.5, (max + 1.0) / dims - 0.5)
+}
+
+/// The most layers a volume texture may have: the device's limit, and iDaVIE's 2048 at most. A server is told it, so
+/// that its levels are the ones `spawn_volume` makes.
+pub fn max_depth(device: &RenderDevice) -> usize {
+    device.limits().max_texture_array_layers.min(2048) as usize
+}
+
+/// The cube shown goes, for when nothing answers for it any more.
+fn clear_dataset(
+    commands: &mut Commands,
+    old: &Query<Entity, With<DatasetEntity>>,
+    upsamples: &mut Upsamples,
+) {
+    for entity in old {
+        commands.entity(entity).despawn();
+    }
+    upsamples.0.clear();
+    commands.remove_resource::<Dataset>();
+    commands.remove_resource::<CubeState>();
+    commands.remove_resource::<AxisAnnotation>();
+    commands.remove_resource::<BoxShape>();
 }
 
 /// The whole cube starts as the coarsest level's one cubelet, which the source can cut at once, and `view::refine`
@@ -416,9 +514,7 @@ fn spawn_volume(
     // The old cube's requests went with its source, but an upsample still to run would keep its texture forever.
     upsamples.0.clear();
     let dims = data.info.dims;
-    // iDaVIE's 2048 layers at most.
-    let layers = device.limits().max_texture_array_layers.min(2048) as usize;
-    let levels = Levels::new(dims, data.config.gpu_memory_limit_mb, layers);
+    let levels = Levels::new(dims, data.config.gpu_memory_limit_mb, max_depth(&device));
     data.source.send(Request::Levels {
         factors: levels.factors.clone(),
         chain: levels.chain,
