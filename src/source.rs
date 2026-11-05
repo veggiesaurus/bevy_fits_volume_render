@@ -1,20 +1,22 @@
 //! The viewer's only way to the voxels. Requests go out and their events come back on a later frame, so nothing
 //! else reads the cube. The source is fits-core's engine: natively in-process, its jobs on the async compute pool,
-//! and in the browser in a Web Worker (web.rs); or natively a server (remote.rs). It wakes the app when there's
-//! something to collect.
+//! and in the browser in a Web Worker (web.rs); or a server (remote.rs). It wakes the app when there's something to
+//! collect.
 
 pub use crate::fits::engine::{CubeletId, Event, Mode, Request};
 #[cfg(target_arch = "wasm32")]
-pub use crate::web::DataSource;
-
+use crate::web::WorkerSource as LocalSource;
 #[cfg(not(target_arch = "wasm32"))]
+use local::DataSource as LocalSource;
+
 pub enum DataSource {
-    Local(local::DataSource),
+    /// A file read here, or in the browser by its worker.
+    Local(LocalSource),
     Remote(crate::remote::Source),
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl DataSource {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn local(cube: crate::fits::Cube) -> Self {
         Self::Local(local::DataSource::local(cube))
     }

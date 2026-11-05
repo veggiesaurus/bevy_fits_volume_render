@@ -36,12 +36,23 @@
   <div id="status" role="status">Starting</div>
 </div>
 <script type="module">
-import init, { clear, connect, opened, receive } from "./pkg/bevy_fits_volume_render.js";
+import init, { clear, connect, opened, pick, receive, receive_remote, server, server_lost } from "./pkg/bevy_fits_volume_render.js";
+
+// A fits-server's token comes after the #, which isn't sent with requests, and it's taken out of the address bar at
+// once so that it isn't kept in the history either. The viewer sends it to the server in its first message. It's
+// taken as it is, without decoding, as the server compares a token in a URL.
+const token = /(?:^#|&)token=([^&]*)/.exec(location.hash)?.[1] ?? "";
+if (location.hash) history.replaceState(null, "", location.pathname + location.search);
 
 const status = document.getElementById("status");
 const picker = document.getElementById("picker");
 const canvas = document.getElementById("bevy");
 const params = new URLSearchParams(location.search);
+// ?server=host:port opens the server panel, and &path= a cube under its root.
+const serverUrl = params.get("server")?.replace(/^(?!wss?:\/\/)/, "ws://");
+const path = params.get("path");
+// These aren't config keys. A token is only read from after the #.
+for (const key of ["server", "path", "token"]) params.delete(key);
 // "host.example/path/cube.fits" with no scheme means https; anything else is relative to the page.
 const file = params.get("file")?.replace(/^(?![a-z][a-z0-9+.-]*:|\/)([^/]+\.[^/]+\/)/i, "https://$1");
 params.delete("file");
@@ -49,6 +60,9 @@ const hdu = params.get("hdu");
 params.delete("hdu");
 const overrides = [...params].map(([k, v]) => `${k}=${v}`).join("\n");
 const mb = n => `${(n / 1e6).toFixed(1)} MB`;
+
+// Whether the viewer has started: the worker can fail before it has.
+let started = false;
 
 // The file goes to a Web Worker, which reads it and serves the viewer's requests off this thread. After a failure
 // its state can't be trusted, so the next load starts another.
@@ -64,6 +78,7 @@ function failed(message) {
   worker.terminate();
   worker = null;
   workerHolds(undefined);
+  if (started) server_lost(`the data worker failed: ${message}`);
   status.textContent = `The data worker failed: ${message}`;
 }
 
@@ -81,7 +96,7 @@ function workerHolds(load) {
 let latest = { id: 0 };
 
 function load(name, source) {
-  latest = { id: latest.id + 1, name };
+  latest = { id: latest.id + 1, name, pick: pick() };
   worker ??= startWorker();
   status.textContent = `Loading ${name}`;
   worker.postMessage({ load: latest.id, source, hdu });
@@ -89,6 +104,7 @@ function load(name, source) {
 
 function fromWorker(data) {
   if (data instanceof ArrayBuffer) return receive(data);
+  if (data.remote) return receive_remote(data.remote);
   if (data.failed) return failed(data.failed);
   if (data.load !== latest.id) return;
   const { name } = latest;
@@ -99,7 +115,7 @@ function fromWorker(data) {
   } else {
     try {
       if (data.error) throw new Error(data.error);
-      opened(data.load, name, data.info, data.seconds, config, overrides);
+      opened(data.load, name, data.info, data.seconds, config, overrides, latest.pick);
       shown = data.load;
       canvas.focus();
       status.textContent = name;
@@ -134,11 +150,25 @@ try {
     throw e;
   }
 }
-// Without a worker this throws, which the viewer logs.
-connect(message => worker.postMessage(message, [message]));
+// Without a worker posting throws, which the viewer logs. A server's messages go as { remote }.
+connect(
+  (message, remote) => worker.postMessage(remote ? { remote: message } : message, [message]),
+  (url, token, id) => (worker ??= startWorker()).postMessage({ server: url, token, id }),
+  (load) => worker?.postMessage({ release: load }),
+);
+started = true;
+let problem;
+if (serverUrl) {
+  try {
+    server(serverUrl, token, path, hdu, config, overrides);
+  } catch (e) {
+    problem = `Could not open the server panel: ${e.message ?? e}`;
+  }
+}
 
 // Unless the worker failed while this started.
-if (worker) status.textContent = "Open a FITS file";
+if (problem) status.textContent = problem;
+else if (worker) status.textContent = "Open a FITS file";
 picker.disabled = false;
 // winit doesn't take focus on a drag, and keys (shift-drag, C, R, Esc) only reach the focused canvas.
 canvas.addEventListener("pointerdown", () => canvas.focus());

@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
-    time::{Instant, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use axum::{
@@ -42,6 +42,8 @@ use tokio::{
 
 /// The largest message a client may send: a level's worth of cubelets for a big cube, many times over.
 const MAX_REQUEST: usize = 4 << 20;
+/// How long a client has to register, since one without a token in the request can connect.
+const REGISTER_WITHIN: Duration = Duration::from_secs(10);
 /// Messages that arrive while a file is opening are held until it's open. Once this many are held, or `MAX_HELD_BYTES`
 /// of them, the session stops reading the socket until the open is done, and the client's further messages wait there.
 const MAX_HELD: usize = 1024;
@@ -69,6 +71,9 @@ struct Server {
 /// Serves the cubes under `root` until the listener fails. A client connects to `/` with `token` as `?token=`, as
 /// `Authorization: Bearer`, or in the `carta-auth-token` header.
 pub async fn serve(listener: TcpListener, root: &Path, token: String) -> std::io::Result<()> {
+    if token.is_empty() {
+        return Err(std::io::Error::other("an empty token would let anyone in"));
+    }
     let server = Arc::new(Server {
         root: root.canonicalize()?,
         token,
@@ -81,36 +86,39 @@ pub async fn serve(listener: TcpListener, root: &Path, token: String) -> std::io
     axum::serve(listener, app).await
 }
 
-/// The token first, before the request is looked at as a WebSocket upgrade.
+/// A client gives the token in the request, or else as REGISTER_VIEWER's api_key once it's connected, since a browser
+/// can't set headers and a URL can end up in its console. A wrong token in the request is refused at once.
 async fn upgrade(
     State(server): State<Arc<Server>>,
     headers: HeaderMap,
     uri: Uri,
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Response {
-    if !authorised(&server.token, &uri, &headers) {
+    let given = given_tokens(&uri, &headers);
+    let authorised = (given.iter()).any(|given| same(given.as_bytes(), server.token.as_bytes()));
+    if !given.is_empty() && !authorised {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match upgrade {
         Ok(upgrade) => upgrade
             .max_message_size(MAX_REQUEST)
             .max_frame_size(MAX_REQUEST)
-            .on_upgrade(move |socket| run(server, socket)),
+            .on_upgrade(move |socket| run(server, socket, authorised)),
         Err(rejection) => rejection.into_response(),
     }
 }
 
-fn authorised(token: &str, uri: &Uri, headers: &HeaderMap) -> bool {
+/// The tokens in the request, as `?token=`, `Authorization: Bearer` or `carta-auth-token`, any of which may match.
+fn given_tokens<'a>(uri: &'a Uri, headers: &'a HeaderMap) -> Vec<&'a str> {
     let query = (uri.query().into_iter())
         .flat_map(|query| query.split('&'))
         .find_map(|pair| pair.strip_prefix("token="));
     let header = |name| headers.get(name).and_then(|value| value.to_str().ok());
     let bearer = header("authorization").and_then(|value| value.strip_prefix("Bearer "));
-    let given = [query, bearer, header("carta-auth-token")];
-    given
+    [query, bearer, header("carta-auth-token")]
         .into_iter()
         .flatten()
-        .any(|given| same(given.as_bytes(), token.as_bytes()))
+        .collect()
 }
 
 /// In time that depends only on the lengths.
@@ -336,6 +344,8 @@ fn cubelet_frame(file_id: i32, id: CubeletId, payload: &[u8]) -> Vec<u8> {
 struct Session {
     server: Arc<Server>,
     id: u32,
+    /// Whether the request carried the right token, so that REGISTER_VIEWER needn't.
+    authorised: bool,
     registered: bool,
     file: Option<Open>,
     /// Jobs out, for this file or one before it.
@@ -397,7 +407,7 @@ struct Done {
     cubelets: Result<Vec<(CubeletId, Payload)>, String>,
 }
 
-async fn run(server: Arc<Server>, socket: WebSocket) {
+async fn run(server: Arc<Server>, socket: WebSocket, authorised: bool) {
     let id = server.sessions.fetch_add(1, Ordering::Relaxed) + 1;
     let (mut sink, mut stream) = socket.split();
     let (out, mut outgoing) = mpsc::unbounded_channel();
@@ -413,6 +423,7 @@ async fn run(server: Arc<Server>, socket: WebSocket) {
     let mut session = Session {
         server,
         id,
+        authorised,
         registered: false,
         file: None,
         jobs: Vec::new(),
@@ -423,6 +434,8 @@ async fn run(server: Arc<Server>, socket: WebSocket) {
     println!("Session {id}: connected");
     // What came in while a file was opening, to be handled after it in turn.
     let mut deferred: VecDeque<Bytes> = VecDeque::new();
+    let deadline = tokio::time::sleep(REGISTER_WITHIN);
+    tokio::pin!(deadline);
     let reason = loop {
         session.start_jobs();
         let handled = match deferred.pop_front() {
@@ -443,6 +456,9 @@ async fn run(server: Arc<Server>, socket: WebSocket) {
                 Some(done) = finished.recv() => {
                     session.finished(done);
                     Ok(())
+                }
+                () = &mut deadline, if !session.registered => {
+                    break "no REGISTER_VIEWER in time".to_string();
                 }
             },
         };
@@ -529,28 +545,39 @@ impl Session {
     }
 
     fn register(&mut self, message: &Frame) -> Result<(), String> {
-        let _: proto::RegisterViewer = message.decode()?;
-        let success = message.icd_version == ICD_VERSION;
+        let register: proto::RegisterViewer = message.decode()?;
+        let token = self.server.token.as_bytes();
+        let authorised = self.authorised
+            || (!register.api_key.is_empty() && same(register.api_key.as_bytes(), token));
+        let success = authorised && message.icd_version == ICD_VERSION;
         let flags =
             proto::ServerFeatureFlags::ReadOnly as u32 | proto::ServerFeatureFlags::Volumes as u32;
         let ack = proto::RegisterViewerAck {
             session_id: self.id,
             success,
-            message: match success {
-                true => String::new(),
-                false => format!(
+            message: match (authorised, success) {
+                (false, _) => "Invalid token".into(),
+                (true, true) => String::new(),
+                (true, false) => format!(
                     "Invalid ICD version number. Expected {ICD_VERSION}, got {}",
                     message.icd_version
                 ),
             },
             session_type: proto::SessionType::New.into(),
-            server_feature_flags: flags,
-            platform_strings: [(
-                "server".into(),
-                format!("fits-server {}", env!("CARGO_PKG_VERSION")),
-            )]
-            .into(),
             ..Default::default()
+        };
+        // A client without the token isn't told anything about the server.
+        let ack = match authorised {
+            true => proto::RegisterViewerAck {
+                server_feature_flags: flags,
+                platform_strings: [(
+                    "server".into(),
+                    format!("fits-server {}", env!("CARGO_PKG_VERSION")),
+                )]
+                .into(),
+                ..ack
+            },
+            false => ack,
         };
         self.registered |= success;
         if !success {
@@ -1031,6 +1058,7 @@ mod tests {
         let session = Session {
             server,
             id: 1,
+            authorised: true,
             registered: true,
             file: None,
             jobs: Vec::new(),

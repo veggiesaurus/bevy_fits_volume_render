@@ -1,10 +1,11 @@
-//! The data source's messages as bytes, for postMessage between the viewer and its worker. A message is a header of
-//! little-endian fields, its length first and padded to a whole f32, then a cubelet's voxels if it carries some, so
-//! that the receiver can copy those straight into a vector of their own.
+//! The data source's messages, and those of a connection to a server, as bytes for postMessage between the viewer
+//! and its worker. A message is a header of little-endian fields, its length first and padded to a whole f32, then a
+//! cubelet's voxels if it carries some, so that the receiver can copy those straight into a vector of their own.
 
 use crate::{
     Cell, Cubelet, FileInfo, Histogram, Noise, Processing, Region, Smoothing, Stats, Voxels,
     engine::{CubeletId, Event, Mode, Request},
+    remote::{Budget, Command, Listing, Opened, Received},
 };
 
 pub trait Wire: Sized {
@@ -88,7 +89,7 @@ macro_rules! numbers {
         }
     )*};
 }
-numbers!(u8, u16, u32, u64, f32, f64);
+numbers!(u8, u16, u32, u64, i32, f32, f64);
 
 impl Wire for usize {
     fn write(&self, w: &mut Writer) {
@@ -525,6 +526,211 @@ impl Wire for FileInfo {
     }
 }
 
+impl Wire for Budget {
+    fn write(&self, w: &mut Writer) {
+        self.gpu_memory_limit_mb.write(w);
+        self.max_depth.write(w);
+    }
+
+    fn read(r: &mut Reader) -> Option<Self> {
+        Some(Self {
+            gpu_memory_limit_mb: Wire::read(r)?,
+            max_depth: Wire::read(r)?,
+        })
+    }
+}
+
+impl Wire for Command {
+    fn write(&self, w: &mut Writer) {
+        match self {
+            Command::List(directory) => {
+                0u8.write(w);
+                directory.write(w);
+            }
+            Command::Info(path) => {
+                1u8.write(w);
+                path.write(w);
+            }
+            Command::Open {
+                path,
+                hdu,
+                budget,
+                sigmas,
+            } => {
+                2u8.write(w);
+                path.write(w);
+                hdu.write(w);
+                budget.write(w);
+                sigmas.write(w);
+            }
+            Command::Request { file_id, request } => {
+                3u8.write(w);
+                file_id.write(w);
+                request.write(w);
+            }
+            Command::Close(file_id) => {
+                4u8.write(w);
+                file_id.write(w);
+            }
+        }
+    }
+
+    fn read(r: &mut Reader) -> Option<Self> {
+        Some(match u8::read(r)? {
+            0 => Command::List(Wire::read(r)?),
+            1 => Command::Info(Wire::read(r)?),
+            2 => Command::Open {
+                path: Wire::read(r)?,
+                hdu: Wire::read(r)?,
+                budget: Wire::read(r)?,
+                sigmas: Wire::read(r)?,
+            },
+            3 => Command::Request {
+                file_id: Wire::read(r)?,
+                request: Wire::read(r)?,
+            },
+            4 => Command::Close(Wire::read(r)?),
+            _ => return None,
+        })
+    }
+}
+
+impl Wire for Listing {
+    fn write(&self, w: &mut Writer) {
+        self.directory.write(w);
+        self.parent.write(w);
+        self.directories.write(w);
+        (self.files.len() as u32).write(w);
+        for (name, bytes) in &self.files {
+            name.write(w);
+            bytes.write(w);
+        }
+    }
+
+    fn read(r: &mut Reader) -> Option<Self> {
+        let (directory, parent, directories) = (Wire::read(r)?, Wire::read(r)?, Wire::read(r)?);
+        let len = u32::read(r)? as usize;
+        let mut files = Vec::with_capacity(len.min(r.header.len()));
+        for _ in 0..len {
+            files.push((Wire::read(r)?, Wire::read(r)?));
+        }
+        Some(Self {
+            directory,
+            parent,
+            directories,
+            files,
+        })
+    }
+}
+
+impl Wire for Opened {
+    fn write(&self, w: &mut Writer) {
+        self.file_id.write(w);
+        self.path.write(w);
+        self.info.write(w);
+        self.levels.write(w);
+        self.tolerance.write(w);
+    }
+
+    fn read(r: &mut Reader) -> Option<Self> {
+        Some(Self {
+            file_id: Wire::read(r)?,
+            path: Wire::read(r)?,
+            info: Wire::read(r)?,
+            levels: Wire::read(r)?,
+            tolerance: Wire::read(r)?,
+        })
+    }
+}
+
+impl Wire for Received {
+    fn write(&self, w: &mut Writer) {
+        match self {
+            Received::Registered { server } => {
+                0u8.write(w);
+                server.write(w);
+            }
+            Received::Listing(listing) => {
+                1u8.write(w);
+                listing.write(w);
+            }
+            Received::Info {
+                path,
+                dims,
+                hdu,
+                bytes,
+            } => {
+                2u8.write(w);
+                path.write(w);
+                dims.write(w);
+                hdu.write(w);
+                bytes.write(w);
+            }
+            Received::Opened(opened) => {
+                3u8.write(w);
+                opened.write(w);
+            }
+            Received::Event { file_id, event } => {
+                4u8.write(w);
+                file_id.write(w);
+                event.write(w);
+            }
+            Received::Failed(message) => {
+                5u8.write(w);
+                message.write(w);
+            }
+            Received::OpenFailed(message) => {
+                6u8.write(w);
+                message.write(w);
+            }
+            Received::FileClosed { file_id, reason } => {
+                7u8.write(w);
+                file_id.write(w);
+                reason.write(w);
+            }
+            Received::Closed(reason) => {
+                8u8.write(w);
+                reason.write(w);
+            }
+        }
+    }
+
+    fn read(r: &mut Reader) -> Option<Self> {
+        Some(match u8::read(r)? {
+            0 => Received::Registered {
+                server: Wire::read(r)?,
+            },
+            1 => Received::Listing(Wire::read(r)?),
+            2 => Received::Info {
+                path: Wire::read(r)?,
+                dims: Wire::read(r)?,
+                hdu: Wire::read(r)?,
+                bytes: Wire::read(r)?,
+            },
+            3 => Received::Opened(Box::new(Wire::read(r)?)),
+            4 => Received::Event {
+                file_id: Wire::read(r)?,
+                event: Wire::read(r)?,
+            },
+            5 => Received::Failed(Wire::read(r)?),
+            6 => Received::OpenFailed(Wire::read(r)?),
+            7 => Received::FileClosed {
+                file_id: Wire::read(r)?,
+                reason: Wire::read(r)?,
+            },
+            8 => Received::Closed(Wire::read(r)?),
+            _ => return None,
+        })
+    }
+
+    fn voxels(&self) -> &[f32] {
+        match self {
+            Received::Event { event, .. } => event.voxels(),
+            _ => &[],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +848,57 @@ mod tests {
         info.cards = vec![format!("{:<80}", "OBJECT  = 'M83 ñ'")];
         info.histogram = Histogram(vec![1, 5, 24]);
         info.sigma = Some(0.25);
-        round_trip(info);
+        round_trip(info.clone());
+
+        // A server connection's messages, between the viewer and the worker that holds the socket.
+        round_trip((
+            3,
+            Command::Open {
+                path: "folder/cube.fits".into(),
+                hdu: Some(1),
+                budget: Budget {
+                    gpu_memory_limit_mb: 384,
+                    max_depth: 2048,
+                },
+                sigmas: 0.5,
+            },
+        ));
+        round_trip(Command::Request {
+            file_id: -1,
+            request: Request::PixelValue {
+                id: 2,
+                voxel: [1, 2, 3],
+            },
+        });
+        round_trip(Command::Close(7));
+        round_trip(Received::Listing(Listing {
+            directory: "a/b".into(),
+            parent: Some("a".into()),
+            directories: vec!["c".into()],
+            files: vec![("cube.fits".into(), 1 << 40)],
+        }));
+        round_trip(Received::Opened(Box::new(Opened {
+            file_id: 2,
+            path: "cube.fits".into(),
+            info,
+            levels: vec![[1; 3], [2, 2, 1]],
+            tolerance: None,
+        })));
+        let cubelet = Cubelet {
+            dims: [3, 2, 1],
+            voxels: Voxels::Data(vec![1.0, f32::NAN, 3.0, -0.0, 5e-39, 7.0]),
+            cell,
+        };
+        round_trip((
+            1,
+            Received::Event {
+                file_id: 2,
+                event: Event::Cubelet { id, cubelet },
+            },
+        ));
+        round_trip(Received::FileClosed {
+            file_id: 2,
+            reason: "gone".into(),
+        });
     }
 }

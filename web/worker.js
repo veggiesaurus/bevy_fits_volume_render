@@ -1,7 +1,9 @@
 // The data source's Web Worker, so that none of this holds up the page: it downloads or reads the file in a load,
 // { load, source, hdu } with a File or URL as the source, and fits-worker holds the cube and answers the viewer's
-// requests. ArrayBuffers both ways are the source's messages.
-import init, { held, open, request, work } from "./pkg/fits_worker.js";
+// requests, until { release } says the viewer no longer shows it. ArrayBuffers both ways are the source's messages. It
+// also holds the socket to a fits-server, opened with { server, token, id }, and { remote } messages both ways are
+// the viewer's for that connection.
+import init, { held, open, release, remote_closed, remote_command, remote_receive, remote_start, request, work } from "./pkg/fits_worker.js";
 
 const ready = init();
 ready.catch((e) => postMessage({ failed: `could not start: ${e.message ?? e}` }));
@@ -26,10 +28,68 @@ onmessage = async ({ data }) => {
   if (data instanceof ArrayBuffer) {
     request(new Uint8Array(data));
     schedule();
+  } else if (data.remote) {
+    toServer(remote_command(new Uint8Array(data.remote)));
+  } else if (data.release !== undefined) {
+    release(data.release);
+  } else if (data.server) {
+    connectServer(data);
   } else {
     load(data);
   }
 };
+
+// The server's socket. fits-worker turns what comes in into the viewer's messages, and the viewer's commands into
+// what goes out. The token goes in the first message rather than the URL, which browsers print when a connection
+// fails.
+let socket;
+let unsent = [];
+
+function connectServer({ server: url, token, id }) {
+  closeServer("another connection took its place");
+  unsent = [remote_start(id, token)];
+  let ws;
+  try {
+    ws = socket = new WebSocket(url);
+  } catch (e) {
+    socket = undefined;
+    remote_closed(`not a server URL: ${e.message ?? e}`);
+    return;
+  }
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    for (const message of unsent) ws.send(message);
+    unsent = [];
+  };
+  ws.onmessage = ({ data }) => {
+    try {
+      toServer(remote_receive(new Uint8Array(data)));
+    } catch (e) {
+      closeServer(e.message ?? String(e));
+    }
+  };
+  // A browser doesn't say why a socket failed, only that it closed.
+  ws.onclose = ({ code, reason }) =>
+    closeServer(reason || (code === 1006 ? "couldn't connect, or the connection was lost" : `closed (${code})`));
+}
+
+function toServer(messages) {
+  for (const message of messages) {
+    if (socket?.readyState === WebSocket.OPEN) socket.send(message);
+    else unsent.push(message);
+  }
+}
+
+function closeServer(reason) {
+  const ws = socket;
+  socket = undefined;
+  unsent = [];
+  if (ws) {
+    ws.onopen = ws.onmessage = ws.onclose = null;
+    ws.close();
+    remote_closed(reason);
+  }
+}
 
 // Only the latest load is read, so a slow download can't replace a file picked after it started.
 let latest;

@@ -1,15 +1,20 @@
-//! A fits-server's cubes, natively: the connection to it, a panel to browse its files and open one, and the data
-//! source for the cube open, which sends the viewer's requests over the connection.
+//! A fits-server's cubes: the connection to it, a panel to browse its files and open or close one, and the data source
+//! for the cube open, which sends the viewer's requests over the connection. Natively the connection is a thread of
+//! its own; in the browser the Web Worker holds it.
 
 use std::sync::{Arc, Mutex};
 
 use bevy::{platform::time::Instant, prelude::*, render::renderer::RenderDevice};
 use bevy_egui::{EguiContexts, egui};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::fits::remote::Connection;
+#[cfg(target_arch = "wasm32")]
+use crate::web::{Connection, latest_pick, pick};
 use crate::{
     Dataset, DatasetEntity, clear_dataset,
     config::{Config, TOLERANCES},
-    fits::remote::{Budget, Command, Connection, Listing, Received},
+    fits::remote::{Budget, Command, Listing, Received},
     max_depth,
     source::{DataSource, Event, Request},
     ui::format_dims,
@@ -17,7 +22,19 @@ use crate::{
     wake,
 };
 
-/// The cube open on the server, as the viewer's data source.
+/// Natively a server's cube is the only kind to pick, so the latest open always wins.
+#[cfg(not(target_arch = "wasm32"))]
+fn pick() -> u32 {
+    0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn latest_pick() -> u32 {
+    0
+}
+
+/// The cube open on the server, as the viewer's data source. Once it's dropped, with the view of it, the server
+/// is told to close the file, over the connection it was opened on.
 pub struct Source {
     connection: Connection,
     file_id: i32,
@@ -39,13 +56,22 @@ impl Source {
     }
 }
 
+impl Drop for Source {
+    fn drop(&mut self) {
+        self.connection.send(Command::Close(self.file_id));
+    }
+}
+
 /// A file's dims, HDU and size.
 type About = ([usize; 3], usize, u64);
 
 #[derive(Resource)]
 pub struct Remote {
     url: String,
-    connection: Connection,
+    /// None until it connects, which in the browser waits for the token.
+    connection: Option<Connection>,
+    /// The token, for a server whose URL doesn't have it. It goes in the first message, never in a URL.
+    api_key: String,
     config: Config,
     /// All but the events, which go straight to the source.
     received: Arc<Mutex<Vec<Received>>>,
@@ -56,23 +82,57 @@ pub struct Remote {
     listing: Option<Listing>,
     /// A file picked, and what's known of it once it's in.
     picked: Option<(String, Option<About>)>,
-    /// The file on its way, and when it was asked for; at start the one given on the command line.
-    opening: Option<(String, Instant)>,
-    /// The file ID of the cube shown.
-    shown: Option<i32>,
+    /// The file given on the command line or in `?path=`, opened once connected, and when the viewer started.
+    start: Option<(String, Instant)>,
+    /// The file being opened, when it was asked for, and its number among the viewer's picks.
+    opening: Option<(String, Instant, u32)>,
     /// For the file on the command line only.
     hdu: Option<usize>,
     error: Option<String>,
     sigmas: f64,
+    /// Set by the Close button: the server's cube on screen is to be closed.
+    close: bool,
     /// With SCREENSHOT, the app gives up when the connection or the open does.
     exit_on_failure: bool,
 }
 
 impl Remote {
-    pub fn connect(url: String, config: Config, open: Option<String>, hdu: Option<usize>) -> Self {
+    /// A server at `url`, not yet connected to. `open` is opened once it is.
+    pub fn new(
+        url: String,
+        config: Config,
+        open: Option<String>,
+        hdu: Option<usize>,
+        api_key: String,
+    ) -> Self {
+        Self {
+            url,
+            connection: None,
+            api_key,
+            sigmas: config.zfp_tolerance_sigmas,
+            config,
+            received: default(),
+            events: default(),
+            server: None,
+            closed: None,
+            listing: None,
+            picked: None,
+            start: open.map(|path| (path, Instant::now())),
+            opening: None,
+            hdu,
+            error: None,
+            close: false,
+            exit_on_failure: std::env::var_os("SCREENSHOT").is_some(),
+        }
+    }
+
+    /// Connects, or connects again after the connection before closed. What comes from this connection goes to new
+    /// queues, so that nothing more from the one before is taken.
+    pub fn connect(&mut self) {
         let (received, events) = <(Arc<Mutex<Vec<_>>>, Arc<Mutex<Vec<_>>>)>::default();
         let (to_viewer, to_source) = (received.clone(), events.clone());
-        let connection = Connection::connect(&url, move |message| {
+        let api_key = self.api_key.clone();
+        self.connection = Some(Connection::connect(&self.url, api_key, move |message| {
             match message {
                 Received::Event { file_id, event } => {
                     to_source.lock().unwrap().push((file_id, event))
@@ -80,23 +140,15 @@ impl Remote {
                 message => to_viewer.lock().unwrap().push(message),
             }
             wake();
-        });
-        Self {
-            url,
-            connection,
-            sigmas: config.zfp_tolerance_sigmas,
-            config,
-            received,
-            events,
-            server: None,
-            closed: None,
-            listing: None,
-            picked: None,
-            opening: open.map(|path| (path, Instant::now())),
-            shown: None,
-            hdu,
-            error: None,
-            exit_on_failure: std::env::var_os("SCREENSHOT").is_some(),
+        }));
+        (self.received, self.events) = (received, events);
+        (self.server, self.closed, self.listing, self.error) = (None, None, None, None);
+        (self.picked, self.opening) = (None, None);
+    }
+
+    fn send(&self, command: Command) {
+        if let Some(connection) = &self.connection {
+            connection.send(command);
         }
     }
 
@@ -112,8 +164,8 @@ impl Remote {
             budget,
             sigmas,
         };
-        self.connection.send(command);
-        self.opening = Some((path, Instant::now()));
+        self.send(command);
+        self.opening = Some((path, Instant::now(), pick()));
         self.error = None;
     }
 }
@@ -124,10 +176,17 @@ pub fn poll(
     mut commands: Commands,
     mut remote: ResMut<Remote>,
     device: Res<RenderDevice>,
+    data: Option<Res<Dataset>>,
     old: Query<Entity, With<DatasetEntity>>,
     mut upsamples: ResMut<Upsamples>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    // Dropping the view drops its source, which tells the server to close the file.
+    if std::mem::take(&mut remote.close)
+        && data.as_ref().is_some_and(|data| data.source.is_remote())
+    {
+        clear_dataset(&mut commands, &old, &mut upsamples);
+    }
     let received = std::mem::take(&mut *remote.received.lock().unwrap());
     let mut failed = false;
     for message in received {
@@ -135,12 +194,14 @@ pub fn poll(
             Received::Registered { server } => {
                 info!("Connected to {server}");
                 remote.server = Some(server);
-                remote.connection.send(Command::List(String::new()));
+                remote.send(Command::List(String::new()));
                 // From the command line, timed from the start.
-                if let Some((path, at)) = remote.opening.take() {
+                if let Some((path, at)) = remote.start.take() {
                     let hdu = remote.hdu.take();
                     remote.open(path, hdu, &device);
-                    remote.opening = remote.opening.take().map(|(path, _)| (path, at));
+                    if let Some((_, when, _)) = remote.opening.as_mut() {
+                        *when = at;
+                    }
                 }
             }
             Received::Listing(listing) => remote.listing = Some(listing),
@@ -157,13 +218,20 @@ pub fn poll(
                 }
             }
             Received::Opened(opened) => {
-                let seconds =
-                    (remote.opening.take()).map_or(0.0, |(_, at)| at.elapsed().as_secs_f32());
+                let connection =
+                    (remote.connection.clone()).expect("what's received comes over the connection");
+                let (seconds, pick) = (remote.opening.take())
+                    .map_or((0.0, 0), |(_, at, pick)| (at.elapsed().as_secs_f32(), pick));
+                // A local file was picked after this open was asked for, so that file stays on screen.
+                if pick != latest_pick() {
+                    connection.send(Command::Close(opened.file_id));
+                    continue;
+                }
                 let tolerance = opened
                     .tolerance
                     .map_or("exact".into(), |t| format!("within {t:.3e} at level 0"));
                 let source = Source {
-                    connection: remote.connection.clone(),
+                    connection,
                     file_id: opened.file_id,
                     events: remote.events.clone(),
                 };
@@ -181,7 +249,6 @@ pub fn poll(
                     dataset.summary(),
                     remote.url_without_token()
                 );
-                remote.shown = Some(opened.file_id);
                 commands.insert_resource(dataset);
             }
             Received::Failed(message) => {
@@ -196,8 +263,10 @@ pub fn poll(
             }
             Received::FileClosed { file_id, reason } => {
                 warn!("Closed: {reason}");
-                if remote.shown == Some(file_id) {
-                    remote.shown = None;
+                let shown = data.as_ref().map(|data| &data.source);
+                if let Some(DataSource::Remote(source)) = shown
+                    && source.file_id == file_id
+                {
                     clear_dataset(&mut commands, &old, &mut upsamples);
                     failed = true;
                 }
@@ -230,6 +299,7 @@ pub fn browser(
     mut contexts: EguiContexts,
     mut remote: ResMut<Remote>,
     device: Res<RenderDevice>,
+    data: Option<Res<Dataset>>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let remote = &mut *remote;
@@ -238,14 +308,18 @@ pub fn browser(
         .default_pos([440.0, 10.0])
         .show(ctx, |ui| {
             let url = remote.url_without_token().to_string();
-            match (&remote.server, &remote.closed) {
-                (_, Some(reason)) => ui.colored_label(ui.visuals().error_fg_color, format!("{url}: {reason}")),
-                (Some(server), None) => ui.label(format!("{server} at {url}")),
-                (None, None) => ui.label(format!("Connecting to {url}")),
+            match (&remote.connection, &remote.server, &remote.closed) {
+                (_, _, Some(reason)) => ui.colored_label(ui.visuals().error_fg_color, format!("{url}: {reason}")),
+                (None, _, None) => ui.label(format!("Not connected to {url}")),
+                (Some(_), Some(server), None) => ui.label(format!("{server} at {url}")),
+                (Some(_), None, None) => ui.label(format!("Connecting to {url}")),
             };
+            if remote.connection.is_none() || remote.closed.is_some() {
+                connect_ui(ui, remote);
+            }
             if let Some(listing) = &remote.listing {
                 ui.label(format!("/{}", listing.directory));
-                let mut go = None;
+                let (mut go, mut pick) = (None, None);
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     if let Some(parent) = &listing.parent
                         && ui.selectable_label(false, "..").clicked()
@@ -266,13 +340,16 @@ pub fn browser(
                         let picked = remote.picked.as_ref().is_some_and(|(p, _)| *p == file);
                         let label = format!("{name}  ({:.2} GB)", *bytes as f64 / 1e9);
                         if ui.selectable_label(picked, label).clicked() && !picked {
-                            remote.connection.send(Command::Info(file.clone()));
-                            remote.picked = Some((file, None));
+                            pick = Some(file);
                         }
                     }
                 });
                 if let Some(directory) = go {
-                    remote.connection.send(Command::List(directory));
+                    remote.send(Command::List(directory));
+                }
+                if let Some(file) = pick {
+                    remote.send(Command::Info(file.clone()));
+                    remote.picked = Some((file, None));
                 }
             }
             ui.horizontal(|ui| {
@@ -291,20 +368,49 @@ pub fn browser(
                     ui.label(format!("{} (HDU {hdu}), {:.2} GB", format_dims(dims), bytes as f64 / 1e9));
                 }
                 ui.horizontal(|ui| match &remote.opening {
-                    Some((opening, _)) => {
+                    Some((opening, _, _)) => {
                         ui.label(format!("Opening {opening}"));
                         ui.spinner();
                     }
                     None => {
-                        if ui.add_enabled(remote.closed.is_none(), egui::Button::new("Open")).clicked() {
+                        let connected = remote.server.is_some() && remote.closed.is_none();
+                        if ui.add_enabled(connected, egui::Button::new("Open")).clicked() {
                             remote.open(path, None, &device);
                         }
                     }
                 });
+            }
+            let shown = data.as_ref().is_some_and(|data| data.source.is_remote());
+            if shown && ui.button("Close the cube shown").clicked() {
+                remote.close = true;
+                wake();
             }
             if let Some(error) = &remote.error {
                 ui.colored_label(ui.visuals().error_fg_color, error);
             }
         });
     Ok(())
+}
+
+/// In the browser a field for the token, which the page fills from a `#token=` in its URL; and a button to connect,
+/// or to connect again once the connection has closed.
+fn connect_ui(ui: &mut egui::Ui, remote: &mut Remote) {
+    ui.horizontal(|ui| {
+        #[cfg(target_arch = "wasm32")]
+        let entered = {
+            let field = egui::TextEdit::singleline(&mut remote.api_key)
+                .password(true)
+                .hint_text("Token")
+                .desired_width(180.0);
+            let field = ui.add(field);
+            field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let entered = false;
+        let ready = !remote.api_key.is_empty() || cfg!(not(target_arch = "wasm32"));
+        let button = ui.add_enabled(ready, egui::Button::new("Connect"));
+        if ready && (button.clicked() || entered) {
+            remote.connect();
+        }
+    });
 }

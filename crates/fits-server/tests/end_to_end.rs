@@ -101,10 +101,14 @@ fn start(root: &Path) -> u16 {
     rx.recv().unwrap()
 }
 
+/// With the token in the URL, as the native viewer has it.
 fn connect(port: u16, token: &str) -> (Connection, mpsc::Receiver<Received>) {
+    connect_with(&format!("ws://127.0.0.1:{port}/?token={token}"), "")
+}
+
+fn connect_with(url: &str, api_key: &str) -> (Connection, mpsc::Receiver<Received>) {
     let (tx, rx) = mpsc::channel();
-    let url = format!("ws://127.0.0.1:{port}/?token={token}");
-    let connection = Connection::connect(&url, move |received| {
+    let connection = Connection::connect(url, api_key.into(), move |received| {
         let _ = tx.send(received);
     });
     (connection, rx)
@@ -588,5 +592,31 @@ fn removed_cubelets_never_arrive_and_the_rest_do() {
     }
     arrived.sort_by_key(|&[x, y, _]| (y, x));
     assert_eq!(arrived, wanted);
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+#[test]
+fn a_browser_gives_the_token_when_it_registers_rather_than_in_the_url() {
+    let root = root("api-key");
+    let port = start(&root);
+    let url = format!("ws://127.0.0.1:{port}/");
+    let (_wrong, rx) = connect_with(&url, "0123456789abcdee");
+    let closed = next(&rx, |r| match r {
+        Received::Closed(reason) => Some(reason),
+        r => panic!("{r:?}"),
+    });
+    assert!(closed.contains("Invalid token"), "{closed}");
+    let (_none, rx) = connect_with(&url, "");
+    next(&rx, |r| matches!(r, Received::Closed(_)).then_some(()));
+
+    let (connection, rx) = connect_with(&url, TOKEN);
+    next(&rx, |r| {
+        matches!(r, Received::Registered { .. }).then_some(())
+    });
+    let file_id = open(&connection, &rx, "cube.fits").file_id;
+    assert_eq!(
+        pixel(&connection, &rx, file_id, [12, 34, 56]),
+        voxel([12, 34, 56])
+    );
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }

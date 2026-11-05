@@ -3,6 +3,10 @@
 //! there's nothing left. The engine's events go back to the page as transferred ArrayBuffers. Both ways a message
 //! carries the id of the page's load whose file it's about, so a request for a file the worker no longer holds is
 //! dropped, and the page can tell an event for one it no longer shows.
+//!
+//! For a cube on a fits-server, worker.js holds the socket and the `remote_` functions turn the server's messages into
+//! the viewer's and back, with fits-core's remote client, so that the cubelets are decoded here too. Those messages
+//! carry the id of the viewer's connection instead.
 #![cfg(target_arch = "wasm32")]
 
 use std::{
@@ -13,6 +17,7 @@ use std::{
 use fits_core::{
     self as fits,
     engine::{Engine, Event, Request},
+    remote::{Client, Command, Received},
     wire::{self, Wire},
 };
 use js_sys::{Array, ArrayBuffer, Float32Array, Object, Reflect, Uint8Array};
@@ -21,6 +26,8 @@ use wasm_bindgen::prelude::*;
 thread_local! {
     /// With the load it was opened for.
     static ENGINE: RefCell<Option<(u32, Engine)>> = const { RefCell::new(None) };
+    /// The connection to a server, with the viewer's id for it, while worker.js has its socket.
+    static CLIENT: RefCell<Option<(u32, Client)>> = const { RefCell::new(None) };
 }
 
 #[wasm_bindgen]
@@ -80,6 +87,14 @@ pub fn open(load: u32, bytes: Uint8Array, hdu: Option<String>) -> Result<ArrayBu
     Ok(info)
 }
 
+/// The viewer no longer shows the file of load `load`, so it's dropped, unless a later one has taken its place.
+#[wasm_bindgen]
+pub fn release(load: u32) {
+    if held() == Some(load) {
+        ENGINE.set(None);
+    }
+}
+
 /// The load whose file the worker holds, if any, so that after a failed load the page can tell whether it's still
 /// the one shown.
 #[wasm_bindgen]
@@ -130,13 +145,78 @@ pub fn work() -> bool {
     true
 }
 
-/// Writes the header and the voxels straight into the buffer that's transferred.
 fn post(message: &(u32, Event)) {
+    let buffer = buffer(message);
+    post_message(&buffer, &Array::of1(&buffer));
+}
+
+/// The header and the voxels written straight into the buffer that's transferred.
+fn buffer(message: &impl Wire) -> ArrayBuffer {
     let (header, voxels) = (wire::header(message), message.voxels());
     let at = header.len() as u32;
     let buffer = ArrayBuffer::new(at + 4 * voxels.len() as u32);
     Uint8Array::new_with_byte_offset_and_length(&buffer, 0, at).copy_from(&header);
     Float32Array::new_with_byte_offset_and_length(&buffer, at, voxels.len() as u32)
         .copy_from(voxels);
-    post_message(&buffer, &Array::of1(&buffer));
+    buffer
+}
+
+/// Starts connection `id`, and returns the REGISTER_VIEWER to send once the socket is open, which carries the token.
+#[wasm_bindgen]
+pub fn remote_start(id: u32, api_key: String) -> Uint8Array {
+    let (client, register) = Client::new(api_key);
+    CLIENT.set(Some((id, client)));
+    Uint8Array::from(&register[..])
+}
+
+/// One of the viewer's commands, as the messages to send the server. A command for a connection that's gone is
+/// dropped.
+#[wasm_bindgen]
+pub fn remote_command(message: Uint8Array) -> Array {
+    let (id, command) = match wire::decode::<(u32, Command)>(&message.to_vec(), |_| None) {
+        Ok(message) => message,
+        Err(e) => {
+            log_error(&format!("From the viewer: {e}"));
+            return Array::new();
+        }
+    };
+    let (messages, told) = CLIENT.with_borrow_mut(|client| match client {
+        Some((held, client)) if *held == id => client.command(command),
+        _ => (Vec::new(), None),
+    });
+    if let Some(told) = told {
+        post_remote(id, told);
+    }
+    messages.iter().map(|m| Uint8Array::from(&m[..])).collect()
+}
+
+/// A message from the server, as the replies to send it. An error ends the connection, and worker.js closes the
+/// socket and calls `remote_closed` with it.
+#[wasm_bindgen]
+pub fn remote_receive(message: Uint8Array) -> Result<Array, String> {
+    let Some((id, received, replies)) = CLIENT.with_borrow_mut(|client| {
+        let (id, client) = client.as_mut()?;
+        let received = client.receive(&message.to_vec());
+        Some((*id, received, client.replies()))
+    }) else {
+        return Ok(Array::new());
+    };
+    received?.into_iter().for_each(|r| post_remote(id, r));
+    Ok(replies.iter().map(|m| Uint8Array::from(&m[..])).collect())
+}
+
+/// The socket has closed. The viewer is told why, once.
+#[wasm_bindgen]
+pub fn remote_closed(reason: String) {
+    if let Some((id, _)) = CLIENT.take() {
+        post_remote(id, Received::Closed(reason));
+    }
+}
+
+/// As `post`, inside `{ remote }` so that the page can tell it from the local file's.
+fn post_remote(id: u32, received: Received) {
+    let buffer = buffer(&(id, received));
+    let wrapped = Object::new();
+    let _ = Reflect::set(&wrapped, &"remote".into(), &buffer);
+    post_message(&wrapped, &Array::of1(&buffer));
 }

@@ -4,7 +4,6 @@ mod config;
 mod grips;
 mod modes;
 mod outline;
-#[cfg(not(target_arch = "wasm32"))]
 mod remote;
 mod selection;
 mod shape;
@@ -267,6 +266,17 @@ fn main() -> AppExit {
 
     #[cfg(target_arch = "wasm32")]
     app.add_systems(PreUpdate, web::poll);
+    // A fits-server, natively from --server and in the browser from ?server=.
+    app.add_systems(
+        PreUpdate,
+        remote::poll
+            .before(receive)
+            .run_if(resource_exists::<remote::Remote>),
+    )
+    .add_systems(
+        EguiPrimaryContextPass,
+        remote::browser.run_if(resource_exists::<remote::Remote>),
+    );
     #[cfg(not(target_arch = "wasm32"))]
     {
         app.add_systems(Last, log_view.run_if(resource_exists::<Dataset>));
@@ -275,9 +285,7 @@ fn main() -> AppExit {
                 app.insert_resource(dataset);
             }
             Start::Remote(remote) => {
-                app.insert_resource(remote)
-                    .add_systems(PreUpdate, remote::poll.before(receive))
-                    .add_systems(EguiPrimaryContextPass, remote::browser);
+                app.insert_resource(remote);
             }
         }
         if let Ok(path) = std::env::var("SCREENSHOT") {
@@ -442,7 +450,9 @@ fn load_native() -> Start {
     println!("Config: {}", config_path.display());
     if let Some(url) = args.server {
         let path = args.file.map(|path| path.to_string_lossy().into_owned());
-        return Start::Remote(remote::Remote::connect(url, config, path, args.hdu));
+        let mut remote = remote::Remote::new(url, config, path, args.hdu, String::new());
+        remote.connect();
+        return Start::Remote(remote);
     }
     let path = args.file.expect("a file without a server");
     // Bevy's own task pools, made before the app so loading doesn't leave it a differently sized one.

@@ -10,8 +10,7 @@ fits-core = { path = "../fits-core" }
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"] }
 getrandom = "0.3"
 prost = "0.14"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["time"] }
 tungstenite = "0.29"

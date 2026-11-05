@@ -38,6 +38,8 @@ pub enum Command {
         file_id: i32,
         request: Request,
     },
+    /// The file opened as `file_id` is no longer wanted.
+    Close(i32),
 }
 
 #[derive(Debug)]
@@ -146,8 +148,9 @@ fn by_mode(ids: &[CubeletId]) -> Result<Vec<(SmoothingMode, Vec<u64>)>, String> 
 }
 
 impl Client {
-    /// With the REGISTER_VIEWER to send first.
-    pub fn new() -> (Self, Vec<u8>) {
+    /// With the REGISTER_VIEWER to send first, which carries `api_key` as the token for a server that wasn't given one
+    /// when the socket connected.
+    pub fn new(api_key: String) -> (Self, Vec<u8>) {
         let client = Self {
             next_file_id: 0,
             opening: None,
@@ -156,7 +159,10 @@ impl Client {
             next_request_id: 1,
             replies: Vec::new(),
         };
-        let register = proto::RegisterViewer::default();
+        let register = proto::RegisterViewer {
+            api_key,
+            ..Default::default()
+        };
         (client, frame(EventType::RegisterViewer, 0, &register))
     }
 
@@ -193,6 +199,20 @@ impl Client {
                 sigmas,
             } => self.open(id, path, hdu, budget, sigmas),
             Command::Request { file_id, request } => return self.request(file_id, request),
+            Command::Close(file_id) => {
+                if self
+                    .open
+                    .as_ref()
+                    .is_some_and(|open| open.file_id == file_id)
+                {
+                    self.open = None;
+                }
+                vec![frame(
+                    EventType::CloseFile,
+                    id,
+                    &proto::CloseFile { file_id },
+                )]
+            }
         };
         (messages, None)
     }
@@ -596,13 +616,17 @@ mod native {
     }
 
     impl Connection {
-        /// `url` is `ws://host:port/?token=...`. `receive` is called on the connection's thread, last with
-        /// `Received::Closed`, once.
-        pub fn connect(url: &str, mut receive: impl FnMut(Received) + Send + 'static) -> Self {
+        /// `url` is `ws://host:port/`, with `?token=...` or else the token as `api_key`. `receive` is called on the
+        /// connection's thread, last with `Received::Closed`, once.
+        pub fn connect(
+            url: &str,
+            api_key: String,
+            mut receive: impl FnMut(Received) + Send + 'static,
+        ) -> Self {
             let (wake, rx) = mpsc::channel();
             let (url, reader) = (url.to_string(), wake.clone());
             std::thread::spawn(move || {
-                let reason = run(&url, reader, &rx, &mut receive).err();
+                let reason = run(&url, api_key, reader, &rx, &mut receive).err();
                 receive(Received::Closed(reason.unwrap_or_else(|| "closed".into())));
             });
             Self(Arc::new(Waker(wake)))
@@ -655,6 +679,7 @@ mod native {
 
     fn run(
         url: &str,
+        api_key: String,
         reader: mpsc::Sender<Wake>,
         wakes: &mpsc::Receiver<Wake>,
         receive: &mut impl FnMut(Received),
@@ -697,7 +722,7 @@ mod native {
             ended: false,
         };
         let mut socket = WebSocket::from_raw_socket(stream, Role::Client, Some(config));
-        let result = serve(&mut socket, wakes, receive);
+        let result = serve(&mut socket, Client::new(api_key), wakes, receive);
         let _ = socket.close(None);
         let _ = socket.flush();
         // Which ends the reader thread too.
@@ -709,10 +734,10 @@ mod native {
     /// until it might take more.
     fn serve(
         socket: &mut WebSocket<Stream>,
+        (mut client, register): (Client, Vec<u8>),
         wakes: &mpsc::Receiver<Wake>,
         receive: &mut impl FnMut(Received),
     ) -> Result<(), String> {
-        let (mut client, register) = Client::new();
         written(socket.write(Message::binary(register)))?;
         loop {
             let unwritten = match socket.flush() {
