@@ -98,7 +98,7 @@ pub async fn serve(
     }
 }
 
-/// For `GET /` in a browser, which is where Safari's certificate warning is accepted.
+/// For `GET /` in a browser, which opens with no warning once the browser trusts the server's certificate.
 const RUNNING: &str = "<!doctype html><meta charset=utf-8><title>fits-server</title>\
     <p>fits-server is running. You can close this tab.";
 

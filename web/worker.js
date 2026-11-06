@@ -5,11 +5,11 @@
 // holds the socket to a fits-server, opened with { server, token, id, memory }, and { remote } messages both ways are
 // the viewer's for that connection.
 import init, {
-  baked_attach, baked_failed, baked_fetched, baked_fetches, baked_open, baked_wanted, held, open, release, remote_attach,
+  baked_attach, baked_failed, baked_fetched, baked_fetches, baked_open, baked_wanted, held, open, opfs, release, remote_attach,
   remote_closed, remote_command, remote_pack, remote_receive, remote_start, remote_work, request, work,
 } from "./pkg/fits_worker.js";
 
-const ready = init();
+const ready = init().then(() => opfs(clearPacks));
 ready.catch((e) => postMessage({ failed: `could not start: ${e.message ?? e}` }));
 
 // A job at a time, each in a task of its own, so that requests (a cursor value, cubelets no longer wanted) are
@@ -57,7 +57,7 @@ let unsent = [];
 
 function connectServer({ server: url, token, id, memory }) {
   closeServer("another connection took its place");
-  unsent = [remote_start(id, url, token, memory, clearPacks)];
+  unsent = [remote_start(id, url, token, memory)];
   let ws;
   try {
     ws = socket = new WebSocket(url);
@@ -114,9 +114,17 @@ const CAP = 4 * 2 ** 30, RESERVE = 2 ** 30;
 const packs = (async () => (await navigator.storage.getDirectory()).getDirectoryHandle("cubelets", { create: true }))()
   .catch(() => null);
 
+// Opening a pack and clearing them take turns, so that a clear can't delete a pack as it's being opened.
+let packsBusy = Promise.resolve();
+function inTurn(work) {
+  const done = packsBusy.then(work);
+  packsBusy = done.catch(() => {});
+  return done;
+}
+
 // The pack's file and how long it may grow. Another tab with the same cube open holds the file, and this one goes
 // without.
-async function openPack(name) {
+const openPack = (name) => inTurn(async () => {
   const dir = await packs;
   const all = [];
   for await (const [other, handle] of dir.entries()) {
@@ -132,15 +140,18 @@ async function openPack(name) {
   }
   const file = await dir.getFileHandle(name, { create: true });
   return [await file.createSyncAccessHandle(), CAP - others];
-}
+});
 
-// Every pack but the one open, which the client has emptied.
-async function clearPacks(open) {
-  const dir = await packs;
-  if (!dir) return;
-  const names = [];
-  for await (const name of dir.keys()) if (name !== open) names.push(name);
-  for (const name of names) await dir.removeEntry(name).catch(() => {});
+// Every pack but those open, which their sources have emptied, and a baked file kept whole.
+function clearPacks(open) {
+  if (baked) baked.whole = undefined;
+  inTurn(async () => {
+    const dir = await packs;
+    if (!dir) return;
+    const names = [];
+    for await (const name of dir.keys()) if (!open.includes(name)) names.push(name);
+    for (const name of names) await dir.removeEntry(name).catch(() => {});
+  }).catch((e) => console.warn(`Clearing the cache: ${e.message ?? e}`));
 }
 
 // Only the latest load is read, so a slow download can't replace a file picked after it started.

@@ -202,6 +202,16 @@ fn cube_section(
         if button(ui, cropped, "Reset crop").clicked() {
             crop_requests.write(CropRequest::Reset);
         }
+        // Only a server's or a baked cube's cubelets are cached. In the browser a baked cube has no Server panel, so
+        // the button is here as well.
+        #[cfg(target_arch = "wasm32")]
+        if !data.source.has_cube()
+            && (ui.button("Clear the cache"))
+                .on_hover_text(crate::remote::CLEAR_CACHE)
+                .clicked()
+        {
+            crate::web::clear_cache();
+        }
     });
 }
 

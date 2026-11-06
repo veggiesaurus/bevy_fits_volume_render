@@ -62,6 +62,10 @@ impl Drop for Source {
     }
 }
 
+/// What Clear the cache does, on the Server panel and the main one.
+pub const CLEAR_CACHE: &str = "Forgets the cubelets kept from servers and baked cubes, in memory and on disk, so that \
+    cubes opened again come from the server or static hosting";
+
 /// A file's dims, HDU and size.
 type About = ([usize; 3], usize, u64);
 
@@ -396,10 +400,7 @@ pub fn browser(
                 wake();
             }
             if remote.server.is_some() && remote.closed.is_none() {
-                let clear = ui.button("Clear the cache").on_hover_text(
-                    "Forgets the cubelets kept from servers and baked cubes, in memory and on disk, so that cubes \
-                     opened again come from the server or static hosting",
-                );
+                let clear = ui.button("Clear the cache").on_hover_text(CLEAR_CACHE);
                 if clear.clicked() {
                     remote.send(Command::ClearCache);
                 }

@@ -38,7 +38,7 @@ thread_local! {
     static BAKED: RefCell<Option<(u32, baked::Source)>> = const { RefCell::new(None) };
     /// The connection to a server, with the viewer's id for it, while worker.js has its socket.
     static CLIENT: RefCell<Option<(u32, Client)>> = const { RefCell::new(None) };
-    /// worker.js's function that deletes every pack in OPFS but the one it's given the name of, which is open.
+    /// worker.js's function that deletes every pack in OPFS but those it's given the names of, which are open.
     static CLEAR_PACKS: RefCell<Option<Function>> = const { RefCell::new(None) };
 }
 
@@ -328,24 +328,16 @@ pub fn baked_fetched(load: u32, token: u32, bytes: Uint8Array) {
 }
 
 /// Starts connection `id` to the server at `url`, and returns the REGISTER_VIEWER to send once the socket is open,
-/// which carries the token. Up to `memory` bytes of the cubelets sent are kept in memory. `clear_packs` is called to
-/// empty OPFS of the packs.
+/// which carries the token. Up to `memory` bytes of the cubelets sent are kept in memory.
 #[wasm_bindgen]
-pub fn remote_start(
-    id: u32,
-    url: &str,
-    api_key: String,
-    memory: f64,
-    clear_packs: Function,
-) -> Uint8Array {
+pub fn remote_start(id: u32, url: &str, api_key: String, memory: f64) -> Uint8Array {
     let (client, register) = Client::new(url, api_key, memory as usize);
     CLIENT.set(Some((id, client)));
-    CLEAR_PACKS.set(Some(clear_packs));
     Uint8Array::from(&register[..])
 }
 
 /// One of the viewer's commands, as the messages to send the server. A command for a connection that's gone is
-/// dropped.
+/// dropped, except Clear the cache, which is for whatever's open and comes with no connection for a baked cube.
 #[wasm_bindgen]
 pub fn remote_command(message: Uint8Array) -> Array {
     let (id, command) = match wire::decode::<(u32, Command)>(&message.to_vec(), |_| None) {
@@ -355,26 +347,43 @@ pub fn remote_command(message: Uint8Array) -> Array {
             return Array::new();
         }
     };
-    let clear = matches!(command, Command::ClearCache);
-    let (messages, told, open) = CLIENT.with_borrow_mut(|client| match client {
-        Some((held, client)) if *held == id => {
-            let open = client.pack().map(String::from);
-            let (messages, told) = client.command(command);
-            (messages, told, Some(open))
-        }
-        _ => (Vec::new(), None, None),
-    });
-    if let (true, Some(open)) = (clear, open) {
-        CLEAR_PACKS.with_borrow(|clear| {
-            clear
-                .as_ref()
-                .map(|f| f.call1(&JsValue::NULL, &open.into()))
-        });
+    if let Command::ClearCache = command {
+        clear_cache();
+        return Array::new();
     }
+    let (messages, told) = CLIENT.with_borrow_mut(|client| match client {
+        Some((held, client)) if *held == id => client.command(command),
+        _ => (Vec::new(), None),
+    });
     if let Some(told) = told {
         post_remote(id, told);
     }
     messages.iter().map(|m| Uint8Array::from(&m[..])).collect()
+}
+
+/// Called once with worker.js's function that deletes every pack in OPFS but those it's given the names of.
+#[wasm_bindgen]
+pub fn opfs(clear_packs: Function) {
+    CLEAR_PACKS.set(Some(clear_packs));
+}
+
+/// The cache emptied, from either of the viewer's buttons and whichever connection it came over: the server's cube's
+/// pack and the baked cube's, which are open, and every other pack in OPFS.
+fn clear_cache() {
+    let mut open = Array::new();
+    CLIENT.with_borrow_mut(|client| {
+        if let Some((_, client)) = client {
+            open.extend(client.pack().map(JsValue::from));
+            client.clear();
+        }
+    });
+    BAKED.with_borrow_mut(|baked| {
+        if let Some((_, source)) = baked {
+            open.push(&source.pack().into());
+            source.clear();
+        }
+    });
+    CLEAR_PACKS.with_borrow(|clear| clear.as_ref().map(|f| f.call1(&JsValue::NULL, &open)));
 }
 
 /// The name of the pack worker.js is to open for the file just opened, once, and then hand to `remote_attach`.

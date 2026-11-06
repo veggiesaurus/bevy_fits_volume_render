@@ -254,10 +254,7 @@ impl Client {
                 )]
             }
             Command::ClearCache => {
-                self.memory.clear();
-                if let Some(kept) = self.open.as_mut().and_then(|open| open.kept.as_mut()) {
-                    kept.clear();
-                }
+                self.clear();
                 Vec::new()
             }
         };
@@ -394,6 +391,14 @@ impl Client {
     /// what was received.
     pub fn replies(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.replies)
+    }
+
+    /// Empties the cache, in memory and the open file's pack, now or once it's attached.
+    pub fn clear(&mut self) {
+        self.memory.clear();
+        if let Some(kept) = self.open.as_mut().and_then(|open| open.kept.as_mut()) {
+            kept.clear();
+        }
     }
 
     /// Whether `cached` has cubelets to decode.

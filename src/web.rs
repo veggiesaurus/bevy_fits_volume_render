@@ -155,6 +155,12 @@ impl Connection {
     }
 }
 
+/// Has the worker empty the cache, as the Server panel's button does. It's sent as a server command, which the
+/// worker acts on whatever the connection, as a baked cube has none.
+pub fn clear_cache() {
+    Connection(0).send(Command::ClearCache);
+}
+
 /// Called once from web/index.html with the functions that post a message to the worker, transferring its buffer,
 /// that have it connect to a server, and that have it let go of a file.
 #[wasm_bindgen]

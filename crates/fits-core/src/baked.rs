@@ -474,6 +474,13 @@ impl Source {
         !self.kept.hits.is_empty()
     }
 
+    /// Empties the cache of the cube's cubelets, in memory and in its pack.
+    pub fn clear(&mut self) {
+        self.memory.clear();
+        self.kept.clear();
+        self.last = None;
+    }
+
     /// The next of the cubelets asked for that are in the cache, decoded. One that has gone or doesn't decode is read
     /// again, in `fetches`.
     pub fn cached(&mut self) -> Option<Event> {
