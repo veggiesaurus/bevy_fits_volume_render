@@ -572,6 +572,7 @@ impl Wire for Command {
                 4u8.write(w);
                 file_id.write(w);
             }
+            Command::ClearCache => 5u8.write(w),
         }
     }
 
@@ -590,6 +591,7 @@ impl Wire for Command {
                 request: Wire::read(r)?,
             },
             4 => Command::Close(Wire::read(r)?),
+            5 => Command::ClearCache,
             _ => return None,
         })
     }
@@ -871,6 +873,7 @@ mod tests {
             },
         });
         round_trip(Command::Close(7));
+        round_trip(Command::ClearCache);
         round_trip(Received::Listing(Listing {
             directory: "a/b".into(),
             parent: Some("a".into()),

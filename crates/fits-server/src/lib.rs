@@ -3,7 +3,7 @@
 //! blocking threads, and the cubelets it compresses are kept for every session in one cache.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     fs::{File, Metadata},
     panic::AssertUnwindSafe,
     path::{Component, Path, PathBuf},
@@ -29,6 +29,7 @@ use axum::{
 };
 use fits_core::{
     self as fits, CUBELET, FileInfo,
+    cache::Lru,
     carta::{self, CUBE, FILE_CLOSED, Frame, ICD_VERSION, cubelet_at, frame, proto},
     codec,
     engine::{CubeletId, Engine, Event, Mode, Request},
@@ -62,7 +63,7 @@ struct Server {
     /// Canonical, so that a resolved path can be checked against it.
     root: PathBuf,
     token: String,
-    cache: Mutex<Cache>,
+    cache: Mutex<Lru<Key, Payload>>,
     /// read_fits reads on every core, so one read at a time.
     opens: Arc<Semaphore>,
     sessions: AtomicU32,
@@ -85,7 +86,7 @@ pub async fn serve(
     let server = Arc::new(Server {
         root: root.canonicalize()?,
         token,
-        cache: Mutex::new(Cache::default()),
+        cache: Mutex::new(Lru::new(CACHE_BYTES)),
         opens: Arc::new(Semaphore::new(1)),
         sessions: AtomicU32::new(0),
         workers: std::thread::available_parallelism().map_or(4, |n| n.get()),
@@ -146,7 +147,7 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 
 impl Server {
     /// The cache, even after a job panicked holding it: the worst a panic leaves is an entry missing.
-    fn cache(&self) -> MutexGuard<'_, Cache> {
+    fn cache(&self) -> MutexGuard<'_, Lru<Key, Payload>> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -301,45 +302,6 @@ type Key = (Arc<str>, Mode, [usize; 3], [usize; 3], Option<u64>);
 
 /// A cubelet's CUBELET_DATA without its address, encoded, to follow the address of each one it's sent as.
 type Payload = Arc<[u8]>;
-
-#[derive(Default)]
-struct Cache {
-    entries: HashMap<Key, (Payload, u64)>,
-    used: BTreeMap<u64, Key>,
-    tick: u64,
-    bytes: usize,
-}
-
-fn size(payload: &Payload) -> usize {
-    payload.len() + 64
-}
-
-impl Cache {
-    fn get(&mut self, key: &Key) -> Option<Payload> {
-        self.tick += 1;
-        let (payload, used) = self.entries.get_mut(key)?;
-        let key = self.used.remove(used).unwrap();
-        *used = self.tick;
-        self.used.insert(self.tick, key);
-        Some(payload.clone())
-    }
-
-    fn insert(&mut self, key: Key, payload: Payload) {
-        self.tick += 1;
-        self.bytes += size(&payload);
-        if let Some((old, used)) = self.entries.insert(key.clone(), (payload, self.tick)) {
-            self.bytes -= size(&old);
-            self.used.remove(&used);
-        }
-        self.used.insert(self.tick, key);
-        while self.bytes > CACHE_BYTES
-            && let Some((_, key)) = self.used.pop_first()
-        {
-            let (old, _) = self.entries.remove(&key).unwrap();
-            self.bytes -= size(&old);
-        }
-    }
-}
 
 /// A cubelet's CUBELET_DATA: its address, then its payload, since protobuf merges a message's encodings.
 fn cubelet_frame(file_id: i32, id: CubeletId, payload: &[u8]) -> Vec<u8> {
@@ -903,7 +865,7 @@ impl Session {
         let mut cache = self.server.cache();
         for id in Self::cubelets(file, mode, &add.cubelets) {
             match cache.get(&file.key(id).0) {
-                Some(payload) => cached.push((id, payload)),
+                Some(payload) => cached.push((id, payload.clone())),
                 None => cut.push(id),
             }
         }
@@ -996,7 +958,9 @@ impl Session {
                         if let Event::Cubelet { id, cubelet } = event {
                             let payload: Payload =
                                 codec::encode(&cubelet, tolerance).encode_to_vec().into();
-                            server.cache().insert(key.clone(), payload.clone());
+                            server
+                                .cache()
+                                .insert(key.clone(), payload.clone(), payload.len());
                             cubelets.push((id, payload));
                         }
                     }
@@ -1065,7 +1029,7 @@ mod tests {
         let server = Arc::new(Server {
             root: root.canonicalize().unwrap(),
             token: String::new(),
-            cache: Mutex::default(),
+            cache: Mutex::new(Lru::new(CACHE_BYTES)),
             opens: Arc::new(Semaphore::new(1)),
             sessions: AtomicU32::new(0),
             workers: 4,

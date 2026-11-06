@@ -19,6 +19,8 @@ pub struct Config {
     pub z_scale: ZScale,
     /// What a server's cubelets may be off by, in units of the cube's noise σ: one of `TOLERANCES`.
     pub zfp_tolerance_sigmas: f64,
+    /// How much of a server's cubelets, compressed, are kept in memory to be shown again without asking for them.
+    pub cache_memory_mb: u64,
     /// Gone, now that each projection mode reads its own pyramid, but still read so that older files parse.
     #[serde(skip_serializing)]
     max_mode_downsampling: serde::de::IgnoredAny,
@@ -36,6 +38,7 @@ impl Default for Config {
             threshold_max: 1.0,
             z_scale: ZScale::Cube,
             zfp_tolerance_sigmas: 1.0,
+            cache_memory_mb: 1024,
             max_mode_downsampling: serde::de::IgnoredAny,
         }
     }
@@ -194,15 +197,27 @@ pub fn from_toml(text: Option<&str>, overrides: &[(String, String)]) -> Result<C
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn default_path() -> Option<PathBuf> {
+    Some(user_dir("XDG_CONFIG_HOME", ".config", "APPDATA")?.join("config.toml"))
+}
+
+/// Where a server's cubelets are kept on disk.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cache_dir() -> Option<PathBuf> {
+    Some(user_dir("XDG_CACHE_HOME", ".cache", "LOCALAPPDATA")?.join("cubelets"))
+}
+
+/// The viewer's folder under the XDG one, or the one in `$HOME` it defaults to, or on Windows the one in `windows`.
+#[cfg(not(target_arch = "wasm32"))]
+fn user_dir(xdg: &str, home: &str, windows: &str) -> Option<PathBuf> {
     let var = |name| {
         std::env::var_os(name)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
     };
-    let base = var("XDG_CONFIG_HOME")
-        .or_else(|| var("HOME").map(|home| home.join(".config")))
-        .or_else(|| var("APPDATA"))?;
-    Some(base.join("idavie-bevy").join("config.toml"))
+    let base = var(xdg)
+        .or_else(|| var("HOME").map(|dir| dir.join(home)))
+        .or_else(|| var(windows))?;
+    Some(base.join("idavie-bevy"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -6,7 +6,8 @@
 //!
 //! For a cube on a fits-server, worker.js holds the socket and the `remote_` functions turn the server's messages into
 //! the viewer's and back, with fits-core's remote client, so that the cubelets are decoded here too. Those messages
-//! carry the id of the viewer's connection instead.
+//! carry the id of the viewer's connection instead. The client keeps the cubelets in a pack per cube in OPFS, whose
+//! file worker.js opens.
 #![cfg(target_arch = "wasm32")]
 
 use std::{
@@ -16,11 +17,12 @@ use std::{
 
 use fits_core::{
     self as fits,
+    cache::Store,
     engine::{Engine, Event, Request},
     remote::{Client, Command, Received},
     wire::{self, Wire},
 };
-use js_sys::{Array, ArrayBuffer, Float32Array, Object, Reflect, Uint8Array};
+use js_sys::{Array, ArrayBuffer, Float32Array, Function, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 
 thread_local! {
@@ -28,6 +30,8 @@ thread_local! {
     static ENGINE: RefCell<Option<(u32, Engine)>> = const { RefCell::new(None) };
     /// The connection to a server, with the viewer's id for it, while worker.js has its socket.
     static CLIENT: RefCell<Option<(u32, Client)>> = const { RefCell::new(None) };
+    /// worker.js's function that deletes every pack in OPFS but the one it's given the name of, which is open.
+    static CLEAR_PACKS: RefCell<Option<Function>> = const { RefCell::new(None) };
 }
 
 #[wasm_bindgen]
@@ -42,6 +46,55 @@ extern "C" {
     fn log_error(text: &str);
     #[wasm_bindgen(js_namespace = performance)]
     fn now() -> f64;
+
+    /// An OPFS file's FileSystemSyncAccessHandle, which only a dedicated worker can have.
+    pub type SyncAccessHandle;
+    #[wasm_bindgen(method, catch)]
+    fn read(this: &SyncAccessHandle, buffer: &mut [u8], options: &Object) -> Result<f64, JsValue>;
+    #[wasm_bindgen(method, catch)]
+    fn write(this: &SyncAccessHandle, buffer: &[u8], options: &Object) -> Result<f64, JsValue>;
+    #[wasm_bindgen(method, catch, js_name = getSize)]
+    fn get_size(this: &SyncAccessHandle) -> Result<f64, JsValue>;
+    #[wasm_bindgen(method, catch)]
+    fn truncate(this: &SyncAccessHandle, size: f64) -> Result<(), JsValue>;
+    #[wasm_bindgen(method)]
+    fn close(this: &SyncAccessHandle);
+}
+
+/// A pack's OPFS file, closed once it's dropped so that the next open of it can have it.
+struct Opfs(SyncAccessHandle);
+
+fn at(offset: u64) -> Object {
+    let options = Object::new();
+    let _ = Reflect::set(&options, &"at".into(), &(offset as f64).into());
+    options
+}
+
+impl Store for Opfs {
+    fn size(&mut self) -> u64 {
+        self.0.get_size().map_or(0, |size| size as u64)
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> bool {
+        let len = buf.len();
+        self.0
+            .read(buf, &at(offset))
+            .is_ok_and(|n| n as usize == len)
+    }
+
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> bool {
+        (self.0.write(bytes, &at(offset))).is_ok_and(|n| n as usize == bytes.len())
+    }
+
+    fn truncate(&mut self, size: u64) -> bool {
+        self.0.truncate(size as f64).is_ok()
+    }
+}
+
+impl Drop for Opfs {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 /// A panic aborts, so it's posted to the page as `{failed}` first.
@@ -162,10 +215,12 @@ fn buffer(message: &impl Wire) -> ArrayBuffer {
 }
 
 /// Starts connection `id`, and returns the REGISTER_VIEWER to send once the socket is open, which carries the token.
+/// Up to `memory` bytes of the cubelets sent are kept in memory. `clear_packs` is called to empty OPFS of the packs.
 #[wasm_bindgen]
-pub fn remote_start(id: u32, api_key: String) -> Uint8Array {
-    let (client, register) = Client::new(api_key);
+pub fn remote_start(id: u32, api_key: String, memory: f64, clear_packs: Function) -> Uint8Array {
+    let (client, register) = Client::new(api_key, memory as usize);
     CLIENT.set(Some((id, client)));
+    CLEAR_PACKS.set(Some(clear_packs));
     Uint8Array::from(&register[..])
 }
 
@@ -180,14 +235,60 @@ pub fn remote_command(message: Uint8Array) -> Array {
             return Array::new();
         }
     };
-    let (messages, told) = CLIENT.with_borrow_mut(|client| match client {
-        Some((held, client)) if *held == id => client.command(command),
-        _ => (Vec::new(), None),
+    let clear = matches!(command, Command::ClearCache);
+    let (messages, told, open) = CLIENT.with_borrow_mut(|client| match client {
+        Some((held, client)) if *held == id => {
+            let open = client.pack().map(String::from);
+            let (messages, told) = client.command(command);
+            (messages, told, Some(open))
+        }
+        _ => (Vec::new(), None, None),
     });
+    if let (true, Some(open)) = (clear, open) {
+        CLEAR_PACKS.with_borrow(|clear| {
+            clear
+                .as_ref()
+                .map(|f| f.call1(&JsValue::NULL, &open.into()))
+        });
+    }
     if let Some(told) = told {
         post_remote(id, told);
     }
     messages.iter().map(|m| Uint8Array::from(&m[..])).collect()
+}
+
+/// The name of the pack worker.js is to open for the file just opened, once, and then hand to `remote_attach`.
+#[wasm_bindgen]
+pub fn remote_pack() -> Option<String> {
+    CLIENT.with_borrow_mut(|client| client.as_mut()?.1.pack_to_open())
+}
+
+/// The pack `name`'s file, or none when OPFS couldn't open it, and how long it may grow. The viewer is told of the file
+/// opened once it's here.
+#[wasm_bindgen]
+pub fn remote_attach(name: String, handle: Option<SyncAccessHandle>, room: f64) {
+    let store = handle.map(|handle| (Box::new(Opfs(handle)) as Box<dyn Store>, room as u64));
+    let opened = CLIENT.with_borrow_mut(|client| {
+        let (id, client) = client.as_mut()?;
+        Some((*id, client.attach(&name, store)?))
+    });
+    if let Some((id, opened)) = opened {
+        post_remote(id, opened);
+    }
+}
+
+/// Decodes the next of the cubelets asked for that were in the cache, and returns what to send the server, or None
+/// when there were none.
+#[wasm_bindgen]
+pub fn remote_work() -> Option<Array> {
+    let (id, cubelet, replies) = CLIENT.with_borrow_mut(|client| {
+        let (id, client) = client.as_mut()?;
+        (client.has_cached()).then(|| (*id, client.cached(), client.replies()))
+    })?;
+    if let Some(cubelet) = cubelet {
+        post_remote(id, cubelet);
+    }
+    Some(replies.iter().map(|m| Uint8Array::from(&m[..])).collect())
 }
 
 /// A message from the server, as the replies to send it. An error ends the connection, and worker.js closes the

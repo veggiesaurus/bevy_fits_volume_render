@@ -1,20 +1,25 @@
 // The data source's Web Worker, so that none of this holds up the page: it downloads or reads the file in a load,
 // { load, source, hdu } with a File or URL as the source, and fits-worker holds the cube and answers the viewer's
 // requests, until { release } says the viewer no longer shows it. ArrayBuffers both ways are the source's messages. It
-// also holds the socket to a fits-server, opened with { server, token, id }, and { remote } messages both ways are
-// the viewer's for that connection.
-import init, { held, open, release, remote_closed, remote_command, remote_receive, remote_start, request, work } from "./pkg/fits_worker.js";
+// also holds the socket to a fits-server, opened with { server, token, id, memory }, and { remote } messages both ways
+// are the viewer's for that connection.
+import init, {
+  held, open, release, remote_attach, remote_closed, remote_command, remote_pack, remote_receive, remote_start,
+  remote_work, request, work,
+} from "./pkg/fits_worker.js";
 
 const ready = init();
 ready.catch((e) => postMessage({ failed: `could not start: ${e.message ?? e}` }));
 
 // A job at a time, each in a task of its own, so that requests (a cursor value, cubelets no longer wanted) are
-// taken in between.
+// taken in between. A server's cubelets that were in the cache are decoded the same way.
 const jobs = new MessageChannel();
 let scheduled = false;
 jobs.port1.onmessage = () => {
   scheduled = false;
-  if (work()) schedule();
+  const sent = remote_work();
+  if (sent) toServer(sent);
+  if (work() || sent) schedule();
 };
 function schedule() {
   if (!scheduled) {
@@ -30,6 +35,7 @@ onmessage = async ({ data }) => {
     schedule();
   } else if (data.remote) {
     toServer(remote_command(new Uint8Array(data.remote)));
+    schedule();
   } else if (data.release !== undefined) {
     release(data.release);
   } else if (data.server) {
@@ -45,9 +51,9 @@ onmessage = async ({ data }) => {
 let socket;
 let unsent = [];
 
-function connectServer({ server: url, token, id }) {
+function connectServer({ server: url, token, id, memory }) {
   closeServer("another connection took its place");
-  unsent = [remote_start(id, token)];
+  unsent = [remote_start(id, token, memory, clearPacks)];
   let ws;
   try {
     ws = socket = new WebSocket(url);
@@ -66,6 +72,13 @@ function connectServer({ server: url, token, id }) {
       toServer(remote_receive(new Uint8Array(data)));
     } catch (e) {
       closeServer(e.message ?? String(e));
+    }
+    const pack = remote_pack();
+    if (pack) {
+      openPack(pack).then(([handle, room]) => remote_attach(pack, handle, room), (e) => {
+        console.warn(`Cubelets are kept in memory only: ${e.message ?? e}`);
+        remote_attach(pack, null, 0);
+      });
     }
   };
   // A browser doesn't say why a socket failed, only that it closed.
@@ -89,6 +102,41 @@ function closeServer(reason) {
     ws.close();
     remote_closed(reason);
   }
+}
+
+// The server's cubelets are kept in a pack per cube in OPFS, under a cap on them all, the least recently used going
+// first to make room for the one opened. Without OPFS they're kept in memory only.
+const CAP = 4 * 2 ** 30, RESERVE = 2 ** 30;
+const packs = (async () => (await navigator.storage.getDirectory()).getDirectoryHandle("cubelets", { create: true }))()
+  .catch(() => null);
+
+// The pack's file and how long it may grow. Another tab with the same cube open holds the file, and this one goes
+// without.
+async function openPack(name) {
+  const dir = await packs;
+  const all = [];
+  for await (const [other, handle] of dir.entries()) {
+    const file = await handle.getFile().catch(() => null);
+    if (file) all.push({ name: other, size: file.size, used: file.lastModified });
+  }
+  all.sort((a, b) => a.used - b.used);
+  const current = all.find((p) => p.name === name)?.size ?? 0;
+  let others = all.reduce((sum, p) => sum + p.size, 0) - current;
+  for (const p of all) {
+    if (others + current + RESERVE <= CAP) break;
+    if (p.name !== name) await dir.removeEntry(p.name).then(() => (others -= p.size), () => {});
+  }
+  const file = await dir.getFileHandle(name, { create: true });
+  return [await file.createSyncAccessHandle(), CAP - others];
+}
+
+// Every pack but the one open, which the client has emptied.
+async function clearPacks(open) {
+  const dir = await packs;
+  if (!dir) return;
+  const names = [];
+  for await (const name of dir.keys()) if (name !== open) names.push(name);
+  for (const name of names) await dir.removeEntry(name).catch(() => {});
 }
 
 // Only the latest load is read, so a slow download can't replace a file picked after it started.

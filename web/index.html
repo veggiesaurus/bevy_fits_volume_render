@@ -153,7 +153,7 @@ try {
 // Without a worker posting throws, which the viewer logs. A server's messages go as { remote }.
 connect(
   (message, remote) => worker.postMessage(remote ? { remote: message } : message, [message]),
-  (url, token, id) => (worker ??= startWorker()).postMessage({ server: url, token, id }),
+  (url, token, id, memory) => (worker ??= startWorker()).postMessage({ server: url, token, id, memory }),
   (load) => worker?.postMessage({ release: load }),
 );
 started = true;

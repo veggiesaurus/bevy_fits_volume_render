@@ -1,9 +1,18 @@
 //! The remote data source: the viewer's requests as CARTA messages to a server, and what comes back as the data
 //! source's events. `Client` only turns one into the other, so the viewer's socket thread natively and the browser's
-//! worker can share it, each moving the bytes its own way.
+//! worker can share it, each moving the bytes its own way. It keeps the cubelets it's sent, compressed, and answers
+//! from those what it can.
+
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+};
+
+use prost::Message as _;
 
 use crate::{
     CUBELET, FileInfo,
+    cache::{self, Lru, Pack, Store},
     carta::{self, CUBE, FILE_CLOSED, Frame, cubelet_key, frame, proto},
     codec,
     engine::{CubeletId, Event, Request},
@@ -40,6 +49,8 @@ pub enum Command {
     },
     /// The file opened as `file_id` is no longer wanted.
     Close(i32),
+    /// Empties the cache, in memory and on disk.
+    ClearCache,
 }
 
 #[derive(Debug)]
@@ -105,10 +116,23 @@ struct Opening {
     statistics: Option<Vec<proto::StatisticsValue>>,
 }
 
+/// A cubelet's CUBELET_DATA as the server sent it, which is what the cache keeps.
+type Payload = Arc<[u8]>;
+
+/// Cubelets by what they're of and where, with the tolerance they're within.
+type Memory = Lru<(Arc<str>, CubeletId), (f64, Payload)>;
+
 struct Open {
     file_id: i32,
     levels: Vec<[usize; 3]>,
     tolerance: Option<f64>,
+    /// What the file's cubelets are kept as, and the name of its pack, when the server says what the file is.
+    identity: Option<(Arc<str>, String)>,
+    pack: Option<Pack>,
+    /// The cache was cleared before the pack was attached, so it's emptied then.
+    cleared: bool,
+    /// Cubelets asked for that are in the cache, for `cached`.
+    hits: VecDeque<CubeletId>,
 }
 
 pub struct Client {
@@ -120,6 +144,11 @@ pub struct Client {
     next_request_id: u32,
     /// Messages for the server that `receive` has made, for `replies`.
     replies: Vec<Vec<u8>>,
+    memory: Memory,
+    /// The open file, which the viewer is told of once its pack is attached, and the pack's name until it's asked
+    /// for.
+    held: Option<Received>,
+    pack_to_open: Option<String>,
 }
 
 /// CARTA's directories and files are separate fields.
@@ -147,10 +176,75 @@ fn by_mode(ids: &[CubeletId]) -> Result<Vec<(SmoothingMode, Vec<u64>)>, String> 
     Ok(runs)
 }
 
+impl Open {
+    /// Whether `id` is in the cache within the tolerance asked for, in which case it's queued for `cached`.
+    fn hit(&mut self, memory: &mut Memory, id: CubeletId) -> bool {
+        let Some((identity, _)) = &self.identity else {
+            return false;
+        };
+        let tolerance = self.tolerance.unwrap_or(0.0);
+        let in_memory = (memory.get(&(identity.clone(), id))).is_some_and(|e| e.0 <= tolerance);
+        let hit = in_memory || self.pack.as_ref().is_some_and(|p| p.has(id, tolerance));
+        if hit {
+            self.hits.push_back(id);
+        }
+        hit
+    }
+
+    /// A cubelet from the cache, from memory or else from the pack, and then kept in both: the pack may have been made
+    /// since the cubelet came.
+    fn find(&mut self, memory: &mut Memory, id: CubeletId) -> Option<Payload> {
+        let (identity, _) = self.identity.as_ref()?;
+        let tolerance = self.tolerance.unwrap_or(0.0);
+        let key = (identity.clone(), id);
+        if let Some(&(within, ref payload)) = memory.get(&key).filter(|e| e.0 <= tolerance) {
+            if let Some(pack) = &mut self.pack {
+                pack.put(id, within, payload);
+            }
+            return Some(payload.clone());
+        }
+        let (within, payload) = self.pack.as_mut()?.get(id, tolerance)?;
+        let payload: Payload = payload.into();
+        memory.insert(key, (within, payload.clone()), payload.len());
+        Some(payload)
+    }
+
+    /// Keeps a cubelet the server sent, `payload` being its CUBELET_DATA.
+    fn keep(&mut self, memory: &mut Memory, id: CubeletId, payload: &[u8]) {
+        let Some((identity, _)) = &self.identity else {
+            return;
+        };
+        let tolerance = self.tolerance.unwrap_or(0.0);
+        if let Some(pack) = &mut self.pack {
+            pack.put(id, tolerance, payload);
+        }
+        let key = (identity.clone(), id);
+        memory.insert(key, (tolerance, payload.into()), payload.len());
+    }
+
+    fn add(&self, ids: &[CubeletId]) -> Result<Vec<Vec<u8>>, String> {
+        let (compression_type, tolerance) = match self.tolerance {
+            Some(tolerance) => (CompressionType::ZfpExplicit, tolerance),
+            None => (CompressionType::None, 0.0),
+        };
+        let messages = (by_mode(ids)?.into_iter()).map(|(mode, cubelets)| {
+            let add = proto::AddRequiredCubelets {
+                file_id: self.file_id,
+                mode: mode.into(),
+                cubelets,
+                compression_type: compression_type.into(),
+                tolerance,
+            };
+            frame(EventType::AddRequiredCubelets, 0, &add)
+        });
+        Ok(messages.collect())
+    }
+}
+
 impl Client {
     /// With the REGISTER_VIEWER to send first, which carries `api_key` as the token for a server that wasn't given one
-    /// when the socket connected.
-    pub fn new(api_key: String) -> (Self, Vec<u8>) {
+    /// when the socket connected. Up to `memory` bytes of the cubelets the server sends are kept in memory.
+    pub fn new(api_key: String, memory: usize) -> (Self, Vec<u8>) {
         let client = Self {
             next_file_id: 0,
             opening: None,
@@ -158,6 +252,9 @@ impl Client {
             info: Vec::new(),
             next_request_id: 1,
             replies: Vec::new(),
+            memory: Lru::new(memory),
+            held: None,
+            pack_to_open: None,
         };
         let register = proto::RegisterViewer {
             api_key,
@@ -212,6 +309,16 @@ impl Client {
                     id,
                     &proto::CloseFile { file_id },
                 )]
+            }
+            Command::ClearCache => {
+                self.memory.clear();
+                if let Some(open) = &mut self.open {
+                    match &mut open.pack {
+                        Some(pack) => pack.clear(),
+                        None => open.cleared = true,
+                    }
+                }
+                Vec::new()
             }
         };
         (messages, None)
@@ -298,39 +405,31 @@ impl Client {
 
     fn messages(&mut self, file_id: i32, request: Request) -> Result<Vec<Vec<u8>>, String> {
         // A request for a file opened before, from a view that's on its way out.
-        let Some(open) = self.open.as_ref().filter(|open| open.file_id == file_id) else {
+        let Some(open) = self.open.as_mut().filter(|open| open.file_id == file_id) else {
             return Ok(Vec::new());
         };
         Ok(match request {
             Request::Levels { .. } => Vec::new(),
             Request::AddCubelets { ids } => {
-                let (compression_type, tolerance) = match open.tolerance {
-                    Some(tolerance) => (CompressionType::ZfpExplicit, tolerance),
-                    None => (CompressionType::None, 0.0),
-                };
+                let ids: Vec<_> = (ids.into_iter())
+                    .filter(|&id| !open.hit(&mut self.memory, id))
+                    .collect();
+                open.add(&ids)?
+            }
+            Request::RemoveCubelets { ids } => {
+                let removed: HashSet<_> = ids.iter().collect();
+                open.hits.retain(|id| !removed.contains(id));
                 (by_mode(&ids)?.into_iter())
                     .map(|(mode, cubelets)| {
-                        let add = proto::AddRequiredCubelets {
+                        let remove = proto::RemoveRequiredCubelets {
                             file_id,
                             mode: mode.into(),
                             cubelets,
-                            compression_type: compression_type.into(),
-                            tolerance,
                         };
-                        frame(EventType::AddRequiredCubelets, 0, &add)
+                        frame(EventType::RemoveRequiredCubelets, 0, &remove)
                     })
                     .collect()
             }
-            Request::RemoveCubelets { ids } => (by_mode(&ids)?.into_iter())
-                .map(|(mode, cubelets)| {
-                    let remove = proto::RemoveRequiredCubelets {
-                        file_id,
-                        mode: mode.into(),
-                        cubelets,
-                    };
-                    frame(EventType::RemoveRequiredCubelets, 0, &remove)
-                })
-                .collect(),
             // The request ID pairs the answer with it.
             Request::PixelValue { id, voxel } => {
                 let [x, y, z] = voxel.map(|v| v.min(i32::MAX as usize) as i32);
@@ -349,9 +448,66 @@ impl Client {
         })
     }
 
-    /// The messages `receive` has made for the server since this was last called, to be sent after what it received.
+    /// The messages `receive` and `cached` have made for the server since this was last called, to be sent after
+    /// what was received.
     pub fn replies(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.replies)
+    }
+
+    /// Whether `cached` has cubelets to decode.
+    pub fn has_cached(&self) -> bool {
+        self.open.as_ref().is_some_and(|open| !open.hits.is_empty())
+    }
+
+    /// The next of the cubelets asked for that are in the cache, read and decoded, which is slow enough to go one at a
+    /// time. One that has gone from the cache since, or doesn't decode, is asked of the server instead, in `replies`.
+    pub fn cached(&mut self) -> Option<Received> {
+        let open = self.open.as_mut()?;
+        while let Some(id) = open.hits.pop_front() {
+            let payload = open.find(&mut self.memory, id).ok_or_else(String::new);
+            let data =
+                payload.and_then(|p| proto::CubeletData::decode(&p[..]).map_err(|e| e.to_string()));
+            match data.and_then(|data| codec::decode(&data)) {
+                Ok(cubelet) => {
+                    let event = Event::Cubelet { id, cubelet };
+                    let file_id = open.file_id;
+                    return Some(Received::Event { file_id, event });
+                }
+                Err(_) => {
+                    if let Some(pack) = &mut open.pack {
+                        pack.forget(id);
+                    }
+                    self.replies.extend(open.add(&[id]).unwrap_or_default());
+                }
+            }
+        }
+        None
+    }
+
+    /// The name of the open file's pack, if it has one.
+    pub fn pack(&self) -> Option<&str> {
+        let open = self.open.as_ref()?;
+        open.identity.as_ref().map(|(_, name)| name.as_str())
+    }
+
+    /// The pack to open for the file just opened, once: the viewer is told of the file when `attach` has it.
+    pub fn pack_to_open(&mut self) -> Option<String> {
+        self.pack_to_open.take()
+    }
+
+    /// The pack `name` for the open file: the store it's in and how long it may grow, or None when it can't be kept.
+    /// Returns the open, for the viewer, unless the file has gone since.
+    pub fn attach(&mut self, name: &str, store: Option<(Box<dyn Store>, u64)>) -> Option<Received> {
+        let open = self.open.as_mut()?;
+        let (identity, wanted) = open.identity.as_ref()?;
+        if wanted != name || self.held.is_none() {
+            return None;
+        }
+        open.pack = store.map(|(store, room)| Pack::open(store, identity, room));
+        if let (Some(pack), true) = (&mut open.pack, open.cleared) {
+            pack.clear();
+        }
+        self.held.take()
     }
 
     /// What a message from the server means for the viewer. An error ends the connection: a message that doesn't make
@@ -426,7 +582,7 @@ impl Client {
             }
             EventType::CubeletData => {
                 let data: proto::CubeletData = message.decode()?;
-                let Some(open) = self.open.as_ref().filter(|o| o.file_id == data.file_id) else {
+                let Some(open) = self.open.as_mut().filter(|o| o.file_id == data.file_id) else {
                     return Ok(Vec::new());
                 };
                 let level = usize::try_from(data.level)
@@ -443,6 +599,7 @@ impl Client {
                 let id =
                     CubeletId::new(mode, Default::default(), level, [x, y, z].map(usize::from));
                 let cubelet = codec::decode(&data)?;
+                open.keep(&mut self.memory, id, message.payload);
                 vec![Received::Event {
                     file_id: data.file_id,
                     event: Event::Cubelet { id, cubelet },
@@ -551,18 +708,34 @@ impl Client {
             .filter(|levels: &Vec<_>| levels.first() == Some(&[1; 3]))
             .ok_or("a level list that doesn't start at level 0")?;
         let tolerance = info.sigma.map(|sigma| opening.sigmas * sigma);
+        let identity = (!volume.content_id.is_empty()).then(|| {
+            let identity = cache::identity(&volume.content_id, &levels);
+            let name = cache::pack_name(&identity);
+            (identity.into(), name)
+        });
+        self.pack_to_open = identity.as_ref().map(|(_, name)| name.clone());
         self.open = Some(Open {
             file_id: opening.file_id,
             levels: levels.clone(),
             tolerance,
+            identity,
+            pack: None,
+            cleared: false,
+            hits: VecDeque::new(),
         });
-        Ok(vec![Received::Opened(Box::new(Opened {
+        let opened = Received::Opened(Box::new(Opened {
             file_id: opening.file_id,
             path: opening.path,
             info,
             levels,
             tolerance,
-        }))])
+        }));
+        if self.pack_to_open.is_none() {
+            self.held = None;
+            return Ok(vec![opened]);
+        }
+        self.held = Some(opened);
+        Ok(Vec::new())
     }
 }
 
@@ -572,9 +745,10 @@ mod native {
         collections::VecDeque,
         io::{self, ErrorKind, Read, Write},
         net::{Shutdown, TcpStream},
+        path::PathBuf,
         sync::{
             Arc,
-            mpsc::{self, RecvTimeoutError},
+            mpsc::{self, RecvTimeoutError, TryRecvError},
         },
         time::Duration,
     };
@@ -587,6 +761,7 @@ mod native {
     };
 
     use super::{Client, Command, Received};
+    use crate::cache::{Folder, Store};
 
     /// A message from the server at most: a cubelet is a MiB and a bit.
     const MAX_MESSAGE: usize = 64 << 20;
@@ -616,17 +791,22 @@ mod native {
     }
 
     impl Connection {
-        /// `url` is `ws://host:port/`, with `?token=...` or else the token as `api_key`. `receive` is called on the
-        /// connection's thread, last with `Received::Closed`, once.
+        /// `url` is `ws://host:port/`, with `?token=...` or else the token as `api_key`. Up to `memory` bytes of the
+        /// cubelets sent are kept in memory, and with `folder` on disk there. `receive` is called on the connection's
+        /// thread, last with `Received::Closed`, once.
         pub fn connect(
             url: &str,
             api_key: String,
+            memory: usize,
+            folder: Option<PathBuf>,
             mut receive: impl FnMut(Received) + Send + 'static,
         ) -> Self {
             let (wake, rx) = mpsc::channel();
             let (url, reader) = (url.to_string(), wake.clone());
             std::thread::spawn(move || {
-                let reason = run(&url, api_key, reader, &rx, &mut receive).err();
+                let client = Client::new(api_key, memory);
+                let folder = folder.map(Folder::new);
+                let reason = run(&url, client, folder, reader, &rx, &mut receive).err();
                 receive(Received::Closed(reason.unwrap_or_else(|| "closed".into())));
             });
             Self(Arc::new(Waker(wake)))
@@ -679,7 +859,8 @@ mod native {
 
     fn run(
         url: &str,
-        api_key: String,
+        client: (Client, Vec<u8>),
+        folder: Option<Folder>,
         reader: mpsc::Sender<Wake>,
         wakes: &mpsc::Receiver<Wake>,
         receive: &mut impl FnMut(Received),
@@ -722,7 +903,7 @@ mod native {
             ended: false,
         };
         let mut socket = WebSocket::from_raw_socket(stream, Role::Client, Some(config));
-        let result = serve(&mut socket, Client::new(api_key), wakes, receive);
+        let result = serve(&mut socket, client, folder.as_ref(), wakes, receive);
         let _ = socket.close(None);
         let _ = socket.flush();
         // Which ends the reader thread too.
@@ -731,10 +912,11 @@ mod native {
     }
 
     /// Asleep until there's a command to send or something the server sent, or while a write waits on the server,
-    /// until it might take more.
+    /// until it might take more. Cubelets from the cache are decoded while there's nothing else to do.
     fn serve(
         socket: &mut WebSocket<Stream>,
         (mut client, register): (Client, Vec<u8>),
+        folder: Option<&Folder>,
         wakes: &mpsc::Receiver<Wake>,
         receive: &mut impl FnMut(Received),
     ) -> Result<(), String> {
@@ -744,17 +926,33 @@ mod native {
                 Err(e) if waiting(&e) => true,
                 result => result.map(|()| false).map_err(|e| e.to_string())?,
             };
-            let wake = match unwritten {
-                true => match wakes.recv_timeout(POLL) {
+            let wake = if client.has_cached() {
+                match wakes.try_recv() {
+                    Ok(wake) => wake,
+                    Err(TryRecvError::Empty) => {
+                        client.cached().into_iter().for_each(&mut *receive);
+                        for message in client.replies() {
+                            written(socket.write(Message::binary(message)))?;
+                        }
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => return Ok(()),
+                }
+            } else if unwritten {
+                match wakes.recv_timeout(POLL) {
                     Ok(wake) => wake,
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => return Ok(()),
-                },
-                false => wakes.recv().map_err(|_| "closed".to_string())?,
+                }
+            } else {
+                wakes.recv().map_err(|_| "closed".to_string())?
             };
             let mut messages = Vec::new();
             match wake {
                 Wake::Command(command) => {
+                    if let (Command::ClearCache, Some(folder)) = (&command, folder) {
+                        folder.clear(client.pack());
+                    }
                     let (sent, told) = client.command(command);
                     told.into_iter().for_each(&mut *receive);
                     messages = sent;
@@ -767,6 +965,15 @@ mod native {
                         match socket.read() {
                             Ok(Message::Binary(bytes)) => {
                                 client.receive(&bytes)?.into_iter().for_each(&mut *receive);
+                                if let Some(name) = client.pack_to_open() {
+                                    let store = (folder.and_then(|folder| folder.open(&name))).map(
+                                        |(file, room)| (Box::new(file) as Box<dyn Store>, room),
+                                    );
+                                    client
+                                        .attach(&name, store)
+                                        .into_iter()
+                                        .for_each(&mut *receive);
+                                }
                                 messages.extend(client.replies());
                             }
                             Ok(Message::Close(_)) => {

@@ -108,7 +108,7 @@ fn connect(port: u16, token: &str) -> (Connection, mpsc::Receiver<Received>) {
 
 fn connect_with(url: &str, api_key: &str) -> (Connection, mpsc::Receiver<Received>) {
     let (tx, rx) = mpsc::channel();
-    let connection = Connection::connect(url, api_key.into(), move |received| {
+    let connection = Connection::connect(url, api_key.into(), 1 << 30, None, move |received| {
         let _ = tx.send(received);
     });
     (connection, rx)

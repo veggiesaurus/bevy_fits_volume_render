@@ -132,7 +132,7 @@ impl Remote {
         let (received, events) = <(Arc<Mutex<Vec<_>>>, Arc<Mutex<Vec<_>>>)>::default();
         let (to_viewer, to_source) = (received.clone(), events.clone());
         let api_key = self.api_key.clone();
-        self.connection = Some(Connection::connect(&self.url, api_key, move |message| {
+        let receive = move |message| {
             match message {
                 Received::Event { file_id, event } => {
                     to_source.lock().unwrap().push((file_id, event))
@@ -140,7 +140,17 @@ impl Remote {
                 message => to_viewer.lock().unwrap().push(message),
             }
             wake();
-        }));
+        };
+        let memory = usize::try_from(self.config.cache_memory_mb.saturating_mul(1 << 20));
+        let memory = memory.unwrap_or(usize::MAX);
+        #[cfg(not(target_arch = "wasm32"))]
+        let connection = {
+            let folder = crate::config::cache_dir();
+            Connection::connect(&self.url, api_key, memory, folder, receive)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let connection = Connection::connect(&self.url, api_key, memory, receive);
+        self.connection = Some(connection);
         (self.received, self.events) = (received, events);
         (self.server, self.closed, self.listing, self.error) = (None, None, None, None);
         (self.picked, self.opening) = (None, None);
@@ -384,6 +394,15 @@ pub fn browser(
             if shown && ui.button("Close the cube shown").clicked() {
                 remote.close = true;
                 wake();
+            }
+            if remote.server.is_some() && remote.closed.is_none() {
+                let clear = ui.button("Clear the cache").on_hover_text(
+                    "Forgets the cubelets kept from the server, in memory and on disk, so that cubes opened again \
+                     come from the server",
+                );
+                if clear.clicked() {
+                    remote.send(Command::ClearCache);
+                }
             }
             if let Some(error) = &remote.error {
                 ui.colored_label(ui.visuals().error_fg_color, error);

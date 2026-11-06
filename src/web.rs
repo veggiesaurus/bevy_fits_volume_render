@@ -115,14 +115,21 @@ impl WorkerSource {
 pub struct Connection(u32);
 
 impl Connection {
-    /// `receive` is called with what the server sends, last with `Received::Closed`.
-    pub fn connect(url: &str, api_key: String, receive: impl FnMut(Received) + 'static) -> Self {
+    /// `receive` is called with what the server sends, last with `Received::Closed`. Up to `memory` bytes of the
+    /// cubelets sent are kept in memory, and the worker keeps them in OPFS as well.
+    pub fn connect(
+        url: &str,
+        api_key: String,
+        memory: usize,
+        receive: impl FnMut(Received) + 'static,
+    ) -> Self {
         let id = CONNECTIONS.get() + 1;
         CONNECTIONS.set(id);
         REMOTE.set(Some((id, Box::new(receive))));
         let called = CONNECT.with_borrow(|connect| {
             connect.as_ref().map(|connect| {
-                connect.call3(&JsValue::NULL, &url.into(), &api_key.into(), &id.into())
+                let (url, api_key) = (url.into(), api_key.into());
+                connect.call4(&JsValue::NULL, &url, &api_key, &id.into(), &memory.into())
             })
         });
         if !matches!(called, Some(Ok(_))) {
