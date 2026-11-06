@@ -59,7 +59,7 @@ A build of `main` is published at https://fits.veggiesaurus.net. Locally, open h
 
 `?server=ws://127.0.0.1:3002#token=...` opens the Server panel on a fits-server, and `&path=` opens a cube under its root straight away. The token goes after the `#`, which isn't sent with requests, and the page takes it out of the address bar at once; without it, the panel asks for the token. The viewer sends it to the server in its first message rather than in the URL, since a browser prints a socket's URL in the console when it can't connect. The worker holds the socket and decodes the cubelets, as it does a file's, and keeps the server's cubelets in the site's origin private file system (OPFS) where the native viewer keeps them on disk.
 
-A cube can be baked so that it opens without downloading all of it. `fits-bake` writes each cube's max and mean pyramids as cubelets within 1σ of its noise, after an index of them, to `CUBE.fits.cubelets` beside it:
+The example cubes on the page are baked, so that they open without downloading the whole cube. `fits-bake` writes each cube's max and mean pyramids as cubelets within 1σ of its noise, after an index of them, to `CUBE.fits.cubelets` beside it:
 
 ```
 cargo run --release -p fits-server --example fits-bake -- [--sigmas S] [--exact-level-0] [--out DIR] cube.fits...
