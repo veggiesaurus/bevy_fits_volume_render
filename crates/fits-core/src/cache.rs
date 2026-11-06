@@ -194,10 +194,35 @@ fn read_record(head: &[u8; RECORD]) -> (CubeletId, f64, usize) {
     (id, tolerance, len as usize)
 }
 
-/// What a pack is of: a file's identity from the server, and the level list its cubelets are cut by.
-pub fn identity(content_id: &str, levels: &[[usize; 3]]) -> String {
+/// What a pack is of: the server, which is named so that one server's cubelets are never taken for another's, the
+/// file's identity from that server, and the level list its cubelets are cut by.
+pub fn identity(server: &str, content_id: &str, levels: &[[usize; 3]]) -> String {
     // The number goes up when a record's layout changes, which leaves the packs before to be evicted.
-    format!("cubelets 1, {CUBELET}³, {content_id}, {levels:?}")
+    format!("cubelets 1, {CUBELET}³, {server}, {content_id}, {levels:?}")
+}
+
+/// A server's URL as the host, port and path it's at, which tell servers apart: without the scheme, since `ws://` and
+/// `wss://` share a port, and without the query, the fragment or a user, which can carry a token.
+pub fn origin(url: &str) -> String {
+    let url = &url[..url.find(['?', '#']).unwrap_or(url.len())];
+    let (scheme, rest) = match url.find("://") {
+        Some(i) if !url[..i].contains('/') => (url[..i].to_ascii_lowercase(), &url[i + 3..]),
+        _ => (String::new(), url),
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let has_port = (host.rsplit_once(':'))
+        .is_some_and(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+    let port = match scheme.as_str() {
+        _ if has_port => "",
+        "wss" | "https" => ":443",
+        "ws" | "http" => ":80",
+        _ => "",
+    };
+    let path = path.trim_end_matches('/');
+    format!("{}{port}{path}", host.to_ascii_lowercase())
 }
 
 /// The name of the file a pack is kept in, an FNV-1a hash of its identity.
@@ -335,7 +360,22 @@ mod tests {
             let (file, room) = folder.open(name).unwrap();
             Pack::open(Box::new(file), identity, room)
         };
-        let mut pack = open("a", "cube a");
+        // Packs are kept by server, which a token in the URL doesn't change.
+        let server = origin("ws://LocalHost:3002/?token=secret");
+        assert_eq!(
+            server,
+            origin("wss://user:pass@localhost:3002#token=secret")
+        );
+        assert_eq!(server, "localhost:3002");
+        assert_eq!(origin("ws://example.org"), origin("ws://example.org:80/"));
+        assert_ne!(origin("ws://example.org"), origin("wss://example.org"));
+        assert_ne!(
+            origin("wss://hub.org/user/alice"),
+            origin("wss://hub.org/user/bob")
+        );
+        assert_eq!(origin("host:3002/?next=ws://other:1"), "host:3002");
+        let cube = |server: &str| identity(server, "cubes/a.fits:100:7:0", &[[1; 3], [2, 2, 1]]);
+        let mut pack = open("a", &cube(&server));
         pack.put(id(1, 0), 0.5, &[1; 100]);
         pack.put(id(0, 0), 0.5, &[2; 100]);
         // Level 0 is the same in either mode.
@@ -356,13 +396,13 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(&[9; RECORD + 10]).unwrap();
         drop(file);
-        let mut pack = open("a", "cube a");
+        let mut pack = open("a", &cube(&server));
         assert_eq!(fs::metadata(&path).unwrap().len(), size);
         assert_eq!(pack.get(id(1, 0), 0.5).map(|c| c.1), Some(vec![3; 50]));
         assert!(pack.get(id(0, 0), 0.5).is_some());
-        // Of something else, it starts empty.
+        // Of the same file on another server, it starts empty.
         drop(pack);
-        let mut pack = open("a", "cube b");
+        let mut pack = open("a", &cube("elsewhere:3002"));
         assert!(pack.get(id(0, 0), 0.5).is_none());
 
         // A pack that would leave no room for the one opened goes, the least recently used first, and the one opened

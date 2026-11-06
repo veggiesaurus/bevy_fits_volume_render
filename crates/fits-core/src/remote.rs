@@ -145,6 +145,8 @@ pub struct Client {
     /// Messages for the server that `receive` has made, for `replies`.
     replies: Vec<Vec<u8>>,
     memory: Memory,
+    /// The server, as `cache::origin` has it, which the packs are kept by.
+    server: String,
     /// The open file, which the viewer is told of once its pack is attached, and the pack's name until it's asked
     /// for.
     held: Option<Received>,
@@ -242,9 +244,10 @@ impl Open {
 }
 
 impl Client {
-    /// With the REGISTER_VIEWER to send first, which carries `api_key` as the token for a server that wasn't given one
-    /// when the socket connected. Up to `memory` bytes of the cubelets the server sends are kept in memory.
-    pub fn new(api_key: String, memory: usize) -> (Self, Vec<u8>) {
+    /// For the server at `url`, with the REGISTER_VIEWER to send first, which carries `api_key` as the token for a server
+    /// that wasn't given one when the socket connected. Up to `memory` bytes of the cubelets the server sends are kept
+    /// in memory.
+    pub fn new(url: &str, api_key: String, memory: usize) -> (Self, Vec<u8>) {
         let client = Self {
             next_file_id: 0,
             opening: None,
@@ -253,6 +256,7 @@ impl Client {
             next_request_id: 1,
             replies: Vec::new(),
             memory: Lru::new(memory),
+            server: cache::origin(url),
             held: None,
             pack_to_open: None,
         };
@@ -709,7 +713,7 @@ impl Client {
             .ok_or("a level list that doesn't start at level 0")?;
         let tolerance = info.sigma.map(|sigma| opening.sigmas * sigma);
         let identity = (!volume.content_id.is_empty()).then(|| {
-            let identity = cache::identity(&volume.content_id, &levels);
+            let identity = cache::identity(&self.server, &volume.content_id, &levels);
             let name = cache::pack_name(&identity);
             (identity.into(), name)
         });
@@ -804,7 +808,7 @@ mod native {
             let (wake, rx) = mpsc::channel();
             let (url, reader) = (url.to_string(), wake.clone());
             std::thread::spawn(move || {
-                let client = Client::new(api_key, memory);
+                let client = Client::new(&url, api_key, memory);
                 let folder = folder.map(Folder::new);
                 let reason = run(&url, client, folder, reader, &rx, &mut receive).err();
                 receive(Received::Closed(reason.unwrap_or_else(|| "closed".into())));

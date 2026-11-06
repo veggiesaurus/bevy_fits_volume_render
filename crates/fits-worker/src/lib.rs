@@ -214,11 +214,18 @@ fn buffer(message: &impl Wire) -> ArrayBuffer {
     buffer
 }
 
-/// Starts connection `id`, and returns the REGISTER_VIEWER to send once the socket is open, which carries the token.
-/// Up to `memory` bytes of the cubelets sent are kept in memory. `clear_packs` is called to empty OPFS of the packs.
+/// Starts connection `id` to the server at `url`, and returns the REGISTER_VIEWER to send once the socket is open,
+/// which carries the token. Up to `memory` bytes of the cubelets sent are kept in memory. `clear_packs` is called to
+/// empty OPFS of the packs.
 #[wasm_bindgen]
-pub fn remote_start(id: u32, api_key: String, memory: f64, clear_packs: Function) -> Uint8Array {
-    let (client, register) = Client::new(api_key, memory as usize);
+pub fn remote_start(
+    id: u32,
+    url: &str,
+    api_key: String,
+    memory: f64,
+    clear_packs: Function,
+) -> Uint8Array {
+    let (client, register) = Client::new(url, api_key, memory as usize);
     CLIENT.set(Some((id, client)));
     CLEAR_PACKS.set(Some(clear_packs));
     Uint8Array::from(&register[..])

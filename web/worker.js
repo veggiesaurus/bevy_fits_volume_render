@@ -53,7 +53,7 @@ let unsent = [];
 
 function connectServer({ server: url, token, id, memory }) {
   closeServer("another connection took its place");
-  unsent = [remote_start(id, token, memory, clearPacks)];
+  unsent = [remote_start(id, url, token, memory, clearPacks)];
   let ws;
   try {
     ws = socket = new WebSocket(url);
