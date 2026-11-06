@@ -19,7 +19,8 @@ pub struct Config {
     pub z_scale: ZScale,
     /// What a server's cubelets may be off by, in units of the cube's noise σ: one of `TOLERANCES`.
     pub zfp_tolerance_sigmas: f64,
-    /// How much of a server's cubelets, compressed, are kept in memory to be shown again without asking for them.
+    /// How much of a server's cubelets, compressed, are kept in memory to be shown again without asking for them. Less
+    /// in the browser, whose worker shares its memory with any file it reads, and which usually keeps them in OPFS too.
     pub cache_memory_mb: u64,
     /// Gone, now that each projection mode reads its own pyramid, but still read so that older files parse.
     #[serde(skip_serializing)]
@@ -38,7 +39,11 @@ impl Default for Config {
             threshold_max: 1.0,
             z_scale: ZScale::Cube,
             zfp_tolerance_sigmas: 1.0,
-            cache_memory_mb: 1024,
+            cache_memory_mb: if cfg!(target_arch = "wasm32") {
+                256
+            } else {
+                1024
+            },
             max_mode_downsampling: serde::de::IgnoredAny,
         }
     }
