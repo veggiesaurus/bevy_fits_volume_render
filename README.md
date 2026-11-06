@@ -59,6 +59,14 @@ A build of `main` is published at https://fits.veggiesaurus.net. Locally, open h
 
 `?server=ws://127.0.0.1:3002#token=...` opens the Server panel on a fits-server, and `&path=` opens a cube under its root straight away. The token goes after the `#`, which isn't sent with requests, and the page takes it out of the address bar at once; without it, the panel asks for the token. The viewer sends it to the server in its first message rather than in the URL, since a browser prints a socket's URL in the console when it can't connect. The worker holds the socket and decodes the cubelets, as it does a file's, and keeps the server's cubelets in the site's origin private file system (OPFS) where the native viewer keeps them on disk.
 
+A cube can be baked so that it opens without downloading all of it. `fits-bake` writes each cube's max and mean pyramids as cubelets within 1σ of its noise, after an index of them, to `CUBE.fits.cubelets` beside it:
+
+```
+cargo run --release -p fits-server --example fits-bake -- [--sigmas S] [--exact-level-0] [--out DIR] cube.fits...
+```
+
+`?file=` with a `.cubelets` URL reads the index, then only the cubelets the view needs, by range request, and keeps them in OPFS as it does a server's. Its levels are the viewer's at the default budget, which a viewer with another budget or fewer texture layers takes as they are, showing the finest that fits. The cursor's values come from level 0's cubelets, so they're shown as within the tolerance (`≈ 1.2e-2 ± 4.0e-3`), unless `--exact-level-0` kept level 0 exact, which makes a cube's file three to seven times larger. Masks, noise normalisation and smoothing aren't available for a baked cube, as for a server's.
+
 The published site is https. In Chrome, `?server=ws://127.0.0.1:3002` works once you allow its Local Network Access prompt for the site. Safari blocks `ws://` from an https page as mixed content, so it needs `wss://` and a certificate it trusts. Once, after fits-server has run and made its certificate:
 
 ```

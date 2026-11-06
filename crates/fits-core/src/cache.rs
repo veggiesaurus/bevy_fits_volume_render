@@ -1,14 +1,16 @@
 //! Compressed cubelets kept for later: an LRU in memory, which the server and the client both have, and on the
-//! client a pack per cube on disk, so that a cube opened again comes from there rather than the server. Natively a
-//! pack is a file in a folder of them; in the browser it's an OPFS file, which worker.js opens and makes room for.
+//! client a pack per cube on disk, so that a cube opened again comes from there rather than the server or static
+//! hosting. Natively a pack is a file in a folder of them; in the browser it's an OPFS file, which worker.js opens and
+//! makes room for. A pack's records are also what a baked cube's file holds.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     hash::Hash,
+    sync::Arc,
 };
 
 use crate::{
-    CUBELET,
+    CUBELET, Cubelet, codec,
     engine::{CubeletId, Mode},
 };
 
@@ -77,7 +79,7 @@ pub trait Store {
 
 /// A record's header: its payload's length, then the cubelet's mode, level and place, then the tolerance it was
 /// compressed to.
-const RECORD: usize = 4 + 1 + 1 + 6 + 8;
+pub const RECORD: usize = 4 + 1 + 1 + 6 + 8;
 
 /// One cube's cubelets on disk, for a cube whose server gives it a `content_id`: what the pack is of, then a record
 /// per cubelet, each appended as it arrives. A cubelet sent again replaces the one before in the index, and the old record
@@ -156,13 +158,10 @@ impl Pack {
         if end > self.room || self.has(id, tolerance) {
             return;
         }
-        let mut record = Vec::with_capacity(RECORD + payload.len());
-        record.extend((payload.len() as u32).to_le_bytes());
-        record.extend([u8::from(id.mode == Mode::Mean), id.level]);
-        record.extend([id.x, id.y, id.z].iter().flat_map(|v| v.to_le_bytes()));
-        record.extend(tolerance.to_le_bytes());
-        record.extend_from_slice(payload);
-        if self.store.write_at(self.end, &record) {
+        if self
+            .store
+            .write_at(self.end, &record(id, tolerance, payload))
+        {
             let at = self.end + RECORD as u64;
             self.index.insert(id, (at, payload.len(), tolerance));
             self.end = end;
@@ -184,7 +183,19 @@ impl Pack {
     }
 }
 
-fn read_record(head: &[u8; RECORD]) -> (CubeletId, f64, usize) {
+/// A cubelet's record: its header, then its CUBELET_DATA.
+pub fn record(id: CubeletId, tolerance: f64, payload: &[u8]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(RECORD + payload.len());
+    record.extend((payload.len() as u32).to_le_bytes());
+    record.extend([u8::from(id.mode == Mode::Mean), id.level]);
+    record.extend([id.x, id.y, id.z].iter().flat_map(|v| v.to_le_bytes()));
+    record.extend(tolerance.to_le_bytes());
+    record.extend_from_slice(payload);
+    record
+}
+
+/// A record's cubelet, the tolerance it's within and its payload's length, from its header.
+pub fn read_record(head: &[u8; RECORD]) -> (CubeletId, f64, usize) {
     let u16_at = |i: usize| usize::from(u16::from_le_bytes([head[i], head[i + 1]]));
     let mode = if head[4] == 1 { Mode::Mean } else { Mode::Max };
     let at = [u16_at(6), u16_at(8), u16_at(10)];
@@ -225,12 +236,127 @@ pub fn origin(url: &str) -> String {
     format!("{}{port}{path}", host.to_ascii_lowercase())
 }
 
-/// The name of the file a pack is kept in, an FNV-1a hash of its identity.
+/// The name of the file a pack is kept in, a hash of its identity.
 pub fn pack_name(identity: &str) -> String {
-    let hash = (identity.bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+    format!("{:016x}", fnv(identity.as_bytes()))
+}
+
+/// FNV-1a.
+pub fn fnv(bytes: &[u8]) -> u64 {
+    (bytes.iter()).fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
-    });
-    format!("{hash:016x}")
+    })
+}
+
+/// A cubelet's CUBELET_DATA, which is what's kept.
+pub type Payload = Arc<[u8]>;
+
+/// Cubelets in memory by what they're of and where, with the tolerance they're within, shared by every file.
+pub type Memory = Lru<(Arc<str>, CubeletId), (f64, Payload)>;
+
+/// One file's cubelets in the cache: in memory, and in its pack once one is attached. A cubelet kept at a tighter
+/// tolerance serves a looser request.
+pub struct Kept {
+    identity: Arc<str>,
+    /// The pack's name.
+    pub name: String,
+    /// What the file's cubelets are asked for within, in level 0's units: 0 for exact.
+    tolerance: f64,
+    pack: Option<Pack>,
+    /// The cache was cleared before the pack was attached, so it's emptied then.
+    cleared: bool,
+    /// Cubelets asked for that are in the cache, for `next`.
+    pub hits: VecDeque<CubeletId>,
+}
+
+impl Kept {
+    pub fn new(identity: String, tolerance: f64) -> Self {
+        Self {
+            name: pack_name(&identity),
+            identity: identity.into(),
+            tolerance,
+            pack: None,
+            cleared: false,
+            hits: VecDeque::new(),
+        }
+    }
+
+    /// The pack, from the store it's in and how long it may grow, or None when it can't be kept.
+    pub fn attach(&mut self, store: Option<(Box<dyn Store>, u64)>) {
+        self.pack = store.map(|(store, room)| Pack::open(store, &self.identity, room));
+        if let (Some(pack), true) = (&mut self.pack, self.cleared) {
+            pack.clear();
+        }
+    }
+
+    /// Empties the pack, now or once it's attached. Memory is the caller's to clear.
+    pub fn clear(&mut self) {
+        match &mut self.pack {
+            Some(pack) => pack.clear(),
+            None => self.cleared = true,
+        }
+    }
+
+    /// Whether `id` is in the cache within the tolerance asked for, in which case it's queued for `next`.
+    pub fn hit(&mut self, memory: &mut Memory, id: CubeletId) -> bool {
+        let key = (self.identity.clone(), id);
+        let in_memory = memory.get(&key).is_some_and(|e| e.0 <= self.tolerance);
+        let hit = in_memory
+            || self
+                .pack
+                .as_ref()
+                .is_some_and(|p| p.has(id, self.tolerance));
+        if hit {
+            self.hits.push_back(id);
+        }
+        hit
+    }
+
+    /// The next of the cubelets queued by `hit`, read and decoded, which is slow enough to go one at a time. One that
+    /// has gone from the cache since, or doesn't decode, is an error, for the caller to ask for again.
+    pub fn next(&mut self, memory: &mut Memory) -> Option<(CubeletId, Result<Cubelet, String>)> {
+        let id = self.hits.pop_front()?;
+        Some((id, self.read(memory, id)))
+    }
+
+    /// A cubelet from the cache, decoded. One the pack can't read or decode is forgotten, so that the one sent again
+    /// is kept in its place.
+    pub fn read(&mut self, memory: &mut Memory, id: CubeletId) -> Result<Cubelet, String> {
+        let payload = self.find(memory, id).ok_or("not in the cache");
+        let cubelet = payload
+            .map_err(String::from)
+            .and_then(|p| codec::decode_payload(&p));
+        if cubelet.is_err()
+            && let Some(pack) = &mut self.pack
+        {
+            pack.forget(id);
+        }
+        cubelet
+    }
+
+    /// From memory or else from the pack, and then kept in both: the pack may have been made since the cubelet came.
+    fn find(&mut self, memory: &mut Memory, id: CubeletId) -> Option<Payload> {
+        let key = (self.identity.clone(), id);
+        if let Some(&(within, ref payload)) = memory.get(&key).filter(|e| e.0 <= self.tolerance) {
+            if let Some(pack) = &mut self.pack {
+                pack.put(id, within, payload);
+            }
+            return Some(payload.clone());
+        }
+        let (within, payload) = self.pack.as_mut()?.get(id, self.tolerance)?;
+        let payload: Payload = payload.into();
+        memory.insert(key, (within, payload.clone()), payload.len());
+        Some(payload)
+    }
+
+    /// A cubelet that came, as `payload`, within `tolerance`.
+    pub fn keep(&mut self, memory: &mut Memory, id: CubeletId, tolerance: f64, payload: &[u8]) {
+        if let Some(pack) = &mut self.pack {
+            pack.put(id, tolerance, payload);
+        }
+        let key = (self.identity.clone(), id);
+        memory.insert(key, (tolerance, payload.into()), payload.len());
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

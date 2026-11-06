@@ -1,11 +1,12 @@
 // The data source's Web Worker, so that none of this holds up the page: it downloads or reads the file in a load,
 // { load, source, hdu } with a File or URL as the source, and fits-worker holds the cube and answers the viewer's
-// requests, until { release } says the viewer no longer shows it. ArrayBuffers both ways are the source's messages. It
-// also holds the socket to a fits-server, opened with { server, token, id, memory }, and { remote } messages both ways
-// are the viewer's for that connection.
+// requests, until { release } says the viewer no longer shows it. A URL ending in .cubelets is a baked cube, whose
+// cubelets are read by range request as they're asked for. ArrayBuffers both ways are the source's messages. It also
+// holds the socket to a fits-server, opened with { server, token, id, memory }, and { remote } messages both ways are
+// the viewer's for that connection.
 import init, {
-  held, open, release, remote_attach, remote_closed, remote_command, remote_pack, remote_receive, remote_start,
-  remote_work, request, work,
+  baked_attach, baked_failed, baked_fetched, baked_fetches, baked_open, baked_wanted, held, open, release, remote_attach,
+  remote_closed, remote_command, remote_pack, remote_receive, remote_start, remote_work, request, work,
 } from "./pkg/fits_worker.js";
 
 const ready = init();
@@ -19,7 +20,9 @@ jobs.port1.onmessage = () => {
   scheduled = false;
   const sent = remote_work();
   if (sent) toServer(sent);
-  if (work() || sent) schedule();
+  const more = work();
+  readBaked();
+  if (more || sent) schedule();
 };
 function schedule() {
   if (!scheduled) {
@@ -32,6 +35,7 @@ onmessage = async ({ data }) => {
   await ready;
   if (data instanceof ArrayBuffer) {
     request(new Uint8Array(data));
+    readBaked();
     schedule();
   } else if (data.remote) {
     toServer(remote_command(new Uint8Array(data.remote)));
@@ -146,6 +150,9 @@ async function load({ load: id, source, hdu }) {
   latest?.abort();
   const current = (latest = new AbortController());
   try {
+    if (typeof source === "string" && new URL(source).pathname.endsWith(".cubelets")) {
+      return await loadBaked(id, source, current.signal);
+    }
     const bytes = typeof source === "string" ? await download(source, current.signal, reporter(id)) : await source.bytes();
     if (current.signal.aborted) return;
     postMessage({ load: id, reading: true });
@@ -156,6 +163,89 @@ async function load({ load: id, source, hdu }) {
     // With the load whose file it still holds, which may not be the one the page shows.
     if (!current.signal.aborted) postMessage({ load: id, error: e.message ?? String(e), held: held() });
   }
+}
+
+// A baked cube: the index at the start of its file, then its pack in OPFS, opened before the viewer is told so that
+// it asks for cubelets with the cache in place.
+let baked;
+async function loadBaked(id, url, signal) {
+  const start = performance.now();
+  baked = { load: id, url };
+  // Most of an index is the histogram, so 256 kB takes in all of one, and the rest is read if it doesn't.
+  let index = await range(url, 0, 1 << 18, signal);
+  const size = new DataView(index.buffer, index.byteOffset).getUint32(0, true);
+  // baked.rs's MAX_INDEX, so that a file that isn't one can't have this allocate gigabytes.
+  if (size > 4 << 20) throw new Error("not a baked cube");
+  if (size > index.length) {
+    const whole = new Uint8Array(size);
+    whole.set(index);
+    whole.set(await range(url, index.length, size, signal), index.length);
+    index = whole;
+  }
+  if (signal.aborted) return;
+  const [pack, info, levels, approximate] = baked_open(id, index, url, baked.whole?.length ?? baked.size);
+  const [handle, room] = await openPack(pack).catch((e) => {
+    console.warn(`Cubelets aren't kept in OPFS: ${e.message ?? e}`);
+    return [null, 0];
+  });
+  baked_attach(id, handle, room);
+  if (signal.aborted) return;
+  postMessage({ load: id, info, levels, approximate, seconds: (performance.now() - start) / 1000 }, [info]);
+}
+
+// The cubelets the baked cube's source asks for, a few range requests at a time, each made only if it's still wanted.
+const READS = 16;
+let reading = 0;
+const reads = [];
+function readBaked() {
+  const [load, ...ranges] = baked_fetches();
+  // Those for a cube that's on its way out are dropped.
+  if (load === baked?.load) {
+    for (let i = 0; i < ranges.length; i += 3) reads.push({ load, url: baked.url, token: ranges[i], start: ranges[i + 1], end: ranges[i + 2] });
+  }
+  while (reading < READS && reads.length) {
+    const { load, url, token, start, end } = reads.shift();
+    if (!baked_wanted(load, token)) continue;
+    reading++;
+    retried(() => range(url, start, end))
+      .then((bytes) => baked_fetched(load, token, bytes), (e) => {
+        console.error(`Reading ${url}: ${e.message ?? e}`);
+        baked_failed(load, token);
+      })
+      .finally(() => {
+        reading--;
+        readBaked();
+      });
+  }
+}
+
+// Three tries, half a second and then a second apart.
+async function retried(read) {
+  for (let tries = 1; ; tries++) {
+    try {
+      return await read();
+    } catch (e) {
+      if (tries === 3) throw e;
+      await new Promise((resolve) => setTimeout(resolve, 500 * tries));
+    }
+  }
+}
+
+// Bytes `start` to `end` of `url`. OPFS is the cache, so the browser's isn't asked. A server that ignores ranges, as
+// python3 -m http.server does, sends the whole file, which is kept and read from after.
+async function range(url, start, end, signal) {
+  if (baked?.url === url && baked.whole) return baked.whole.subarray(start, end);
+  const res = await fetch(url, { headers: { Range: `bytes=${start}-${end - 1}` }, cache: "no-store", signal });
+  // The file's size, for checking its index, where the server lets the page see it.
+  const total = /\/(\d+)$/.exec(res.headers.get("Content-Range") ?? "")?.[1];
+  if (baked?.url === url && total) baked.size = Number(total);
+  if (res.status === 200) {
+    const whole = new Uint8Array(await res.arrayBuffer());
+    if (baked?.url === url) baked.whole = whole;
+    return whole.subarray(start, end);
+  }
+  if (res.status !== 206) throw new Error(`${res.status} ${res.statusText}`);
+  return new Uint8Array(await res.arrayBuffer());
 }
 
 // Download progress for the page's status, ten times a second at most.

@@ -397,8 +397,8 @@ pub fn browser(
             }
             if remote.server.is_some() && remote.closed.is_none() {
                 let clear = ui.button("Clear the cache").on_hover_text(
-                    "Forgets the cubelets kept from the server, in memory and on disk, so that cubes opened again \
-                     come from the server",
+                    "Forgets the cubelets kept from servers and baked cubes, in memory and on disk, so that cubes \
+                     opened again come from the server or static hosting",
                 );
                 if clear.clicked() {
                     remote.send(Command::ClearCache);

@@ -5,6 +5,7 @@ use bevy_tasks::{ComputeTaskPool, TaskPool};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_tasks::{ParallelSlice, ParallelSliceMut};
 
+pub mod baked;
 pub mod cache;
 pub mod carta;
 pub mod codec;

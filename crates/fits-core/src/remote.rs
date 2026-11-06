@@ -3,16 +3,11 @@
 //! worker can share it, each moving the bytes its own way. It keeps the cubelets it's sent, compressed, and answers
 //! from those what it can.
 
-use std::{
-    collections::{HashSet, VecDeque},
-    sync::Arc,
-};
-
-use prost::Message as _;
+use std::collections::HashSet;
 
 use crate::{
     CUBELET, FileInfo,
-    cache::{self, Lru, Pack, Store},
+    cache::{self, Kept, Lru, Memory, Store},
     carta::{self, CUBE, FILE_CLOSED, Frame, cubelet_key, frame, proto},
     codec,
     engine::{CubeletId, Event, Request},
@@ -116,23 +111,12 @@ struct Opening {
     statistics: Option<Vec<proto::StatisticsValue>>,
 }
 
-/// A cubelet's CUBELET_DATA as the server sent it, which is what the cache keeps.
-type Payload = Arc<[u8]>;
-
-/// Cubelets by what they're of and where, with the tolerance they're within.
-type Memory = Lru<(Arc<str>, CubeletId), (f64, Payload)>;
-
 struct Open {
     file_id: i32,
     levels: Vec<[usize; 3]>,
     tolerance: Option<f64>,
-    /// What the file's cubelets are kept as, and the name of its pack, when the server says what the file is.
-    identity: Option<(Arc<str>, String)>,
-    pack: Option<Pack>,
-    /// The cache was cleared before the pack was attached, so it's emptied then.
-    cleared: bool,
-    /// Cubelets asked for that are in the cache, for `cached`.
-    hits: VecDeque<CubeletId>,
+    /// The file's cubelets in the cache, when the server says what the file is.
+    kept: Option<Kept>,
 }
 
 pub struct Client {
@@ -179,51 +163,6 @@ fn by_mode(ids: &[CubeletId]) -> Result<Vec<(SmoothingMode, Vec<u64>)>, String> 
 }
 
 impl Open {
-    /// Whether `id` is in the cache within the tolerance asked for, in which case it's queued for `cached`.
-    fn hit(&mut self, memory: &mut Memory, id: CubeletId) -> bool {
-        let Some((identity, _)) = &self.identity else {
-            return false;
-        };
-        let tolerance = self.tolerance.unwrap_or(0.0);
-        let in_memory = (memory.get(&(identity.clone(), id))).is_some_and(|e| e.0 <= tolerance);
-        let hit = in_memory || self.pack.as_ref().is_some_and(|p| p.has(id, tolerance));
-        if hit {
-            self.hits.push_back(id);
-        }
-        hit
-    }
-
-    /// A cubelet from the cache, from memory or else from the pack, and then kept in both: the pack may have been made
-    /// since the cubelet came.
-    fn find(&mut self, memory: &mut Memory, id: CubeletId) -> Option<Payload> {
-        let (identity, _) = self.identity.as_ref()?;
-        let tolerance = self.tolerance.unwrap_or(0.0);
-        let key = (identity.clone(), id);
-        if let Some(&(within, ref payload)) = memory.get(&key).filter(|e| e.0 <= tolerance) {
-            if let Some(pack) = &mut self.pack {
-                pack.put(id, within, payload);
-            }
-            return Some(payload.clone());
-        }
-        let (within, payload) = self.pack.as_mut()?.get(id, tolerance)?;
-        let payload: Payload = payload.into();
-        memory.insert(key, (within, payload.clone()), payload.len());
-        Some(payload)
-    }
-
-    /// Keeps a cubelet the server sent, `payload` being its CUBELET_DATA.
-    fn keep(&mut self, memory: &mut Memory, id: CubeletId, payload: &[u8]) {
-        let Some((identity, _)) = &self.identity else {
-            return;
-        };
-        let tolerance = self.tolerance.unwrap_or(0.0);
-        if let Some(pack) = &mut self.pack {
-            pack.put(id, tolerance, payload);
-        }
-        let key = (identity.clone(), id);
-        memory.insert(key, (tolerance, payload.into()), payload.len());
-    }
-
     fn add(&self, ids: &[CubeletId]) -> Result<Vec<Vec<u8>>, String> {
         let (compression_type, tolerance) = match self.tolerance {
             Some(tolerance) => (CompressionType::ZfpExplicit, tolerance),
@@ -316,11 +255,8 @@ impl Client {
             }
             Command::ClearCache => {
                 self.memory.clear();
-                if let Some(open) = &mut self.open {
-                    match &mut open.pack {
-                        Some(pack) => pack.clear(),
-                        None => open.cleared = true,
-                    }
+                if let Some(kept) = self.open.as_mut().and_then(|open| open.kept.as_mut()) {
+                    kept.clear();
                 }
                 Vec::new()
             }
@@ -415,14 +351,16 @@ impl Client {
         Ok(match request {
             Request::Levels { .. } => Vec::new(),
             Request::AddCubelets { ids } => {
-                let ids: Vec<_> = (ids.into_iter())
-                    .filter(|&id| !open.hit(&mut self.memory, id))
-                    .collect();
+                let mut hit =
+                    |id| (open.kept.as_mut()).is_some_and(|k| k.hit(&mut self.memory, id));
+                let ids: Vec<_> = ids.into_iter().filter(|&id| !hit(id)).collect();
                 open.add(&ids)?
             }
             Request::RemoveCubelets { ids } => {
                 let removed: HashSet<_> = ids.iter().collect();
-                open.hits.retain(|id| !removed.contains(id));
+                if let Some(kept) = &mut open.kept {
+                    kept.hits.retain(|id| !removed.contains(id));
+                }
                 (by_mode(&ids)?.into_iter())
                     .map(|(mode, cubelets)| {
                         let remove = proto::RemoveRequiredCubelets {
@@ -460,29 +398,22 @@ impl Client {
 
     /// Whether `cached` has cubelets to decode.
     pub fn has_cached(&self) -> bool {
-        self.open.as_ref().is_some_and(|open| !open.hits.is_empty())
+        let kept = self.open.as_ref().and_then(|open| open.kept.as_ref());
+        kept.is_some_and(|kept| !kept.hits.is_empty())
     }
 
     /// The next of the cubelets asked for that are in the cache, read and decoded, which is slow enough to go one at a
     /// time. One that has gone from the cache since, or doesn't decode, is asked of the server instead, in `replies`.
     pub fn cached(&mut self) -> Option<Received> {
         let open = self.open.as_mut()?;
-        while let Some(id) = open.hits.pop_front() {
-            let payload = open.find(&mut self.memory, id).ok_or_else(String::new);
-            let data =
-                payload.and_then(|p| proto::CubeletData::decode(&p[..]).map_err(|e| e.to_string()));
-            match data.and_then(|data| codec::decode(&data)) {
+        while let Some((id, cubelet)) = open.kept.as_mut()?.next(&mut self.memory) {
+            match cubelet {
                 Ok(cubelet) => {
                     let event = Event::Cubelet { id, cubelet };
                     let file_id = open.file_id;
                     return Some(Received::Event { file_id, event });
                 }
-                Err(_) => {
-                    if let Some(pack) = &mut open.pack {
-                        pack.forget(id);
-                    }
-                    self.replies.extend(open.add(&[id]).unwrap_or_default());
-                }
+                Err(_) => self.replies.extend(open.add(&[id]).unwrap_or_default()),
             }
         }
         None
@@ -491,7 +422,7 @@ impl Client {
     /// The name of the open file's pack, if it has one.
     pub fn pack(&self) -> Option<&str> {
         let open = self.open.as_ref()?;
-        open.identity.as_ref().map(|(_, name)| name.as_str())
+        open.kept.as_ref().map(|kept| kept.name.as_str())
     }
 
     /// The pack to open for the file just opened, once: the viewer is told of the file when `attach` has it.
@@ -502,15 +433,11 @@ impl Client {
     /// The pack `name` for the open file: the store it's in and how long it may grow, or None when it can't be kept.
     /// Returns the open, for the viewer, unless the file has gone since.
     pub fn attach(&mut self, name: &str, store: Option<(Box<dyn Store>, u64)>) -> Option<Received> {
-        let open = self.open.as_mut()?;
-        let (identity, wanted) = open.identity.as_ref()?;
-        if wanted != name || self.held.is_none() {
+        let kept = self.open.as_mut()?.kept.as_mut()?;
+        if kept.name != name || self.held.is_none() {
             return None;
         }
-        open.pack = store.map(|(store, room)| Pack::open(store, identity, room));
-        if let (Some(pack), true) = (&mut open.pack, open.cleared) {
-            pack.clear();
-        }
+        kept.attach(store);
         self.held.take()
     }
 
@@ -603,7 +530,10 @@ impl Client {
                 let id =
                     CubeletId::new(mode, Default::default(), level, [x, y, z].map(usize::from));
                 let cubelet = codec::decode(&data)?;
-                open.keep(&mut self.memory, id, message.payload);
+                if let Some(kept) = &mut open.kept {
+                    let tolerance = open.tolerance.unwrap_or(0.0);
+                    kept.keep(&mut self.memory, id, tolerance, message.payload);
+                }
                 vec![Received::Event {
                     file_id: data.file_id,
                     event: Event::Cubelet { id, cubelet },
@@ -712,20 +642,16 @@ impl Client {
             .filter(|levels: &Vec<_>| levels.first() == Some(&[1; 3]))
             .ok_or("a level list that doesn't start at level 0")?;
         let tolerance = info.sigma.map(|sigma| opening.sigmas * sigma);
-        let identity = (!volume.content_id.is_empty()).then(|| {
+        let kept = (!volume.content_id.is_empty()).then(|| {
             let identity = cache::identity(&self.server, &volume.content_id, &levels);
-            let name = cache::pack_name(&identity);
-            (identity.into(), name)
+            Kept::new(identity, tolerance.unwrap_or(0.0))
         });
-        self.pack_to_open = identity.as_ref().map(|(_, name)| name.clone());
+        self.pack_to_open = kept.as_ref().map(|kept| kept.name.clone());
         self.open = Some(Open {
             file_id: opening.file_id,
             levels: levels.clone(),
             tolerance,
-            identity,
-            pack: None,
-            cleared: false,
-            hits: VecDeque::new(),
+            kept,
         });
         let opened = Received::Opened(Box::new(Opened {
             file_id: opening.file_id,

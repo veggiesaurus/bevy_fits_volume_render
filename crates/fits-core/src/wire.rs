@@ -129,8 +129,9 @@ impl<T: Wire> Wire for Vec<T> {
 
     fn read(r: &mut Reader) -> Option<Self> {
         let len = u32::read(r)? as usize;
-        // Each item takes at least a byte, so a corrupt length can't ask for more than is there.
-        let mut items = Vec::with_capacity(len.min(r.header.len()));
+        // A corrupt length can't ask for more than there is: each item takes at least a byte, and the first few
+        // thousand are all that's set aside, as an item can take far more memory than its bytes.
+        let mut items = Vec::with_capacity(len.min(r.header.len()).min(1 << 12));
         for _ in 0..len {
             items.push(T::read(r)?);
         }
@@ -612,7 +613,7 @@ impl Wire for Listing {
     fn read(r: &mut Reader) -> Option<Self> {
         let (directory, parent, directories) = (Wire::read(r)?, Wire::read(r)?, Wire::read(r)?);
         let len = u32::read(r)? as usize;
-        let mut files = Vec::with_capacity(len.min(r.header.len()));
+        let mut files = Vec::with_capacity(len.min(r.header.len()).min(1 << 12));
         for _ in 0..len {
             files.push((Wire::read(r)?, Wire::read(r)?));
         }

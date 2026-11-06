@@ -73,6 +73,10 @@ struct Dataset {
     config: Config,
     wcs: Option<wcs::Wcs>,
     load_seconds: f32,
+    /// The levels a baked cube has, which the view takes in place of its own.
+    levels: Option<Vec<[usize; 3]>>,
+    /// What the cursor's values may be off by, when they come from compressed cubelets.
+    approximate: Option<f64>,
 }
 
 impl Dataset {
@@ -90,6 +94,8 @@ impl Dataset {
             source,
             config,
             load_seconds,
+            levels: None,
+            approximate: None,
         }
     }
 
@@ -524,7 +530,8 @@ fn spawn_volume(
     // The old cube's requests went with its source, but an upsample still to run would keep its texture forever.
     upsamples.0.clear();
     let dims = data.info.dims;
-    let levels = Levels::new(dims, data.config.gpu_memory_limit_mb, max_depth(&device));
+    let (budget, given) = (data.config.gpu_memory_limit_mb, data.levels.as_deref());
+    let levels = Levels::new(dims, budget, max_depth(&device), given);
     data.source.send(Request::Levels {
         factors: levels.factors.clone(),
         chain: levels.chain,

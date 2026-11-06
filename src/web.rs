@@ -85,6 +85,8 @@ fn release(load: u32) {
 /// back. Once it's dropped, with the view of it, the worker lets go of the file.
 pub struct WorkerSource {
     load: u32,
+    /// A baked cube's, which isn't held whole.
+    baked: bool,
 }
 
 impl Drop for WorkerSource {
@@ -94,6 +96,10 @@ impl Drop for WorkerSource {
 }
 
 impl WorkerSource {
+    pub fn has_cube(&self) -> bool {
+        !self.baked
+    }
+
     pub fn send(&self, request: Request) {
         post(
             Uint8Array::from(&wire::encode(&(self.load, request))[..]).buffer(),
@@ -168,8 +174,13 @@ fn page_config(config_toml: &str, overrides: &str) -> Result<config::Config, Str
 }
 
 /// Called from web/index.html when the worker has read the file of load `load` in `seconds`, which was the viewer's
-/// pick `pick`. An error is thrown to the page.
+/// pick `pick`. For a baked cube, `levels` are its levels, three to a level, and `approximate` the tolerance its cursor
+/// values are within when they're not exact. An error is thrown to the page.
 #[wasm_bindgen]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "called once a load, from JavaScript"
+)]
 pub fn opened(
     load: u32,
     name: String,
@@ -178,6 +189,8 @@ pub fn opened(
     config_toml: String,
     overrides: String,
     pick: u32,
+    levels: Option<Vec<u32>>,
+    approximate: Option<f64>,
 ) -> Result<(), String> {
     // A cube was opened on a server after this load began, so that one stays on screen.
     if pick != latest_pick() {
@@ -186,8 +199,15 @@ pub fn opened(
     }
     let config = page_config(&config_toml, &overrides)?;
     let info: FileInfo = decode(&info)?;
-    let source = DataSource::Local(WorkerSource { load });
-    let dataset = Dataset::new(name, info, source, config, seconds);
+    let baked = levels.is_some();
+    let source = DataSource::Local(WorkerSource { load, baked });
+    let mut dataset = Dataset::new(name, info, source, config, seconds);
+    dataset.levels = levels.map(|l| {
+        (l.as_chunks::<3>().0.iter())
+            .map(|f| f.map(|f| f as usize))
+            .collect()
+    });
+    dataset.approximate = approximate;
     info!("{}", dataset.summary());
     *PENDING.lock().unwrap() = Some(Some(dataset));
     // The app only updates on input, so a file handed over by the page has to wake it.

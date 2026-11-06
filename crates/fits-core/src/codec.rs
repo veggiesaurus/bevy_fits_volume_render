@@ -93,6 +93,12 @@ pub fn decode(message: &CubeletData) -> Result<Cubelet, String> {
     Ok(Cubelet { dims, voxels, cell })
 }
 
+/// The cubelet in an encoded CUBELET_DATA.
+pub fn decode_payload(payload: &[u8]) -> Result<Cubelet, String> {
+    use prost::Message;
+    decode(&CubeletData::decode(payload).map_err(|e| format!("a cubelet: {e}"))?)
+}
+
 /// Alternately finite and not, starting with finite, x fastest; none when every voxel is finite.
 fn nan_runs(voxels: &[f32]) -> Vec<i32> {
     let (mut runs, mut finite, mut run) = (Vec::new(), true, 0);

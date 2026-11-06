@@ -33,10 +33,22 @@ pub struct Levels {
 }
 
 impl Levels {
-    pub fn new(dims: [usize; 3], gpu_memory_limit_mb: u64, max_depth: usize) -> Self {
+    /// `given` is the source's own list, a baked cube's, in place of the one for this budget. It has the same chain,
+    /// and its overview is shown only if it fits.
+    pub fn new(
+        dims: [usize; 3],
+        gpu_memory_limit_mb: u64,
+        max_depth: usize,
+        given: Option<&[[usize; 3]]>,
+    ) -> Self {
         let levels = fits::levels(dims, gpu_memory_limit_mb, max_depth);
         let chain = levels.chain.len();
-        let (factors, overview) = levels.list();
+        let (mut factors, mut overview) = levels.list();
+        if let Some(given) = given {
+            overview =
+                (given.iter().position(|&f| f == levels.overview)).unwrap_or(given.len() - 1);
+            factors = given.to_vec();
+        }
         Self {
             factors,
             chain,
@@ -71,7 +83,10 @@ impl Levels {
         };
         let fit = (0..self.chain).find(fits).unwrap_or(self.coarsest());
         let count = |level| texels(level).iter().product::<u64>();
-        if region == Region::whole(self.dims) && count(self.overview) > count(fit) {
+        if region == Region::whole(self.dims)
+            && fits(&self.overview)
+            && count(self.overview) > count(fit)
+        {
             self.overview
         } else {
             fit
@@ -643,7 +658,7 @@ mod tests {
     fn cubelets_come_nearest_the_middle_first_without_those_that_cant_show() {
         // Level 0 of a 256 x 256 x 64 cube, four cubelets by four, under a coarsest level of 4 x 4 x 1.
         let dims = [256, 256, 64];
-        let levels = Levels::new(dims, 384, 2048);
+        let levels = Levels::new(dims, 384, 2048, None);
         assert_eq!(levels.factors[levels.coarsest()], [4, 4, 1]);
         // Each cubelet's coarse texels are its x + 4y, apart from one cubelet that's all NaN and one with a NaN.
         let data = (0..64 * 64 * 64)
@@ -707,7 +722,7 @@ mod tests {
         let region = |min: [usize; 3], max: [usize; 3]| Region { min, max };
         // M83 CO opens at 2 x 2 x 1, its overview and the chain's second level.
         let dims = [1238, 1236, 196];
-        let levels = Levels::new(dims, 384, 2048);
+        let levels = Levels::new(dims, 384, 2048, None);
         let whole = Region::whole(dims);
         assert_eq!(
             (levels.for_region(whole), levels.factors[1]),
@@ -728,7 +743,7 @@ mod tests {
         // CGPS opens at its 5 x 5 x 1 overview, finer than the chain's 8 x 8 x 1, which still shows a crop that
         // needs 8 x 8 x 1, but not one that needs 4 x 4 x 1.
         let dims = [4096, 4096, 100];
-        let levels = Levels::new(dims, 384, 2048);
+        let levels = Levels::new(dims, 384, 2048, None);
         let whole = Region::whole(dims);
         let overview = levels.for_region(whole);
         assert_eq!(

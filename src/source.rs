@@ -36,9 +36,17 @@ impl DataSource {
         }
     }
 
-    /// A server has no noise measures or masks to give, nor processed cubelets.
     pub fn is_remote(&self) -> bool {
         matches!(self, Self::Remote(_))
+    }
+
+    /// Whether the whole cube is here, to measure noise, make masks and process cubelets from. A server's isn't, nor
+    /// is a baked cube's.
+    pub fn has_cube(&self) -> bool {
+        match self {
+            Self::Local(source) => source.has_cube(),
+            Self::Remote(_) => false,
+        }
     }
 }
 
@@ -76,6 +84,10 @@ mod local {
     }
 
     impl DataSource {
+        pub fn has_cube(&self) -> bool {
+            true
+        }
+
         pub fn local(cube: Cube) -> Self {
             Self {
                 state: Mutex::new(State {

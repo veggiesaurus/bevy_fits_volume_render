@@ -8,6 +8,9 @@
 //! the viewer's and back, with fits-core's remote client, so that the cubelets are decoded here too. Those messages
 //! carry the id of the viewer's connection instead. The client keeps the cubelets in a pack per cube in OPFS, whose
 //! file worker.js opens.
+//!
+//! A baked cube is a load too, read through the `baked_` functions: worker.js reads its index and opens its pack, then
+//! makes the range requests its source asks for and hands back what they bring.
 #![cfg(target_arch = "wasm32")]
 
 use std::{
@@ -17,17 +20,22 @@ use std::{
 
 use fits_core::{
     self as fits,
+    baked::{self, Index},
     cache::Store,
     engine::{Engine, Event, Request},
     remote::{Client, Command, Received},
     wire::{self, Wire},
 };
-use js_sys::{Array, ArrayBuffer, Float32Array, Function, Object, Reflect, Uint8Array};
+use js_sys::{
+    Array, ArrayBuffer, Float32Array, Function, Object, Reflect, Uint8Array, Uint32Array,
+};
 use wasm_bindgen::prelude::*;
 
 thread_local! {
     /// With the load it was opened for.
     static ENGINE: RefCell<Option<(u32, Engine)>> = const { RefCell::new(None) };
+    /// A baked cube in place of a file, with its load.
+    static BAKED: RefCell<Option<(u32, baked::Source)>> = const { RefCell::new(None) };
     /// The connection to a server, with the viewer's id for it, while worker.js has its socket.
     static CLIENT: RefCell<Option<(u32, Client)>> = const { RefCell::new(None) };
     /// worker.js's function that deletes every pack in OPFS but the one it's given the name of, which is open.
@@ -133,18 +141,24 @@ impl fits::Source for JsBytes {
 #[wasm_bindgen]
 pub fn open(load: u32, bytes: Uint8Array, hdu: Option<String>) -> Result<ArrayBuffer, String> {
     let hdu = hdu.as_deref().map(fits::parse_hdu).transpose()?;
-    ENGINE.set(None);
+    drop_held();
     let cube = fits::read_fits(&JsBytes(bytes), hdu)?;
     let info = Uint8Array::from(&wire::encode(&cube.info)[..]).buffer();
     ENGINE.set(Some((load, Engine::new(cube))));
     Ok(info)
 }
 
+/// The file or baked cube held goes, so that two are never in memory together.
+fn drop_held() {
+    ENGINE.set(None);
+    BAKED.set(None);
+}
+
 /// The viewer no longer shows the file of load `load`, so it's dropped, unless a later one has taken its place.
 #[wasm_bindgen]
 pub fn release(load: u32) {
     if held() == Some(load) {
-        ENGINE.set(None);
+        drop_held();
     }
 }
 
@@ -152,7 +166,8 @@ pub fn release(load: u32) {
 /// the one shown.
 #[wasm_bindgen]
 pub fn held() -> Option<u32> {
-    ENGINE.with_borrow(|engine| engine.as_ref().map(|(load, _)| *load))
+    let file = ENGINE.with_borrow(|engine| engine.as_ref().map(|(load, _)| *load));
+    file.or_else(|| BAKED.with_borrow(|baked| baked.as_ref().map(|(load, _)| *load)))
 }
 
 /// One of the viewer's requests, answered at once when it needs no work.
@@ -162,18 +177,32 @@ pub fn request(message: Uint8Array) {
         Ok(request) => request,
         Err(e) => return log_error(&format!("From the viewer: {e}")),
     };
-    let answer = ENGINE.with_borrow_mut(|engine| {
-        let (_, engine) = engine.as_mut().filter(|(held, _)| *held == load)?;
-        engine.request(request)
-    });
+    let baked = BAKED.with_borrow(|baked| baked.as_ref().is_some_and(|(held, _)| *held == load));
+    let answer = match baked {
+        true => BAKED.with_borrow_mut(|baked| baked.as_mut()?.1.request(request)),
+        false => ENGINE.with_borrow_mut(|engine| {
+            let (_, engine) = engine.as_mut().filter(|(held, _)| *held == load)?;
+            engine.request(request)
+        }),
+    };
     if let Some(event) = answer {
         post(&(load, event));
     }
 }
 
-/// Runs the next job, if there is one, and says whether there was.
+/// Runs the next job, if there is one, and says whether there was. For a baked cube, that's decoding a cubelet that
+/// was in the cache.
 #[wasm_bindgen]
 pub fn work() -> bool {
+    if let Some((load, cubelet)) = BAKED.with_borrow_mut(|baked| {
+        let (load, source) = baked.as_mut().filter(|(_, source)| source.has_cached())?;
+        Some((*load, source.cached()))
+    }) {
+        if let Some(event) = cubelet {
+            post(&(load, event));
+        }
+        return true;
+    }
     let Some((load, job)) = ENGINE.with_borrow_mut(|engine| {
         let (load, engine) = engine.as_mut()?;
         Some((*load, engine.next_job()?))
@@ -212,6 +241,90 @@ fn buffer(message: &impl Wire) -> ArrayBuffer {
     Float32Array::new_with_byte_offset_and_length(&buffer, at, voxels.len() as u32)
         .copy_from(voxels);
     buffer
+}
+
+/// The baked cube at `url` for load `load`, in place of any file or cube before, from the index at the start of its
+/// file. Returns the name of its pack in OPFS, for worker.js to open and hand to `baked_attach`, and then for the
+/// viewer the cube's info, its levels, three to a level, and the tolerance its cursor values are within, if they're
+/// not exact.
+#[wasm_bindgen]
+pub fn baked_open(
+    load: u32,
+    index: Uint8Array,
+    url: String,
+    size: Option<f64>,
+) -> Result<Array, String> {
+    drop_held();
+    let index = Index::read(&index.to_vec(), size.map(|size| size as u64))?;
+    let source = baked::Source::new(&index, &url);
+    let pack = JsValue::from(source.pack());
+    BAKED.set(Some((load, source)));
+    let info = Uint8Array::from(&wire::encode(&index.info)[..]).buffer();
+    let levels: Vec<u32> = index.levels.iter().flatten().map(|&f| f as u32).collect();
+    let approximate = index.tolerance.filter(|_| !index.exact_level_0);
+    Ok(Array::of4(
+        &pack,
+        &info,
+        &Uint32Array::from(&levels[..]),
+        &approximate.into(),
+    ))
+}
+
+/// The pack in OPFS for load `load`'s baked cube, or none when it couldn't be opened, and how long it may grow.
+#[wasm_bindgen]
+pub fn baked_attach(load: u32, handle: Option<SyncAccessHandle>, room: f64) {
+    let store = handle.map(|handle| (Box::new(Opfs(handle)) as Box<dyn Store>, room as u64));
+    BAKED.with_borrow_mut(|baked| {
+        if let Some((_, source)) = baked.as_mut().filter(|(held, _)| *held == load) {
+            source.attach(store);
+        }
+    });
+}
+
+/// The range reads the baked cube's source has asked for: its load, then the token, start and end of each.
+#[wasm_bindgen]
+pub fn baked_fetches() -> Vec<f64> {
+    BAKED.with_borrow_mut(|baked| {
+        let Some((load, source)) = baked.as_mut() else {
+            return Vec::new();
+        };
+        let fetches = source.fetches().into_iter();
+        let ranges = fetches.flat_map(|f| [f64::from(f.token), f.start as f64, f.end as f64]);
+        std::iter::once(f64::from(*load)).chain(ranges).collect()
+    })
+}
+
+/// Whether the read for `token` is still wanted. One that isn't is forgotten, as it won't be made.
+#[wasm_bindgen]
+pub fn baked_wanted(load: u32, token: u32) -> bool {
+    BAKED.with_borrow_mut(|baked| {
+        let (_, source) = baked.as_mut().filter(|(held, _)| *held == load)?;
+        Some(source.wanted(token))
+    }) == Some(true)
+}
+
+/// The read for `token` failed, after worker.js tried it again.
+#[wasm_bindgen]
+pub fn baked_failed(load: u32, token: u32) {
+    BAKED.with_borrow_mut(|baked| {
+        if let Some((_, source)) = baked.as_mut().filter(|(held, _)| *held == load) {
+            source.failed(token);
+        }
+    });
+}
+
+/// What the read for `token` of load `load`'s cube brought.
+#[wasm_bindgen]
+pub fn baked_fetched(load: u32, token: u32, bytes: Uint8Array) {
+    let event = BAKED.with_borrow_mut(|baked| {
+        let (_, source) = baked.as_mut().filter(|(held, _)| *held == load)?;
+        Some(source.fetched(token, &bytes.to_vec()))
+    });
+    match event {
+        Some(Ok(events)) => events.into_iter().for_each(|event| post(&(load, event))),
+        Some(Err(e)) => log_error(&format!("The baked cube: {e}")),
+        None => {}
+    }
 }
 
 /// Starts connection `id` to the server at `url`, and returns the REGISTER_VIEWER to send once the socket is open,

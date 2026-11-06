@@ -115,7 +115,7 @@ function fromWorker(data) {
   } else {
     try {
       if (data.error) throw new Error(data.error);
-      opened(data.load, name, data.info, data.seconds, config, overrides, latest.pick);
+      opened(data.load, name, data.info, data.seconds, config, overrides, latest.pick, data.levels, data.approximate);
       shown = data.load;
       canvas.focus();
       status.textContent = name;
@@ -173,7 +173,8 @@ picker.disabled = false;
 // winit doesn't take focus on a drag, and keys (shift-drag, C, R, Esc) only reach the focused canvas.
 canvas.addEventListener("pointerdown", () => canvas.focus());
 picker.addEventListener("change", () => picker.files[0] && load(picker.files[0].name, picker.files[0]));
-if (file) load(fileName(file), new URL(file, location.href).href);
+// A baked cube goes by the name of the file it was baked from.
+if (file) load(fileName(file).replace(/\.cubelets$/, ""), new URL(file, location.href).href);
 </script>
 </body>
 </html>

@@ -95,7 +95,7 @@ pub fn ui(
             egui::CollapsingHeader::new("Mask")
                 .default_open(true)
                 .show(ui, |ui| {
-                    if data.source.is_remote() {
+                    if !data.source.has_cube() {
                         ui.label(modes::REMOTE);
                         return;
                     }
@@ -179,14 +179,13 @@ fn cube_section(
         }
         // Until the source answers, the readout stays on the last voxel it answered for.
         if let Some((v, value)) = hover.voxel.and(hover.value) {
+            let value = match data.approximate {
+                Some(within) => format!("≈ {value:.4e} ± {within:.1e}{unit}"),
+                None => format!("= {value:.4e}{unit}"),
+            };
             row(
                 "Cursor",
-                format!(
-                    "({}, {}, {}) = {value:.4e}{unit}",
-                    v[0] + 1,
-                    v[1] + 1,
-                    v[2] + 1
-                ),
+                format!("({}, {}, {}) {value}", v[0] + 1, v[1] + 1, v[2] + 1),
             );
             let grid = v.map(|i| i as f64 + 1.0);
             if let Some(world) = data.wcs.as_ref().and_then(|w| w.grid_to_world(grid)) {
@@ -276,7 +275,7 @@ fn rendering_section(
         &mut s.modes,
         noise,
         masked,
-        data.source.is_remote(),
+        !data.source.has_cube(),
         unit,
     );
     ui.add(egui::Slider::new(&mut p.jitter, JITTER).text("Jitter"));
