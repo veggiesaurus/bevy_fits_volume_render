@@ -392,9 +392,10 @@ impl fmt::Display for Job {
 }
 
 impl Engine {
-    pub fn new(cube: Cube) -> Self {
+    /// A cube of its own, or one it shares, as a server's sessions do.
+    pub fn new(cube: impl Into<Arc<Cube>>) -> Self {
         Self {
-            cube: Arc::new(cube),
+            cube: cube.into(),
             levels: Vec::new(),
             chain: 0,
             pyramid: None,

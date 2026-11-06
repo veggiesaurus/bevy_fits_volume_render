@@ -93,7 +93,7 @@ fn start(root: &Path) -> u16 {
         runtime.block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             tx.send(listener.local_addr().unwrap().port()).unwrap();
-            fits_server::serve(listener, &root, TOKEN.into(), None)
+            fits_server::serve(listener, &root, TOKEN.into(), None, 1 << 30)
                 .await
                 .unwrap();
         });

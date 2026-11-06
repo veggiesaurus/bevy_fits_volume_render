@@ -1,6 +1,7 @@
 //! FITS cubes under a root folder, served as cubelets over a subset of CARTA's protocol with the volume messages added
-//! to it. A session has one cube open at a time and holds all of it, cutting cubelets through fits-core's engine on
-//! blocking threads, and the cubelets it compresses are kept for every session in one cache.
+//! to it. A session has one cube open at a time, cutting cubelets through fits-core's engine on blocking threads. The
+//! cubes are held whole, once for every session that opens them and within a budget, and the cubelets compressed are
+//! kept for every session in one cache.
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -28,7 +29,7 @@ use axum::{
     routing::get,
 };
 use fits_core::{
-    self as fits, CUBELET, FileInfo,
+    self as fits, CUBELET, Cube, FileInfo,
     cache::Lru,
     carta::{self, CUBE, FILE_CLOSED, Frame, ICD_VERSION, cubelet_at, frame, proto},
     codec,
@@ -39,7 +40,7 @@ use prost::Message as _;
 use proto::{CompressionType, EventType, SmoothingMode};
 use tokio::{
     net::TcpListener,
-    sync::{Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::{JoinHandle, spawn_blocking},
 };
 
@@ -64,6 +65,7 @@ struct Server {
     root: PathBuf,
     token: String,
     cache: Mutex<Lru<Key, Payload>>,
+    cubes: Mutex<Cubes>,
     /// read_fits reads on every core, so one read at a time.
     opens: Arc<Semaphore>,
     sessions: AtomicU32,
@@ -71,14 +73,15 @@ struct Server {
     workers: usize,
 }
 
-/// Serves the cubes under `root` until the listener fails. A client connects to `/` with `token` as `?token=`, as
-/// `Authorization: Bearer`, or in the `carta-auth-token` header, or else in REGISTER_VIEWER. With `tls`, the same port
-/// takes `wss://` as well as `ws://`.
+/// Serves the cubes under `root` until the listener fails, holding at most `memory_limit` bytes of them. A client
+/// connects to `/` with `token` as `?token=`, as `Authorization: Bearer`, or in the `carta-auth-token` header, or else in
+/// REGISTER_VIEWER. With `tls`, the same port takes `wss://` as well as `ws://`.
 pub async fn serve(
     listener: TcpListener,
     root: &Path,
     token: String,
     tls: Option<Arc<rustls::ServerConfig>>,
+    memory_limit: u64,
 ) -> std::io::Result<()> {
     if token.is_empty() {
         return Err(std::io::Error::other("an empty token would let anyone in"));
@@ -87,6 +90,7 @@ pub async fn serve(
         root: root.canonicalize()?,
         token,
         cache: Mutex::new(Lru::new(CACHE_BYTES)),
+        cubes: Mutex::new(Cubes::new(memory_limit)),
         opens: Arc::new(Semaphore::new(1)),
         sessions: AtomicU32::new(0),
         workers: std::thread::available_parallelism().map_or(4, |n| n.get()),
@@ -149,6 +153,10 @@ impl Server {
     /// The cache, even after a job panicked holding it: the worst a panic leaves is an entry missing.
     fn cache(&self) -> MutexGuard<'_, Lru<Key, Payload>> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn cubes(&self) -> MutexGuard<'_, Cubes> {
+        self.cubes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// `path`, relative to the root, as a path under the root once any symlinks are followed.
@@ -296,6 +304,104 @@ fn nan_infinities(data: &mut [f32]) {
     });
 }
 
+/// The cubes read, by content ID, which the sessions that open one share. One that's no longer open stays until another
+/// needs its room. Open or not, they all count against the budget.
+// ponytail: a session's pyramid, up to a third of its cube more, isn't counted; count it if the budget proves too loose.
+struct Cubes {
+    budget: u64,
+    /// Least recently used first.
+    held: Vec<Held>,
+}
+
+struct Held {
+    content_id: Arc<str>,
+    cube: Arc<Cube>,
+    /// A clone for each session with the cube open, beside this one, which jobs that still have the cube don't count.
+    open: Arc<()>,
+    bytes: u64,
+}
+
+fn gb(bytes: u64) -> f64 {
+    bytes as f64 / 1e9
+}
+
+impl Cubes {
+    fn new(budget: u64) -> Self {
+        Self {
+            budget,
+            held: Vec::new(),
+        }
+    }
+
+    /// The cube, and a hold on it as open, as the most recently used.
+    fn get(&mut self, content_id: &str) -> Option<(Arc<Cube>, Arc<()>)> {
+        let at = (self.held.iter()).position(|held| &*held.content_id == content_id)?;
+        let held = self.held.remove(at);
+        let got = (held.cube.clone(), held.open.clone());
+        self.held.push(held);
+        Some(got)
+    }
+
+    /// The bytes of the cubes open, not counting one that only `own`, a session's hold on its own, has.
+    fn open(&self, own: Option<&Arc<()>>) -> u64 {
+        let only_own = |held: &Held| own.is_some_and(|own| Arc::ptr_eq(own, &held.open));
+        (self.held.iter())
+            .filter(|held| Arc::strong_count(&held.open) > 1 + usize::from(only_own(held)))
+            .map(|held| held.bytes)
+            .sum()
+    }
+
+    /// Whether `bytes` more can be held, once the cubes no session has open go, and the one only the session opening it
+    /// has open, held by `own`.
+    fn check(&self, bytes: u64, own: Option<&Arc<()>>) -> Result<(), String> {
+        let open = self.open(own);
+        match open.saturating_add(bytes) <= self.budget {
+            true => Ok(()),
+            false => Err(self.refusal(bytes, open)),
+        }
+    }
+
+    /// Room for `bytes` more, by dropping cubes no session has open, least recently used first, which are returned to
+    /// be freed once the lock is let go; or why there's none, with nothing dropped.
+    fn make_room(&mut self, bytes: u64) -> Result<Vec<Held>, String> {
+        self.check(bytes, None)?;
+        let mut dropped = Vec::new();
+        while self.held.iter().map(|held| held.bytes).sum::<u64>() + bytes > self.budget {
+            let closed = (self.held.iter()).position(|held| Arc::strong_count(&held.open) == 1);
+            let Some(closed) = closed else { break };
+            dropped.push(self.held.remove(closed));
+        }
+        Ok(dropped)
+    }
+
+    fn refusal(&self, bytes: u64, open: u64) -> String {
+        let (needs, budget) = (gb(bytes), gb(self.budget));
+        match bytes > self.budget {
+            true => format!(
+                "not enough memory on the server: the cube needs {needs:.2} GB, and the server may hold {budget:.2} \
+                 GB of cubes (its --memory-limit-gb)"
+            ),
+            false => format!(
+                "not enough memory on the server: the cube needs {needs:.2} GB, and {:.2} GB of the {budget:.2} GB \
+                 it may hold is taken by cubes open now",
+                gb(open)
+            ),
+        }
+    }
+
+    /// The cube, held as open by the hold returned.
+    fn insert(&mut self, content_id: Arc<str>, cube: Arc<Cube>, bytes: u64) -> Arc<()> {
+        let open = Arc::new(());
+        self.held.push(Held {
+            content_id,
+            cube,
+            open: open.clone(),
+            bytes,
+        });
+        open
+    }
+}
+
 /// Compressed cubelets by the content they're of, its pyramid, level factors, place and tolerance, least recently used
 /// first out.
 type Key = (Arc<str>, Mode, [usize; 3], [usize; 3], Option<u64>);
@@ -350,6 +456,8 @@ struct Open {
     info: FileInfo,
     engine: Engine,
     content_id: Arc<str>,
+    /// The session's hold on the cube as open.
+    holding: Arc<()>,
     levels: Vec<[usize; 3]>,
     /// What level 0's cubelets are compressed to, from the request for them last: None for exact.
     tolerance: Option<f64>,
@@ -612,7 +720,7 @@ impl Session {
     }
 
     /// In place of the file open, which goes once the new one's header has been read and before its data is, so that
-    /// a bad path leaves it open and the two are never in memory together.
+    /// a bad path or a cube there's no room for leaves it open.
     async fn open(&mut self, request_id: u32, open: proto::OpenFile) {
         let start = Instant::now();
         let file_id = open.file_id;
@@ -681,30 +789,46 @@ impl Session {
         let canonical = relative.to_string_lossy().into_owned();
         let header = spawn_blocking(move || {
             let file = File::open(full).map_err(|e| e.to_string())?;
-            fits::read_image_header(&file, hdu)?;
+            let header = fits::read_image_header(&file, hdu)?;
             let metadata = file.metadata().map_err(|e| e.to_string())?;
-            Ok::<_, String>((file, metadata))
+            Ok::<_, String>((file, header, metadata))
         });
-        let (file, metadata) = header.await.map_err(|e| e.to_string())??;
+        let (file, header, metadata) = header.await.map_err(|e| e.to_string())??;
+        let modified = modified(&metadata).as_nanos();
+        let content_id: Arc<str> =
+            format!("{canonical}:{}:{modified}:{}", metadata.len(), header.hdu).into();
+        let bytes = (header.dims.iter().product::<usize>() * size_of::<f32>()) as u64;
+        // A cube a session read is shared. Otherwise it's read, one read at a time, and that's when it's checked
+        // against the budget, so that no other read can take the room in between.
+        let mut held = self.server.cubes().get(&content_id);
+        let permit = match held {
+            Some(_) => None,
+            None => {
+                let opens = self.server.opens.clone();
+                let permit = opens.acquire_owned().await.map_err(|e| e.to_string())?;
+                held = self.server.cubes().get(&content_id);
+                let own = self.file.as_ref().map(|file| &file.holding);
+                if held.is_none() {
+                    self.server.cubes().check(bytes, own)?;
+                }
+                Some(permit)
+            }
+        };
 
         let closed = self.close_file();
         for job in std::mem::take(&mut self.jobs) {
             let _ = job.handle.await;
         }
-        let opens = self.server.opens.clone();
-        let read = async {
-            // Held by the read itself, which can't be stopped once it's begun.
-            let permit = opens.acquire_owned().await.map_err(|e| e.to_string())?;
-            let read = spawn_blocking(move || {
-                let _permit = permit;
-                let mut cube = fits::read_fits(&file, hdu)?;
-                nan_infinities(&mut cube.data);
-                Ok(cube)
-            });
-            read.await.map_err(|e| e.to_string())?
+        let read = match (held, permit) {
+            (Some(held), _) => Ok(held),
+            (None, Some(permit)) => {
+                self.read_cube(permit, &content_id, file, header.hdu, bytes)
+                    .await
+            }
+            (None, None) => unreachable!("a permit is taken for a cube that isn't held"),
         };
-        let cube = match read.await {
-            Ok(cube) => cube,
+        let (cube, holding) = match read {
+            Ok(read) => read,
             Err(e) => {
                 if let Some((file_id, closed)) = closed {
                     let error = proto::ErrorData {
@@ -720,12 +844,6 @@ impl Session {
         };
         let levels = fits::levels(cube.info.dims, gpu_memory_limit_mb, max_depth);
         let (chain, levels) = (levels.chain.len(), levels.list().0);
-        let modified = modified(&metadata).as_nanos();
-        let content_id = format!(
-            "{canonical}:{}:{modified}:{}",
-            metadata.len(),
-            cube.info.hdu
-        );
         let info = cube.info.clone();
         let mut engine = Engine::new(cube);
         engine.request(Request::Levels {
@@ -737,12 +855,39 @@ impl Session {
             path: path.into(),
             info,
             engine,
-            content_id: content_id.into(),
+            content_id,
+            holding,
             levels,
             tolerance: None,
             sent: Sent::default(),
         };
         Ok((file, metadata))
+    }
+
+    /// HDU `hdu` of `file`, the cube of `content_id`, which takes `bytes` in memory, read with `permit` once there's
+    /// room for it, and held as open.
+    async fn read_cube(
+        &self,
+        permit: OwnedSemaphorePermit,
+        content_id: &Arc<str>,
+        file: File,
+        hdu: usize,
+        bytes: u64,
+    ) -> Result<(Arc<Cube>, Arc<()>), String> {
+        let (server, content_id) = (self.server.clone(), content_id.clone());
+        // The permit is held by the read itself, which can't be stopped once it's begun, until the cube is in. Cubes
+        // dropped for room are freed here too, off the async threads.
+        let read = spawn_blocking(move || {
+            let _permit = permit;
+            let dropped = server.cubes().make_room(bytes)?;
+            drop(dropped);
+            let mut cube = fits::read_fits(&file, Some(hdu))?;
+            nan_infinities(&mut cube.data);
+            let cube = Arc::new(cube);
+            let holding = server.cubes().insert(content_id, cube.clone(), bytes);
+            Ok((cube, holding))
+        });
+        read.await.map_err(|e| e.to_string())?
     }
 
     /// Drops the file open, and what its jobs are cutting, and returns its ID and path.
@@ -751,6 +896,8 @@ impl Session {
             job.cancelled.store(true, Ordering::Relaxed);
         }
         let file = self.file.take()?;
+        // The cube that has gone least recently is the first to make room.
+        drop(self.server.cubes().get(&file.content_id));
         let Sent {
             messages,
             bytes,
@@ -1018,18 +1165,19 @@ mod tests {
 
     use super::*;
 
-    /// A registered session on a server of `root`, and what it hands its loop and its socket.
-    fn session(
-        root: &Path,
-    ) -> (
+    type Opener = (
         Session,
         mpsc::UnboundedReceiver<Done>,
         mpsc::UnboundedReceiver<Message>,
-    ) {
+    );
+
+    /// A registered session on a server of `root`, and what it hands its loop and its socket.
+    fn session(root: &Path) -> Opener {
         let server = Arc::new(Server {
             root: root.canonicalize().unwrap(),
             token: String::new(),
             cache: Mutex::new(Lru::new(CACHE_BYTES)),
+            cubes: Mutex::new(Cubes::new(1 << 30)),
             opens: Arc::new(Semaphore::new(1)),
             sessions: AtomicU32::new(0),
             workers: 4,
@@ -1092,24 +1240,30 @@ mod tests {
         assert!(session.server.cache().get(&key).is_some());
     }
 
+    /// A float cube of n x n x n zeros, n at most 8.
+    fn cube_bytes(n: usize) -> Vec<u8> {
+        let mut bytes: Vec<u8> = ([
+            "SIMPLE  =                    T",
+            "BITPIX  =                  -32",
+        ]
+        .iter())
+        .map(|card| card.to_string())
+        .chain((0..4).map(|i| match i {
+            0 => format!("NAXIS   = {:>20}", 3),
+            _ => format!("NAXIS{i}  = {n:>20}"),
+        }))
+        .chain(["END".to_string()])
+        .flat_map(|card| format!("{card:<80}").into_bytes())
+        .collect();
+        bytes.resize(2 * 2880, 0);
+        bytes
+    }
+
     /// A root of its own with a small cube in it, and the OPEN_FILE for it.
     fn root_with_cube(test: &str) -> (PathBuf, Vec<u8>) {
         let root = std::env::temp_dir().join(format!("fits-server-{test}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let mut bytes: Vec<u8> = [
-            "SIMPLE  =                    T",
-            "BITPIX  =                  -32",
-            "NAXIS   =                    3",
-            "NAXIS1  =                    4",
-            "NAXIS2  =                    4",
-            "NAXIS3  =                    4",
-            "END",
-        ]
-        .iter()
-        .flat_map(|card| format!("{card:<80}").into_bytes())
-        .collect();
-        bytes.resize(2 * 2880, 0);
-        std::fs::write(root.join("cube.fits"), bytes).unwrap();
+        std::fs::write(root.join("cube.fits"), cube_bytes(4)).unwrap();
         let open = proto::OpenFile {
             file: "cube.fits".into(),
             file_id: 1,
@@ -1166,6 +1320,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sessions_share_a_cube_and_an_open_past_the_budget_fails_until_one_closes() {
+        let (root, cube) = root_with_cube("unit-share");
+        std::fs::copy(root.join("cube.fits"), root.join("other.fits")).unwrap();
+        let other = proto::OpenFile {
+            file: "other.fits".into(),
+            file_id: 1,
+            ..Default::default()
+        };
+        let other = frame(EventType::OpenFile, 0, &other);
+        let mut sessions: Vec<_> = (0..3).map(|_| session(&root)).collect();
+        let server = sessions[0].0.server.clone();
+        // Room for one 4 x 4 x 4 cube.
+        server.cubes().budget = 300;
+        for (session, ..) in &mut sessions {
+            session.server = server.clone();
+        }
+        async fn open(sessions: &mut [Opener], at: usize, message: &[u8]) -> proto::OpenFileAck {
+            let (session, _, replies) = &mut sessions[at];
+            let mut stream = futures_util::stream::pending();
+            (session
+                .handle(message, &mut stream, &mut VecDeque::new())
+                .await)
+                .unwrap();
+            let Some(Message::Binary(bytes)) = replies.recv().await else {
+                panic!("no ack")
+            };
+            carta::unframe(&bytes).unwrap().decode().unwrap()
+        }
+        assert!(open(&mut sessions, 0, &cube).await.success);
+        assert!(open(&mut sessions, 1, &cube).await.success);
+        // Read once, held by the two sessions and the server.
+        let held = |server: &Server| {
+            let cubes = server.cubes();
+            (cubes.held.iter())
+                .map(|h| (h.content_id.clone(), Arc::strong_count(&h.open)))
+                .collect::<Vec<_>>()
+        };
+        assert!(matches!(&held(&server)[..], [(id, 3)] if id.starts_with("cube.fits:")));
+
+        let refused = open(&mut sessions, 2, &other).await;
+        assert!(
+            !refused.success && refused.message.contains("not enough memory"),
+            "{}",
+            refused.message
+        );
+        // Nor is the cube a session would close room while another has it open, and it stays open.
+        assert!(!open(&mut sessions, 0, &other).await.success);
+        assert!(sessions[0].0.file.is_some());
+        sessions[0].0.close_file();
+        assert!(!open(&mut sessions, 2, &other).await.success);
+        // Once neither has it open, the cube goes to make room.
+        sessions[1].0.close_file();
+        assert!(open(&mut sessions, 2, &other).await.success);
+        assert!(matches!(&held(&server)[..], [(id, 2)] if id.starts_with("other.fits:")));
+        // A cube that can't fit is refused before the one open goes.
+        std::fs::write(root.join("big.fits"), cube_bytes(8)).unwrap();
+        let big = proto::OpenFile {
+            file: "big.fits".into(),
+            file_id: 2,
+            ..Default::default()
+        };
+        assert!(
+            !open(&mut sessions, 2, &frame(EventType::OpenFile, 0, &big))
+                .await
+                .success
+        );
+        assert!(sessions[2].0.file.is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn one_port_answers_plain_and_tls_with_the_certificate_it_made() {
         use rustls::pki_types::pem::PemObject;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1174,7 +1399,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let root = dir.clone();
-        tokio::spawn(async move { serve(listener, &root, "token".into(), Some(config)).await });
+        tokio::spawn(
+            async move { serve(listener, &root, "token".into(), Some(config), 1 << 30).await },
+        );
 
         async fn get(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) -> String {
             let request = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
