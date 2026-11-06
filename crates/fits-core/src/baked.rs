@@ -360,8 +360,8 @@ impl Source {
                 None
             }
             Request::RemoveCubelets { ids } => {
-                let removed: HashSet<_> = ids.iter().collect();
-                self.kept.hits.retain(|id| !removed.contains(id));
+                let removed: HashSet<_> = ids.iter().copied().collect();
+                self.kept.hits.remove_all(&removed);
                 for read in self
                     .reads
                     .values_mut()

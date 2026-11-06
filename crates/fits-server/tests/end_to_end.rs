@@ -512,6 +512,69 @@ fn a_reused_file_id_gets_only_the_new_cubes_cubelets() {
 }
 
 #[test]
+fn a_reply_overtakes_the_cubelets_queued_for_a_client_slow_to_read_and_few_are_queued() {
+    let root = root("slow");
+    let dims = [1024, 512, 16];
+    write_fits(&root.join("big.fits"), dims, &[], |[x, y, z]| {
+        ((x + y + z) % 89) as f32
+    });
+    let port = start(&root);
+    let (mut socket, _) =
+        tungstenite::connect(format!("ws://127.0.0.1:{port}/?token={TOKEN}")).unwrap();
+    if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_mut() {
+        tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    }
+    let mut raw = Raw(socket);
+    raw.send(EventType::RegisterViewer, &proto::RegisterViewer::default());
+    assert_eq!(raw.next().0, EventType::RegisterViewerAck);
+    let open = proto::OpenFile {
+        file: "big.fits".into(),
+        file_id: 1,
+        ..Default::default()
+    };
+    raw.send(EventType::OpenFile, &open);
+    assert_eq!(raw.next().0, EventType::OpenFileAck);
+
+    // Every level 0 cubelet uncompressed, 128 of 256 KiB, which the client doesn't read for a while.
+    let cubelets: Vec<u64> = (0..16 * 8)
+        .map(|i| cubelet_key(0, [i % 16, i / 16, 0]))
+        .collect();
+    let add = proto::AddRequiredCubelets {
+        file_id: 1,
+        cubelets: cubelets.clone(),
+        ..Default::default()
+    };
+    raw.send(EventType::AddRequiredCubelets, &add);
+    std::thread::sleep(Duration::from_millis(500));
+    let pixel = proto::PixelValueRequest {
+        file_id: 1,
+        ..Default::default()
+    };
+    raw.send(EventType::PixelValueRequest, &pixel);
+    let remove = proto::RemoveRequiredCubelets {
+        file_id: 1,
+        cubelets,
+        ..Default::default()
+    };
+    raw.send(EventType::RemoveRequiredCubelets, &remove);
+
+    // Until nothing more comes.
+    let (mut arrived, mut before_reply) = (0, None);
+    while let Ok(tungstenite::Message::Binary(bytes)) = raw.0.read() {
+        match carta::unframe(&bytes).unwrap().event.unwrap() {
+            EventType::CubeletData => arrived += 1,
+            EventType::PixelValueResponse => before_reply = Some(arrived),
+            event => panic!("{event:?}"),
+        }
+    }
+    let before_reply = before_reply.expect("a reply");
+    // The reply came ahead of cubelets queued before it, and only what had been queued came after the removal.
+    assert!(before_reply < arrived, "{before_reply} of {arrived}");
+    assert!(arrived < 128, "{arrived}");
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+#[test]
 fn a_level_list_unlike_the_servers_closes_the_file() {
     let root = root("levels");
     let port = start(&root);

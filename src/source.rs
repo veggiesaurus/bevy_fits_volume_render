@@ -78,7 +78,7 @@ mod local {
     }
 
     struct State {
-        engine: Engine,
+        engine: Box<Engine>,
         /// Dropping a task cancels it, if it hasn't started.
         running: Vec<(Option<CubeletId>, Task<()>)>,
     }
@@ -91,7 +91,7 @@ mod local {
         pub fn local(cube: Cube) -> Self {
             Self {
                 state: Mutex::new(State {
-                    engine: Engine::new(cube),
+                    engine: Box::new(Engine::new(cube)),
                     running: Vec::new(),
                 }),
                 answered: default(),

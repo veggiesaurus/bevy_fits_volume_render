@@ -62,6 +62,52 @@ impl CubeletId {
     }
 }
 
+/// Cubelets in the order they were asked for, each once, so that asking again for one still to come adds nothing.
+#[derive(Debug, Default)]
+pub struct Queue {
+    order: VecDeque<CubeletId>,
+    queued: HashSet<CubeletId>,
+}
+
+impl Queue {
+    /// Whether `id` wasn't queued already.
+    pub fn push_back(&mut self, id: CubeletId) -> bool {
+        let new = self.queued.insert(id);
+        if new {
+            self.order.push_back(id);
+        }
+        new
+    }
+
+    pub fn pop_front(&mut self) -> Option<CubeletId> {
+        self.remove(0)
+    }
+
+    fn remove(&mut self, at: usize) -> Option<CubeletId> {
+        let id = self.order.remove(at)?;
+        self.queued.remove(&id);
+        Some(id)
+    }
+
+    pub fn remove_all(&mut self, ids: &HashSet<CubeletId>) {
+        self.order.retain(|id| !ids.contains(id));
+        self.queued.retain(|id| !ids.contains(id));
+    }
+
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.queued.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+}
+
 #[derive(Debug)]
 pub enum Request {
     /// The level list the viewer asks by, the first `chain` of them the power-of-two chain, in place of any before
@@ -138,7 +184,7 @@ pub struct Engine {
     /// The pyramid before while a job still has it, which the next level waits for so that the two are never in
     /// memory together.
     retired: Weak<RwLock<Vec<Level>>>,
-    queue: VecDeque<CubeletId>,
+    queue: Queue,
     extras: VecDeque<Extra>,
     normalisers: HashMap<(Mode, u8), NormaliserCell>,
 }
@@ -400,7 +446,7 @@ impl Engine {
             chain: 0,
             pyramid: None,
             retired: Weak::new(),
-            queue: VecDeque::new(),
+            queue: Queue::default(),
             extras: VecDeque::new(),
             normalisers: HashMap::new(),
         }
@@ -427,8 +473,7 @@ impl Engine {
                 }
             }
             Request::RemoveCubelets { ids } => {
-                let ids: HashSet<CubeletId> = ids.into_iter().collect();
-                self.queue.retain(|id| !ids.contains(id));
+                self.queue.remove_all(&ids.into_iter().collect());
             }
             Request::PixelValue { id, voxel } => {
                 let [width, height, depth] = self.cube.info.dims;
@@ -492,6 +537,15 @@ impl Engine {
     /// The next job: a measure or a mask, which the view waits on, or else the first cubelet that can be cut now,
     /// in the order asked; or the job one of them waits on, the next level of a pyramid or a normaliser.
     pub fn next_job(&mut self) -> Option<Job> {
+        self.next(true)
+    }
+
+    /// `next_job`, but never a cut, for when there's nowhere to put another cubelet yet.
+    pub fn next_job_but_a_cut(&mut self) -> Option<Job> {
+        self.next(false)
+    }
+
+    fn next(&mut self, cuts: bool) -> Option<Job> {
         for i in 0..self.extras.len() {
             let Extra {
                 mode,
@@ -515,10 +569,11 @@ impl Engine {
             }
         }
         for i in 0..self.queue.len() {
-            let id = self.queue[i];
+            let id = self.queue.order[i];
             let factors = self.levels[usize::from(id.level)];
             if !id.processing.is_none() {
                 match self.normaliser(id.mode, id.level, id.processing) {
+                    Need::Ready(_) if !cuts => continue,
                     Need::Ready(normaliser) => {
                         self.queue.remove(i);
                         return Some(Job(Work::Cut {
@@ -535,6 +590,9 @@ impl Engine {
             }
             let built = self.built(id.mode, id.level);
             if built.is_some() || !self.needs_pyramid(id) {
+                if !cuts {
+                    continue;
+                }
                 self.queue.remove(i);
                 return Some(Job(Work::Cut {
                     id,
@@ -694,6 +752,43 @@ mod tests {
             chain: 1,
         });
         assert!(engine.next_job().is_none());
+    }
+
+    #[test]
+    fn with_no_room_for_a_cubelet_the_level_cuts_wait_on_still_starts() {
+        let dims = [256, 256, 4];
+        let mut engine = Engine::new(cube(dims, vec![0.0; 256 * 256 * 4]));
+        engine.request(Request::Levels {
+            factors: levels(dims, 384, 2048).chain,
+            chain: 3,
+        });
+        let ids =
+            [0, 1].map(|level| CubeletId::new(Mode::Max, Processing::default(), level, [0; 3]));
+        engine.request(Request::AddCubelets { ids: ids.to_vec() });
+        let level = engine.next_job_but_a_cut().unwrap();
+        assert!(level.cubelet().is_none() && engine.next_job_but_a_cut().is_none());
+        assert_eq!(engine.next_job().unwrap().cubelet(), Some(ids[0]));
+    }
+
+    #[test]
+    fn a_cubelet_asked_for_again_before_its_cut_is_cut_once() {
+        let mut engine = Engine::new(cube([130, 4, 1], vec![0.0; 130 * 4]));
+        engine.request(Request::Levels {
+            factors: vec![[1; 3]],
+            chain: 1,
+        });
+        let id = CubeletId::new(Mode::Max, Processing::default(), 0, [1, 0, 0]);
+        for _ in 0..3 {
+            engine.request(Request::AddCubelets { ids: vec![id, id] });
+        }
+        let mut cut = 0;
+        while let Some(job) = engine.next_job() {
+            cut += job.run().len();
+        }
+        assert_eq!(cut, 1);
+        // Once it's out, it can be asked for again.
+        engine.request(Request::AddCubelets { ids: vec![id] });
+        assert!(engine.next_job().is_some());
     }
 
     #[test]

@@ -4,14 +4,14 @@
 //! makes room for. A pack's records are also what a baked cube's file holds.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap},
     hash::Hash,
     sync::Arc,
 };
 
 use crate::{
     CUBELET, Cubelet, codec,
-    engine::{CubeletId, Mode},
+    engine::{CubeletId, Mode, Queue},
 };
 
 /// Entries under a cap on their bytes, least recently used out first.
@@ -265,8 +265,8 @@ pub struct Kept {
     pack: Option<Pack>,
     /// The cache was cleared before the pack was attached, so it's emptied then.
     cleared: bool,
-    /// Cubelets asked for that are in the cache, for `next`.
-    pub hits: VecDeque<CubeletId>,
+    /// Cubelets asked for that are in the cache, for `next`, each once however often it's asked for.
+    pub hits: Queue,
 }
 
 impl Kept {
@@ -277,7 +277,7 @@ impl Kept {
             tolerance,
             pack: None,
             cleared: false,
-            hits: VecDeque::new(),
+            hits: Queue::default(),
         }
     }
 

@@ -354,9 +354,9 @@ impl Client {
                 open.add(&ids)?
             }
             Request::RemoveCubelets { ids } => {
-                let removed: HashSet<_> = ids.iter().collect();
+                let removed: HashSet<_> = ids.iter().copied().collect();
                 if let Some(kept) = &mut open.kept {
-                    kept.hits.retain(|id| !removed.contains(id));
+                    kept.hits.remove_all(&removed);
                 }
                 (by_mode(&ids)?.into_iter())
                     .map(|(mode, cubelets)| {

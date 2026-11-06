@@ -33,14 +33,17 @@ use fits_core::{
     cache::Lru,
     carta::{self, CUBE, FILE_CLOSED, Frame, ICD_VERSION, cubelet_at, frame, proto},
     codec,
-    engine::{CubeletId, Engine, Event, Mode, Request},
+    engine::{CubeletId, Engine, Event, Mode, Queue, Request},
 };
 use futures_util::{SinkExt, Stream, StreamExt};
 use prost::Message as _;
 use proto::{CompressionType, EventType, SmoothingMode};
 use tokio::{
     net::TcpListener,
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{
+        OwnedSemaphorePermit, Semaphore,
+        mpsc::{self, OwnedPermit, error::TrySendError},
+    },
     task::{JoinHandle, spawn_blocking},
 };
 
@@ -54,6 +57,14 @@ const MAX_HELD: usize = 1024;
 const MAX_HELD_BYTES: usize = 2 * MAX_REQUEST;
 /// Compressed cubelets kept for every session.
 const CACHE_BYTES: usize = 1 << 30;
+/// Replies and errors queued for the socket, which go ahead of any cubelets queued. Once this many are queued, the
+/// session stops reading the client's messages until some have gone.
+const CONTROL: usize = 64;
+/// Cubelets being cut or queued for the socket, a session's at most, so that a client slow to read holds up the cutting
+/// rather than filling the server's memory.
+const BULK: usize = 32;
+/// How long a session that's ending waits for the client to take what's left to send.
+const CLOSE_WITHIN: Duration = Duration::from_secs(10);
 /// A client that doesn't say what it can hold gets the viewer's defaults.
 const DEFAULT_BUDGET: proto::VolumeBudget = proto::VolumeBudget {
     gpu_memory_limit_mb: 384,
@@ -436,17 +447,29 @@ struct Session {
     /// Jobs out, for this file or one before it.
     jobs: Vec<Running>,
     done: mpsc::UnboundedSender<Done>,
-    /// To the task writing to the socket, so that the session reads on while the client is slow to.
-    // ponytail: unbounded, so a client that stops reading grows it; stage 2's flow control bounds it.
-    out: mpsc::UnboundedSender<Message>,
+    /// Replies and errors, to the task writing to the socket, which sends them ahead of cubelets.
+    control: mpsc::Sender<Message>,
+    /// What didn't fit in `control`, in order. While there's any, the session doesn't read the client's messages or
+    /// send cubelets, so that nothing for a file overtakes its ack.
+    overflow: VecDeque<Message>,
+    /// Cubelets, with the epoch of the file they're of. A place is taken before a cubelet is cut.
+    bulk: mpsc::Sender<(u32, Message)>,
+    /// Moved on as a file closes, so that the writer drops its cubelets still queued.
+    epoch: Arc<AtomicU32>,
+    /// The open file's cubelets that the cache has, to send as there's room, each once however often it's asked for.
+    hits: Queue,
+    /// Whether there was no room for a cubelet, so that the session waits for some.
+    blocked: bool,
     /// Why the session ends, once it's to end after what it's sending.
     closing: Option<String>,
 }
 
-/// A job out, and the flag that drops what it cuts once that's no longer wanted.
+/// A job out, the flag that drops what it cuts once that's no longer wanted, and for a cut, its cubelet's place in the
+/// queue to the socket.
 struct Running {
     cubelet: Option<CubeletId>,
     cancelled: Arc<AtomicBool>,
+    room: Option<OwnedPermit<(u32, Message)>>,
     handle: JoinHandle<()>,
 }
 
@@ -496,16 +519,11 @@ struct Done {
 
 async fn run(server: Arc<Server>, socket: WebSocket, authorised: bool) {
     let id = server.sessions.fetch_add(1, Ordering::Relaxed) + 1;
-    let (mut sink, mut stream) = socket.split();
-    let (out, mut outgoing) = mpsc::unbounded_channel();
-    let writer = tokio::spawn(async move {
-        while let Some(message) = outgoing.recv().await {
-            if sink.send(message).await.is_err() {
-                return;
-            }
-        }
-        let _ = sink.close().await;
-    });
+    let (sink, mut stream) = socket.split();
+    let (control, controls) = mpsc::channel(CONTROL);
+    let (bulk, cubelets) = mpsc::channel(BULK);
+    let epoch = Arc::new(AtomicU32::new(0));
+    let mut writer = tokio::spawn(write(sink, controls, cubelets, epoch.clone()));
     let (done, mut finished) = mpsc::unbounded_channel();
     let mut session = Session {
         server,
@@ -515,7 +533,12 @@ async fn run(server: Arc<Server>, socket: WebSocket, authorised: bool) {
         file: None,
         jobs: Vec::new(),
         done,
-        out,
+        control,
+        overflow: VecDeque::new(),
+        bulk,
+        epoch,
+        hits: Queue::default(),
+        blocked: false,
         closing: None,
     };
     println!("Session {id}: connected");
@@ -525,15 +548,35 @@ async fn run(server: Arc<Server>, socket: WebSocket, authorised: bool) {
     tokio::pin!(deadline);
     let reason = loop {
         session.start_jobs();
-        let handled = match deferred.pop_front() {
-            Some(bytes) => session.handle(&bytes, &mut stream, &mut deferred).await,
-            None => tokio::select! {
-                message = stream.next() => match message {
+        let (control, bulk) = (session.control.clone(), session.bulk.clone());
+        let reading = session.overflow.is_empty();
+        let handled = if reading && let Some(bytes) = deferred.pop_front() {
+            session.handle(&bytes, &mut stream, &mut deferred).await
+        } else {
+            tokio::select! {
+                Ok(permit) = control.reserve(), if !reading => {
+                    permit.send(session.overflow.pop_front().expect("an overflow"));
+                    // And as many more as there's room for.
+                    while let Some(message) = session.overflow.pop_front() {
+                        if let Err(TrySendError::Full(message)) = session.control.try_send(message) {
+                            session.overflow.push_front(message);
+                            break;
+                        }
+                    }
+                    Ok(())
+                }
+                // The writer has gone, which a session that isn't reading would otherwise never see.
+                () = control.closed() => break "the client went".to_string(),
+                Ok(_) = bulk.reserve(), if session.blocked => {
+                    session.blocked = false;
+                    Ok(())
+                }
+                message = stream.next(), if reading => match message {
                     Some(Ok(Message::Binary(bytes))) => {
                         session.handle(&bytes, &mut stream, &mut deferred).await
                     }
                     Some(Ok(Message::Text(text))) if text.as_str() == "PING" => {
-                        let _ = session.out.send(Message::Text("PONG".into()));
+                        session.queue(Message::Text("PONG".into()));
                         Ok(())
                     }
                     Some(Ok(Message::Close(_))) | None => break "closed by the client".to_string(),
@@ -547,14 +590,14 @@ async fn run(server: Arc<Server>, socket: WebSocket, authorised: bool) {
                 () = &mut deadline, if !session.registered => {
                     break "no REGISTER_VIEWER in time".to_string();
                 }
-            },
+            }
         };
         // A message that makes no sense: nothing after it from this client can be trusted.
         if let Err(e) = handled {
             writer.abort();
             break format!("a bad message, {e}");
         }
-        if session.out.is_closed() {
+        if session.control.is_closed() {
             break "the client went".into();
         }
         if let Some(reason) = session.closing.take() {
@@ -562,21 +605,79 @@ async fn run(server: Arc<Server>, socket: WebSocket, authorised: bool) {
         }
     };
     session.close_file();
-    // What's left to send goes, then the socket closes.
+    // What's left to send goes, then the socket closes, unless the client has stopped reading.
+    for message in std::mem::take(&mut session.overflow) {
+        let _ = session.control.try_send(message);
+    }
     drop(session);
-    let _ = writer.await;
+    if tokio::time::timeout(CLOSE_WITHIN, &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+    }
     println!("Session {id}: {reason}");
+}
+
+/// Sends what's queued for the socket, replies and errors ahead of cubelets, and drops the cubelets of a file that has
+/// closed since they were queued.
+async fn write(
+    mut sink: impl futures_util::Sink<Message> + Unpin,
+    mut control: mpsc::Receiver<Message>,
+    mut bulk: mpsc::Receiver<(u32, Message)>,
+    epoch: Arc<AtomicU32>,
+) {
+    loop {
+        let message = tokio::select! {
+            biased;
+            Some(message) = control.recv() => message,
+            Some((of, message)) = bulk.recv() => {
+                if of != epoch.load(Ordering::Relaxed) {
+                    continue;
+                }
+                message
+            }
+            else => break,
+        };
+        if sink.send(message).await.is_err() {
+            return;
+        }
+    }
+    let _ = sink.close().await;
 }
 
 impl Session {
     fn send(&mut self, bytes: Vec<u8>) {
         if let Some(Open { sent, .. }) = &mut self.file {
-            let cubelet = (EventType::CubeletData as u16).to_le_bytes();
             sent.messages += 1;
             sent.bytes += bytes.len();
-            sent.cubelets += usize::from(bytes.starts_with(&cubelet));
         }
-        let _ = self.out.send(Message::Binary(bytes.into()));
+        self.queue(Message::Binary(bytes.into()));
+    }
+
+    /// Into `control`, or after what's waiting for room in it.
+    fn queue(&mut self, message: Message) {
+        let message = match self.overflow.is_empty() {
+            true => match self.control.try_send(message) {
+                Ok(()) | Err(TrySendError::Closed(_)) => return,
+                Err(TrySendError::Full(message)) => message,
+            },
+            false => message,
+        };
+        self.overflow.push_back(message);
+    }
+
+    /// A cubelet of the open file, in the place `room` took for it.
+    fn send_cubelet(&mut self, room: OwnedPermit<(u32, Message)>, id: CubeletId, payload: &[u8]) {
+        let Some(file) = &mut self.file else {
+            return;
+        };
+        let bytes = cubelet_frame(file.file_id, id, payload);
+        file.sent.messages += 1;
+        file.sent.bytes += bytes.len();
+        file.sent.cubelets += 1;
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        room.send((epoch, Message::Binary(bytes.into())));
     }
 
     async fn handle(
@@ -687,7 +788,7 @@ impl Session {
         stream: &mut (impl Stream<Item = Result<Message, axum::Error>> + Unpin),
         deferred: &mut VecDeque<Bytes>,
     ) {
-        let out = self.out.clone();
+        let control = self.control.clone();
         let mut held: usize = deferred.iter().map(Bytes::len).sum();
         let gone = {
             let opening = self.open(request_id, open);
@@ -704,8 +805,9 @@ impl Session {
                             // slice would keep the whole buffer in memory.
                             deferred.push_back(Bytes::copy_from_slice(&bytes));
                         }
+                        // Dropped if the queue is full, as it can only be for a client that isn't reading.
                         Some(Ok(Message::Text(text))) if text.as_str() == "PING" => {
-                            let _ = out.send(Message::Text("PONG".into()));
+                            let _ = control.try_send(Message::Text("PONG".into()));
                         }
                         Some(Ok(Message::Close(_))) | None => break Some("closed by the client".into()),
                         Some(Ok(_)) => {}
@@ -895,6 +997,8 @@ impl Session {
         for job in &self.jobs {
             job.cancelled.store(true, Ordering::Relaxed);
         }
+        self.hits.clear();
+        self.epoch.fetch_add(1, Ordering::Relaxed);
         let file = self.file.take()?;
         // The cube that has gone least recently is the first to make room.
         drop(self.server.cubes().get(&file.content_id));
@@ -1008,21 +1112,16 @@ impl Session {
             return;
         };
         file.tolerance = tolerance;
-        let (mut cached, mut cut) = (Vec::new(), Vec::new());
+        let mut cut = Vec::new();
         let mut cache = self.server.cache();
         for id in Self::cubelets(file, mode, &add.cubelets) {
-            match cache.get(&file.key(id).0) {
-                Some(payload) => cached.push((id, payload.clone())),
-                None => cut.push(id),
+            match cache.get(&file.key(id).0).is_some() {
+                true => _ = self.hits.push_back(id),
+                false => cut.push(id),
             }
         }
         drop(cache);
-        file.sent.cached += cached.len();
         file.engine.request(Request::AddCubelets { ids: cut });
-        let file_id = file.file_id;
-        for (id, payload) in cached {
-            self.send(cubelet_frame(file_id, id, &payload));
-        }
     }
 
     /// Out of the queue, and dropped uncompressed if they're being cut.
@@ -1035,7 +1134,8 @@ impl Session {
             return;
         };
         let ids = Self::cubelets(file, mode, &remove.cubelets);
-        let removed: HashSet<_> = ids.iter().collect();
+        let removed: HashSet<_> = ids.iter().copied().collect();
+        self.hits.remove_all(&removed);
         for job in &self.jobs {
             if job.cubelet.is_some_and(|id| removed.contains(&id)) {
                 job.cancelled.store(true, Ordering::Relaxed);
@@ -1067,23 +1167,64 @@ impl Session {
         self.send(frame(EventType::PixelValueResponse, request_id, &response));
     }
 
-    /// Hands out jobs up to a core's worth, in the order the engine has them. Each compresses its cubelet into the
-    /// cache, once it has dropped what it held of the engine's, unless it's cancelled by then.
+    /// Sends the cubelets the cache has while there's room for them, and hands out jobs up to a core's worth, in the
+    /// order the engine has them: cuts while there's room for what they cut, and otherwise the jobs cuts wait on. Each
+    /// cut compresses its cubelet into the cache, once it has dropped what it held of the engine's, unless it's
+    /// cancelled by then. Nothing goes while a reply waits for room.
     fn start_jobs(&mut self) {
-        while self.jobs.len() < self.server.workers {
-            let Some(file) = self.file.as_mut() else {
+        while self.overflow.is_empty() && self.file.is_some() {
+            let room = self.bulk.clone().try_reserve_owned().ok();
+            self.blocked = room.is_none();
+            let hit = if room.is_some() {
+                self.hits.pop_front()
+            } else {
+                None
+            };
+            let room = match (hit, room) {
+                (Some(id), Some(room)) => {
+                    self.send_hit(room, id);
+                    continue;
+                }
+                (_, room) => room,
+            };
+            let Some(file) = self
+                .file
+                .as_mut()
+                .filter(|_| self.jobs.len() < self.server.workers)
+            else {
                 return;
             };
-            let Some(job) = file.engine.next_job() else {
+            let job = match room {
+                Some(_) => file.engine.next_job(),
+                None => file.engine.next_job_but_a_cut(),
+            };
+            let Some(job) = job else {
                 return;
             };
             let cubelet = job.cubelet();
             let target = cubelet.map(|id| file.key(id));
-            self.spawn_job(cubelet, target, move || {
+            let room = room.filter(|_| cubelet.is_some());
+            self.spawn_job(cubelet, target, room, move || {
                 let events = job.run();
                 drop(job);
                 events
             });
+        }
+    }
+
+    /// A cubelet the cache had when it was asked for, in the place `room` took for it, or else asked of the engine.
+    fn send_hit(&mut self, room: OwnedPermit<(u32, Message)>, id: CubeletId) {
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        let payload = self.server.cache().get(&file.key(id).0).cloned();
+        match payload {
+            Some(payload) => {
+                file.sent.cached += 1;
+                self.send_cubelet(room, id, &payload);
+            }
+            // Gone from the cache since.
+            None => _ = file.engine.request(Request::AddCubelets { ids: vec![id] }),
         }
     }
 
@@ -1092,6 +1233,7 @@ impl Session {
         &mut self,
         cubelet: Option<CubeletId>,
         target: Option<(Key, Option<f64>)>,
+        room: Option<OwnedPermit<(u32, Message)>>,
         work: impl FnOnce() -> Vec<Event> + Send + 'static,
     ) {
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1127,11 +1269,12 @@ impl Session {
         self.jobs.push(Running {
             cubelet,
             cancelled,
+            room,
             handle,
         });
     }
 
-    /// A job's cubelets, unless they're no longer wanted.
+    /// A job's cubelet, unless it's no longer wanted, in the place it took. A job that cut nothing frees its place.
     fn finished(&mut self, done: Done) {
         let Some(at) =
             (self.jobs.iter()).position(|job| Arc::ptr_eq(&job.cancelled, &done.cancelled))
@@ -1147,12 +1290,12 @@ impl Session {
                 return self.send(error_data(format!("Cutting {what} failed: {panic}")));
             }
         };
-        let file_id = self.file.as_ref().map(|file| file.file_id);
-        let Some(file_id) = file_id.filter(|_| !done.cancelled.load(Ordering::Relaxed)) else {
+        if self.file.is_none() || done.cancelled.load(Ordering::Relaxed) {
             return;
-        };
-        for (id, payload) in cubelets {
-            self.send(cubelet_frame(file_id, id, &payload));
+        }
+        // A cut has one cubelet at most, or none for a cubelet past the cube's edge.
+        if let (Some(room), Some((id, payload))) = (job.room, cubelets.into_iter().next()) {
+            self.send_cubelet(room, id, &payload);
         }
     }
 }
@@ -1168,10 +1311,10 @@ mod tests {
     type Opener = (
         Session,
         mpsc::UnboundedReceiver<Done>,
-        mpsc::UnboundedReceiver<Message>,
+        mpsc::Receiver<Message>,
     );
 
-    /// A registered session on a server of `root`, and what it hands its loop and its socket.
+    /// A registered session on a server of `root`, and what it hands its loop and its socket's replies.
     fn session(root: &Path) -> Opener {
         let server = Arc::new(Server {
             root: root.canonicalize().unwrap(),
@@ -1182,8 +1325,8 @@ mod tests {
             sessions: AtomicU32::new(0),
             workers: 4,
         });
-        let ((done, finished), (out, outgoing)) =
-            (mpsc::unbounded_channel(), mpsc::unbounded_channel());
+        let ((done, finished), (control, controls)) =
+            (mpsc::unbounded_channel(), mpsc::channel(CONTROL));
         let session = Session {
             server,
             id: 1,
@@ -1192,10 +1335,15 @@ mod tests {
             file: None,
             jobs: Vec::new(),
             done,
-            out,
+            control,
+            overflow: VecDeque::new(),
+            bulk: mpsc::channel(BULK).0,
+            epoch: Arc::default(),
+            hits: Queue::default(),
+            blocked: false,
             closing: None,
         };
-        (session, finished, outgoing)
+        (session, finished, controls)
     }
 
     async fn next(finished: &mut mpsc::UnboundedReceiver<Done>) -> Done {
@@ -1206,7 +1354,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_that_panics_frees_its_place_and_says_so_and_a_poisoned_cache_still_serves() {
         let (mut session, mut finished, mut outgoing) = session(&std::env::temp_dir());
-        session.spawn_job(None, None, || panic!("on purpose"));
+        session.spawn_job(None, None, None, || panic!("on purpose"));
         session.finished(next(&mut finished).await);
         assert!(session.jobs.is_empty());
         let Some(Message::Binary(bytes)) = outgoing.recv().await else {
@@ -1232,7 +1380,7 @@ mod tests {
                 has_nan: false,
             },
         };
-        session.spawn_job(Some(id), Some((key.clone(), None)), move || {
+        session.spawn_job(Some(id), Some((key.clone(), None)), None, move || {
             vec![Event::Cubelet { id, cubelet }]
         });
         let done = next(&mut finished).await;
@@ -1240,18 +1388,16 @@ mod tests {
         assert!(session.server.cache().get(&key).is_some());
     }
 
-    /// A float cube of n x n x n zeros, n at most 8.
-    fn cube_bytes(n: usize) -> Vec<u8> {
+    /// A float cube of zeros, of at most 720 voxels.
+    fn cube_bytes(dims: [usize; 3]) -> Vec<u8> {
         let mut bytes: Vec<u8> = ([
             "SIMPLE  =                    T",
             "BITPIX  =                  -32",
         ]
         .iter())
         .map(|card| card.to_string())
-        .chain((0..4).map(|i| match i {
-            0 => format!("NAXIS   = {:>20}", 3),
-            _ => format!("NAXIS{i}  = {n:>20}"),
-        }))
+        .chain([format!("NAXIS   = {:>20}", 3)])
+        .chain((1..).zip(dims).map(|(i, n)| format!("NAXIS{i}  = {n:>20}")))
         .chain(["END".to_string()])
         .flat_map(|card| format!("{card:<80}").into_bytes())
         .collect();
@@ -1263,7 +1409,7 @@ mod tests {
     fn root_with_cube(test: &str) -> (PathBuf, Vec<u8>) {
         let root = std::env::temp_dir().join(format!("fits-server-{test}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("cube.fits"), cube_bytes(4)).unwrap();
+        std::fs::write(root.join("cube.fits"), cube_bytes([4; 3])).unwrap();
         let open = proto::OpenFile {
             file: "cube.fits".into(),
             file_id: 1,
@@ -1375,7 +1521,7 @@ mod tests {
         assert!(open(&mut sessions, 2, &other).await.success);
         assert!(matches!(&held(&server)[..], [(id, 2)] if id.starts_with("other.fits:")));
         // A cube that can't fit is refused before the one open goes.
-        std::fs::write(root.join("big.fits"), cube_bytes(8)).unwrap();
+        std::fs::write(root.join("big.fits"), cube_bytes([8; 3])).unwrap();
         let big = proto::OpenFile {
             file: "big.fits".into(),
             file_id: 2,
@@ -1387,6 +1533,46 @@ mod tests {
                 .success
         );
         assert!(sessions[2].0.file.is_some());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cached_cubelets_asked_for_again_before_theyve_gone_are_queued_once() {
+        let (root, _) = root_with_cube("unit-hits");
+        std::fs::write(root.join("wide.fits"), cube_bytes([130, 4, 1])).unwrap();
+        let (mut session, _, _replies) = session(&root);
+        let open = proto::OpenFile {
+            file: "wide.fits".into(),
+            file_id: 1,
+            ..Default::default()
+        };
+        let mut stream = futures_util::stream::pending();
+        let open = frame(EventType::OpenFile, 0, &open);
+        (session
+            .handle(&open, &mut stream, &mut VecDeque::new())
+            .await)
+            .unwrap();
+        let ids: Vec<_> = (0..3)
+            .map(|x| CubeletId::new(Mode::Max, Default::default(), 0, [x, 0, 0]))
+            .collect();
+        let file = session.file.as_ref().unwrap();
+        for &id in &ids {
+            let key = file.key(id).0;
+            session.server.cache().insert(key, Arc::from(&[][..]), 0);
+        }
+        let keys = ids
+            .iter()
+            .map(|id| carta::cubelet_key(0, [id.x, id.y, id.z]));
+        let add = proto::AddRequiredCubelets {
+            file_id: 1,
+            cubelets: keys.clone().chain(keys).collect(),
+            ..Default::default()
+        };
+        // Nothing goes out, since the socket's queue is gone.
+        for _ in 0..3 {
+            session.add(add.clone());
+        }
+        assert_eq!(session.hits.len(), ids.len());
         let _ = std::fs::remove_dir_all(root);
     }
 
