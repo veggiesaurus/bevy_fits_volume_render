@@ -10,7 +10,14 @@ fits-core = { path = "../fits-core" }
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"] }
 getrandom = "0.3"
 prost = "0.14"
+# TLS for wss://, with ring rather than aws-lc, which needs cmake.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+time = "0.3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", default-features = false }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["io-util"] }
 tungstenite = "0.29"

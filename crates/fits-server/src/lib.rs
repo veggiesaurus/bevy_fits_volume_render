@@ -14,6 +14,8 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
+pub mod tls;
+
 use axum::{
     Router,
     body::Bytes,
@@ -22,7 +24,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
     },
     http::{HeaderMap, StatusCode, Uri},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use fits_core::{
@@ -69,8 +71,14 @@ struct Server {
 }
 
 /// Serves the cubes under `root` until the listener fails. A client connects to `/` with `token` as `?token=`, as
-/// `Authorization: Bearer`, or in the `carta-auth-token` header.
-pub async fn serve(listener: TcpListener, root: &Path, token: String) -> std::io::Result<()> {
+/// `Authorization: Bearer`, or in the `carta-auth-token` header, or else in REGISTER_VIEWER. With `tls`, the same port
+/// takes `wss://` as well as `ws://`.
+pub async fn serve(
+    listener: TcpListener,
+    root: &Path,
+    token: String,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) -> std::io::Result<()> {
     if token.is_empty() {
         return Err(std::io::Error::other("an empty token would let anyone in"));
     }
@@ -83,8 +91,15 @@ pub async fn serve(listener: TcpListener, root: &Path, token: String) -> std::io
         workers: std::thread::available_parallelism().map_or(4, |n| n.get()),
     });
     let app = Router::new().route("/", get(upgrade)).with_state(server);
-    axum::serve(listener, app).await
+    match tls {
+        Some(tls) => axum::serve(tls::Listener::new(listener, tls)?, app).await,
+        None => axum::serve(listener, app).await,
+    }
 }
+
+/// For `GET /` in a browser, which is where Safari's certificate warning is accepted.
+const RUNNING: &str = "<!doctype html><meta charset=utf-8><title>fits-server</title>\
+    <p>fits-server is running. You can close this tab.";
 
 /// A client gives the token in the request, or else as REGISTER_VIEWER's api_key once it's connected, since a browser
 /// can't set headers and a URL can end up in its console. A wrong token in the request is refused at once.
@@ -104,6 +119,8 @@ async fn upgrade(
             .max_message_size(MAX_REQUEST)
             .max_frame_size(MAX_REQUEST)
             .on_upgrade(move |socket| run(server, socket, authorised)),
+        // A browser's plain GET, rather than an upgrade gone wrong, whose rejection says why.
+        Err(_) if !headers.contains_key("upgrade") => Html(RUNNING).into_response(),
         Err(rejection) => rejection.into_response(),
     }
 }
@@ -1182,5 +1199,55 @@ mod tests {
             assert!(matches!(stream.next().await, Some(Ok(Message::Binary(_)))));
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn one_port_answers_plain_and_tls_with_the_certificate_it_made() {
+        use rustls::pki_types::pem::PemObject;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("fits-server-unit-tls-{}", std::process::id()));
+        let (config, cert) = tls::own_config(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let root = dir.clone();
+        tokio::spawn(async move { serve(listener, &root, "token".into(), Some(config)).await });
+
+        async fn get(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) -> String {
+            let request = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+            stream.write_all(request).await.unwrap();
+            let mut page = String::new();
+            stream.read_to_string(&mut page).await.unwrap();
+            page
+        }
+        let plain = tokio::net::TcpStream::connect(address).await.unwrap();
+        assert!(get(plain).await.contains("fits-server is running"));
+
+        // A client that trusts only that certificate takes it for 127.0.0.1.
+        let mut roots = rustls::RootCertStore::empty();
+        for der in rustls::pki_types::CertificateDer::pem_file_iter(&cert).unwrap() {
+            roots.add(der.unwrap()).unwrap();
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+        let secure = connector.connect(name, tcp).await.unwrap();
+        assert!(get(secure).await.contains("fits-server is running"));
+
+        // A pair that no longer loads, such as a key that was cut short, is made again rather than kept.
+        let made = std::fs::read(&cert).unwrap();
+        std::fs::write(
+            dir.join("localhost-key.pem"),
+            "-----BEGIN PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let (_, again) = tls::own_config(&dir).unwrap();
+        assert_ne!(std::fs::read(again).unwrap(), made);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
