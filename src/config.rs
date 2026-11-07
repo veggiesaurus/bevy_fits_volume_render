@@ -14,6 +14,8 @@ pub struct Config {
     pub default_color_map: ColorMap,
     pub default_scaling_type: Scaling,
     pub jitter: f32,
+    /// Every voxel along each ray rather than fixed steps.
+    pub high_precision: bool,
     pub threshold_min: f32,
     pub threshold_max: f32,
     pub z_scale: ZScale,
@@ -35,6 +37,7 @@ impl Default for Config {
             default_color_map: ColorMap::try_from("Inferno".to_string()).unwrap(),
             default_scaling_type: Scaling::try_from("Linear".to_string()).unwrap(),
             jitter: 1.0,
+            high_precision: false,
             threshold_min: 0.0,
             threshold_max: 1.0,
             z_scale: ZScale::Cube,

@@ -246,8 +246,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let t = intersect_box(in.ray_origin, direction, params.slice_min, params.slice_max);
     // Early exit of pixels missing the bounding box or occluded by opaque objects. Within a step counts as
     // occluded, since the last sample would land a step in front of the box and wrap round to the far side,
-    // tinting the front edges of the outline.
-    if t.x > t.y || t.y < 0.0 || opaque_depth < t.x + step_length {
+    // tinting the front edges of the outline. High precision has no steps, so within a voxel along the ray does.
+    var margin = step_length;
+    @if(VOXELS) {
+        let rate = abs(direction / (params.texture_max - params.texture_min) * texels());
+        margin = 1.0 / max(rate.x, max(rate.y, rate.z));
+    }
+    if t.x > t.y || t.y < 0.0 || opaque_depth < t.x + margin {
         return vec4(0.0);
     }
     let t_near = max(0.0, t.x);
@@ -261,8 +266,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let step_vector = normalize(ray_delta);
     let required_steps = i32(clamp(total_length / step_length, 0.0, max_steps));
 
-    // Unity's _Time.xy is (t / 20, t)
-    let rand_vector = nrand(in.position.xy + vec2(globals.time / 20.0, globals.time)) * step_vector * step_length * params.jitter;
+    // Unity's _Time.xy is (t / 20, t). High precision has no jitter.
+    var jitter = params.jitter;
+    @if(VOXELS) {
+        jitter = 0.0;
+    }
+    let rand_vector = nrand(in.position.xy + vec2(globals.time / 20.0, globals.time)) * step_vector * step_length * jitter;
 
     let region_scale = 1.0 / (params.texture_max - params.texture_min);
     let region_offset = -(params.texture_min + 0.5);
@@ -270,6 +279,15 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let s = step_vector * step_length * region_scale;
     let h_min = (params.highlight_min + region_offset + 0.5) * region_scale;
     let h_max = (params.highlight_max + region_offset + 0.5) * region_scale;
+    @if(ASINH) {
+        set_noise_floor(ray_delta * region_scale);
+    }
+    // High precision's walk, from where the ray enters the box, in texels with z in layers.
+    let walked = walk((p_near + region_offset) * region_scale * texels(), direction * region_scale * texels(), total_length);
+    @if(VOXELS && !CUSTOM) {
+        let layers = vec3(1.0, 1.0, params.layers);
+        return every_voxel(walked, h_min * layers, h_max * layers);
+    }
 
     // The guard keeps a constant cube from dividing zero by zero.
     let scale_range = select(params.scale_max - params.scale_min, 1.0, params.scale_max == params.scale_min);
@@ -294,14 +312,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let da = s * zs;
     let l_min = h_min * zs;
     let l_max = h_max * zs;
-    @if(ASINH) {
-        set_noise_floor(ray_delta * region_scale);
-    }
     @if(CUSTOM) {
         let tail = position + f32(required_steps) * s + step_vector * (total_length - f32(required_steps + 1) * step_length - length(rand_vector)) * region_scale;
         let tail_steps = max(total_length - f32(required_steps) * step_length, 0.0) / step_length;
         let jittered = t_near + length(rand_vector);
-        return march(display_ray(start, da, required_steps, tail * zs, tail_steps, jittered, step_length, direction, in.ray_origin, region_scale * zs, in.instance_index, l_min, l_max));
+        return march(display_ray(start, da, required_steps, tail * zs, tail_steps, jittered, step_length, direction, in.ray_origin, region_scale * zs, in.instance_index, l_min, l_max, walked));
     }
     if average_mode {
         let rest = max(required_steps - 1, 0);
@@ -383,6 +398,343 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     return shade((top.x - params.scale_min) / scale_range, top.y == top.x);
 }
 
+// High precision: the ray o + t d in texels, z in layers, t from 0 to its object-space length `end`, through every voxel
+// it passes once each by Amanatides and Woo's traversal, mostly eight voxels at a time so that their fetches overlap.
+// After each batch the walk steps over the rest of the grid cell it's in, and any cells after it, if they can't change
+// the result. Visiting some of such a cell's voxels doesn't change the result either, so the check needn't fall on a
+// cell boundary, and neighbouring rays don't wait on each other at each cell they cross.
+struct Walk {
+    o: vec3<f32>,
+    d: vec3<f32>,
+    end: f32,
+    // Per axis, the way the ray goes, -1, 0 or 1, and how far it goes to cross a texel.
+    step: vec3<f32>,
+    delta: vec3<f32>,
+    // The voxels the clip box takes in, lo to hi, and how many texels the grid starts before the texture.
+    lo: vec3<f32>,
+    hi: vec3<f32>,
+    grid: vec3<f32>,
+    // Per axis, the voxel just past the clip box the way the ray goes, which the walk reaches only on leaving it.
+    exit: vec3<i32>,
+};
+
+fn walk(o: vec3<f32>, d: vec3<f32>, end: f32) -> Walk {
+    let size = texels();
+    let scale = size / (params.texture_max - params.texture_min);
+    // A crop's faces are on voxel boundaries, give or take rounding.
+    let lo = max(floor((params.slice_min - params.texture_min) * scale + 1e-3), vec3(0.0));
+    let hi = min(ceil((params.slice_max - params.texture_min) * scale - 1e-3), size);
+    let grid = round(params.grid_offset * vec3(size.xy, 1.0));
+    let exit = vec3<i32>(select(lo - 1.0, hi, d > vec3(0.0)));
+    return Walk(o, d, end, sign(d), select(vec3(F32_MAX), abs(1.0 / d), d != vec3(0.0)), lo, hi, grid, exit);
+}
+
+// Where the ray reaches the far side of the box from `at` to `at + size` along each axis, F32_MAX along one it doesn't
+// move on.
+fn boundaries(w: Walk, at: vec3<f32>, size: f32) -> vec3<f32> {
+    return select(vec3(F32_MAX), (at + select(vec3(0.0), vec3(size), w.d > vec3(0.0)) - w.o) / w.d, w.d != vec3(0.0));
+}
+
+// The cell of the first voxel, found from the voxel rather than the ray's start, which can round onto the far side of a
+// crop face that's also a cell's.
+fn first_cell(w: Walk) -> vec3<f32> {
+    let at = clamp(floor(w.o), w.lo, w.hi - 1.0);
+    return clamp(cell_of(w, at), vec3(0.0), vec3<f32>(params.grid_cells - 1u));
+}
+
+// The cell a voxel is in.
+fn cell_of(w: Walk, at: vec3<f32>) -> vec3<f32> {
+    return floor((at + w.grid) / params.cell_size.z);
+}
+
+// A cell's box in texels, inside the clip box.
+fn cell_lo(w: Walk, cell: vec3<f32>) -> vec3<f32> {
+    return max(cell * params.cell_size.z - w.grid, w.lo);
+}
+
+fn cell_hi(w: Walk, cell: vec3<f32>) -> vec3<f32> {
+    return min((cell + 1.0) * params.cell_size.z - w.grid, w.hi);
+}
+
+// Where the ray leaves a cell it steps over, and the cell after it.
+fn past_cell(w: Walk, cell: vec3<f32>) -> vec4<f32> {
+    let e = boundaries(w, cell * params.cell_size.z - w.grid, params.cell_size.z);
+    let t = min(min(min(e.x, e.y), e.z), w.end);
+    return vec4(cell + select(vec3(0.0), w.step, e == vec3(t)), t);
+}
+
+// The walk so far: the voxel it's at, where the ray enters it and where it crosses the next boundary along each axis,
+// the cell it's in with that cell's max and NaN flag, and the length of the cells stepped over since it was last
+// cleared.
+struct Walking {
+    at: vec3<i32>,
+    t: f32,
+    next: vec3<f32>,
+    cell: vec3<i32>,
+    max: f32,
+    nan: bool,
+    skipped: f32,
+};
+
+fn walking(w: Walk) -> Walking {
+    return Walking(vec3(0), 0.0, vec3(F32_MAX), vec3<i32>(first_cell(w)), -F32_MAX, false, 0.0);
+}
+
+// Whether a cell with this max and NaN flag can change the result: its max is above `below`, or equal to it with
+// `ties`, or it has a NaN that doesn't count as nothing.
+fn worth(m: f32, nan: bool, below: f32, ties: bool, nan_skips: bool) -> bool {
+    return m > below || (ties && m == below) || (nan && !nan_skips);
+}
+
+// From cell `first`, which the ray enters at `entered`, into the first cell worth visiting, adding the length of the
+// cells stepped over to `skipped`. False at the end of the ray.
+fn enter_from(
+    it: ptr<function, Walking>, w: Walk, first: vec3<f32>, entered: f32, below: f32, ties: bool, nan_skips: bool,
+) -> bool {
+    var cell = first;
+    var t = entered;
+    for (var i = 0; i < i32(dot(vec3<f32>(params.grid_cells), vec3(1.0))) + 2 && t < w.end; i++) {
+        let lo = cell_lo(w, cell);
+        let hi = cell_hi(w, cell);
+        if any(lo >= hi) {
+            return false;
+        }
+        let entry = grid_entry(vec3<u32>(cell));
+        let m = bitcast<f32>(entry.y);
+        if worth(m, entry.x != 0u, below, ties, nan_skips) {
+            let at = clamp(floor(w.o + w.d * t), lo, hi - 1.0);
+            *it = Walking(vec3<i32>(at), t, boundaries(w, at, 1.0), vec3<i32>(cell), m, entry.x != 0u, (*it).skipped);
+            return true;
+        }
+        let past = past_cell(w, cell);
+        (*it).skipped += past.w - t;
+        cell = past.xyz;
+        t = past.w;
+    }
+    return false;
+}
+
+// Into the first cell worth visiting.
+fn enter_first(it: ptr<function, Walking>, w: Walk, below: f32, ties: bool, nan_skips: bool) -> bool {
+    return enter_from(it, w, vec3<f32>((*it).cell), 0.0, below, ties, nan_skips);
+}
+
+// Whether the walk's voxel is in the clip box, before the end of the ray.
+fn in_run(it: Walking, w: Walk) -> bool {
+    return all(it.at != w.exit) && it.t < w.end;
+}
+
+// The cell of the walk's voxel. In a new cell, the boundary crossings start afresh from the voxel, as they do on
+// entering a cell after a skip, so that rounding doesn't build up along the ray.
+fn recross(it: ptr<function, Walking>, w: Walk) -> vec3<i32> {
+    let cell = vec3<i32>(cell_of(w, vec3<f32>((*it).at)));
+    if any(cell != (*it).cell) {
+        (*it).next = boundaries(w, vec3<f32>((*it).at), 1.0);
+    }
+    return cell;
+}
+
+// After a batch: on to the next voxel, stepping over the rest of the walk's cell and the cells after it if they aren't
+// worth visiting. Every ray looks its cell up after every batch, so that rays don't diverge, and acts on it after the
+// next, by when the fetch has arrived. So a cell not worth visiting is still walked for up to two batches after the
+// walk reaches it. False at the end of the ray.
+fn keep_on(it: ptr<function, Walking>, w: Walk, below: f32, ties: bool, nan_skips: bool) -> bool {
+    if !in_run(*it, w) {
+        return false;
+    }
+    let cell = recross(it, w);
+    let leave = all(cell == (*it).cell) && !worth((*it).max, (*it).nan, below, ties, nan_skips);
+    let entry = grid_entry(vec3<u32>(cell));
+    (*it).cell = cell;
+    (*it).max = bitcast<f32>(entry.y);
+    (*it).nan = entry.x != 0u;
+    if !leave {
+        return true;
+    }
+    let past = past_cell(w, vec3<f32>(cell));
+    (*it).skipped += past.w - (*it).t;
+    return enter_from(it, w, past.xyz, past.w, below, ties, nan_skips);
+}
+
+// A voxel of the walk: its texel, where the ray enters and leaves it, and whether it counts, which it doesn't once the
+// ray has left the clip box or ended. One that doesn't is still fetched.
+struct Voxel {
+    at: vec3<i32>,
+    t: f32,
+    out: f32,
+    on: bool,
+};
+
+// The walk's voxel, with the walk moved on to the next one if it counts.
+fn take(it: ptr<function, Walking>, w: Walk) -> Voxel {
+    let on = in_run(*it, w);
+    let out = min(min((*it).next.x, (*it).next.y), min((*it).next.z, w.end));
+    var at = (*it).at;
+    // One that doesn't count can lie past the texture. A browser checks every load's bounds, but native shaders aren't
+    // checked, so there it's fetched from inside the clip box.
+    @if(GUARD_LOADS) {
+        at = select(vec3<i32>(w.lo), at, on);
+    }
+    let v = Voxel(at, (*it).t, out, on);
+    // A voxel that doesn't count leaves the walk where it is.
+    let crossed = (*it).next == vec3(select(-F32_MAX, out, on));
+    (*it).at += select(vec3(0), vec3<i32>(w.step), crossed);
+    (*it).next += select(vec3(0.0), w.delta, crossed);
+    (*it).t = select((*it).t, out, on);
+    return v;
+}
+
+fn length_in(v: Voxel) -> f32 {
+    return max(v.out - v.t, 0.0);
+}
+
+// The voxel's middle in texture coordinates, z in layers.
+fn middle(v: Voxel) -> vec3<f32> {
+    return (vec3<f32>(v.at) + 0.5) * texel_size();
+}
+
+// The most voxels a ray can pass through.
+fn most_voxels() -> i32 {
+    return i32(dot(texels(), vec3(1.0))) + 3;
+}
+
+fn is_nan4(value: vec4<f32>) -> vec4<bool> {
+    return (bitcast<vec4<u32>>(value) & vec4(0x7fffffffu)) > vec4(0x7f800000u);
+}
+
+// Four voxels of the walk in turn, and their values once fetched.
+struct Four {
+    a: Voxel,
+    b: Voxel,
+    c: Voxel,
+    d: Voxel,
+    x: vec4<f32>,
+};
+
+fn four(it: ptr<function, Walking>, w: Walk) -> Four {
+    let a = take(it, w);
+    let b = take(it, w);
+    let c = take(it, w);
+    let d = take(it, w);
+    return Four(a, b, c, d, vec4(0.0));
+}
+
+fn fetched(f: Four) -> Four {
+    return Four(f.a, f.b, f.c, f.d, vec4(load(f.a.at), load(f.b.at), load(f.c.at), load(f.d.at)));
+}
+
+// Eight voxels of the walk, as two Fours, fetched once all eight are found so that the fetches overlap.
+struct Eight {
+    f: Four,
+    g: Four,
+};
+
+fn eight(it: ptr<function, Walking>, w: Walk) -> Eight {
+    let f = four(it, w);
+    let g = four(it, w);
+    return Eight(fetched(f), fetched(g));
+}
+
+fn on4(f: Four) -> vec4<bool> {
+    return vec4(f.a.on, f.b.on, f.c.on, f.d.on);
+}
+
+fn lengths4(f: Four) -> vec4<f32> {
+    return vec4(length_in(f.a), length_in(f.b), length_in(f.c), length_in(f.d));
+}
+
+fn in_box4(f: Four, l_min: vec3<f32>, l_max: vec3<f32>) -> vec4<bool> {
+    return vec4(in_box(middle(f.a), l_min, l_max), in_box(middle(f.b), l_min, l_max), in_box(middle(f.c), l_min, l_max),
+        in_box(middle(f.d), l_min, l_max));
+}
+
+// The values of the voxels that count, the others and NaN as -F32_MAX.
+fn counted4(f: Four) -> vec4<f32> {
+    return select(vec4(-F32_MAX), f.x, on4(f) & !is_nan4(f.x));
+}
+
+// The sum and length of the voxels that count, each value weighted by the ray's length in it, and how many are in the
+// selection when it's shown.
+fn weighted4(f: Four, track: bool, l_min: vec3<f32>, l_max: vec3<f32>) -> vec3<f32> {
+    let counts = on4(f) & !is_nan4(f.x);
+    let l = select(vec4(0.0), lengths4(f), counts);
+    var selected = 0.0;
+    if track {
+        selected = dot(select(vec4(0.0), vec4(1.0), counts & in_box4(f, l_min, l_max)), vec4(1.0));
+    }
+    return vec3(dot(select(vec4(0.0), f.x, counts), l), dot(l, vec4(1.0)), selected);
+}
+
+fn max_voxel(top: vec2<f32>, value: f32, v: Voxel, l_min: vec3<f32>, l_max: vec3<f32>) -> vec2<f32> {
+    return select(top, max_sample(top, value, middle(v), l_min, l_max), v.on);
+}
+
+fn max4(top: vec2<f32>, f: Four, l_min: vec3<f32>, l_max: vec3<f32>) -> vec2<f32> {
+    let ab = max_voxel(max_voxel(top, f.x.x, f.a, l_min, l_max), f.x.y, f.b, l_min, l_max);
+    return max_voxel(max_voxel(ab, f.x.z, f.c, l_min, l_max), f.x.w, f.d, l_min, l_max);
+}
+
+// Maximum over the voxels, stepping over cells that can't raise it, as the fixed step does, which includes the rest of
+// a cell once its max is reached.
+@if(VOXELS && !CUSTOM && !VOXELS_AVERAGE)
+fn every_voxel(w: Walk, l_min: vec3<f32>, l_max: vec3<f32>) -> vec4<f32> {
+    let scale_range = select(params.scale_max - params.scale_min, 1.0, params.scale_max == params.scale_min);
+    let track = params.highlight_saturate_factor != 1.0;
+    let floor_value = params.threshold_min * scale_range + params.scale_min;
+    let stop = params.threshold_max * scale_range + params.scale_min;
+    // The max, and the max in the selection, which is compared with it, so a tie counts when a selection is shown.
+    var top = vec2(-F32_MAX);
+    var it = walking(w);
+    // Under the floor a cell whose max is the floor counts, as it does for the fixed step.
+    var more = enter_first(&it, w, floor_value, true, true);
+    if track {
+        for (var i = 0; more && i < most_voxels(); i += 4) {
+            top = max4(top, fetched(four(&it, w)), l_min, l_max);
+            more = keep_on(&it, w, max(floor_value, top.x), true, true);
+        }
+    } else {
+        for (var i = 0; more && i < most_voxels(); i += 8) {
+            let e = eight(&it, w);
+            let m = max(counted4(e.f), counted4(e.g));
+            top.x = max(top.x, max(max(m.x, m.y), max(m.z, m.w)));
+            if top.x >= stop {
+                return shade((top.x - params.scale_min) / scale_range, false);
+            }
+            more = keep_on(&it, w, max(floor_value, top.x), top.x < floor_value, true);
+        }
+    }
+    if top.x == -F32_MAX {
+        return vec4(0.0);
+    }
+    return shade((top.x - params.scale_min) / scale_range, top.y == top.x);
+}
+
+// Average over the voxels, weighting each by the ray's length in it, stepping over cells with nothing but NaN.
+@if(VOXELS && !CUSTOM && VOXELS_AVERAGE)
+fn every_voxel(w: Walk, l_min: vec3<f32>, l_max: vec3<f32>) -> vec4<f32> {
+    let scale_range = select(params.scale_max - params.scale_min, 1.0, params.scale_max == params.scale_min);
+    let track = params.highlight_saturate_factor != 1.0;
+    // The sum, the length, and whether any of it is in the selection.
+    var acc = vec3(0.0);
+    var it = walking(w);
+    var more = enter_first(&it, w, -F32_MAX, true, true);
+    for (var i = 0; more && i < most_voxels(); i += 8) {
+        let e = eight(&it, w);
+        acc += weighted4(e.f, track, l_min, l_max) + weighted4(e.g, track, l_min, l_max);
+        // Without a NaN there's no cell to step over, but the crossings still start afresh in each new cell.
+        if params.has_nan != 0u {
+            more = keep_on(&it, w, -F32_MAX, true, true);
+        } else {
+            more = in_run(it, w);
+            it.cell = recross(&it, w);
+        }
+    }
+    if acc.y == 0.0 {
+        return vec4(0.0);
+    }
+    return shade((acc.x / acc.y - params.scale_min) / scale_range, acc.z > 0.0);
+}
+
 // Thresholds, scaling and the colour map, for a ray's value normalised to the scale range.
 fn shade(normalised: f32, in_highlight: bool) -> vec4<f32> {
     // Unity's v axis points up the atlas, wgpu's points down, so no "1.0 -" here.
@@ -456,8 +808,8 @@ var<private> noise_floor: f32;
 
 @if(ASINH)
 fn set_noise_floor(delta: vec3<f32>) {
-    let texels = length(delta * vec3(vec2<f32>(textureDimensions(data_cube)), params.layers));
-    noise_floor = modes.noise_median + select(0.0, sqrt(2.0 * log(max(texels, 2.0))) * modes.noise_sigma, modes.ray_max != 0u);
+    let n = length(delta * texels());
+    noise_floor = modes.noise_median + select(0.0, sqrt(2.0 * log(max(n, 2.0))) * modes.noise_sigma, modes.ray_max != 0u);
 }
 
 // Outside the mask a value is pulled towards mask_zero.
@@ -494,14 +846,17 @@ struct Ray {
     // The clip box.
     clip_min: vec3<f32>,
     clip_max: vec3<f32>,
+    // High precision's walk, in display-space lengths from where the ray enters the box, which is t0 as high precision
+    // has no jitter.
+    walk: Walk,
 };
 
 // A Ray from the fragment's object-space distances and directions, converted to display space: object space scaled
 // to params.box_size, so that depth, opacity per unit length and lighting follow the z scale.
-fn display_ray(start: vec3<f32>, da: vec3<f32>, steps: i32, tail: vec3<f32>, tail_steps: f32, t0: f32, step_length: f32, direction: vec3<f32>, origin: vec3<f32>, scale: vec3<f32>, instance: u32, selection_min: vec3<f32>, selection_max: vec3<f32>) -> Ray {
+fn display_ray(start: vec3<f32>, da: vec3<f32>, steps: i32, tail: vec3<f32>, tail_steps: f32, t0: f32, step_length: f32, direction: vec3<f32>, origin: vec3<f32>, scale: vec3<f32>, instance: u32, selection_min: vec3<f32>, selection_max: vec3<f32>, w: Walk) -> Ray {
     let size = params.box_size;
     let stretch = length(direction * size);
-    return Ray(start, da, 1.0 / da, steps, tail, tail_steps, t0 * stretch, step_length * stretch, normalize(direction * size), origin * size, scale / size, key_light(instance), selection_min, selection_max, params.slice_min * size, params.slice_max * size);
+    return Ray(start, da, 1.0 / da, steps, tail, tail_steps, t0 * stretch, step_length * stretch, normalize(direction * size), origin * size, scale / size, key_light(instance), selection_min, selection_max, params.slice_min * size, params.slice_max * size, walk(w.o, w.d / stretch, w.end * stretch));
 }
 
 fn in_selection(r: Ray, a: vec3<f32>) -> bool {
@@ -510,7 +865,12 @@ fn in_selection(r: Ray, a: vec3<f32>) -> bool {
 
 fn crosses_selection(r: Ray) -> bool {
     let t = intersect_box(r.start, r.da, r.selection_min, r.selection_max);
-    return t.x <= t.y && t.y >= 0.0 && t.x <= f32(r.steps);
+    // High precision takes the whole ray, so the part step at its end counts too.
+    var end = f32(r.steps);
+    @if(VOXELS) {
+        end += r.tail_steps;
+    }
+    return t.x <= t.y && t.y >= 0.0 && t.x <= end;
 }
 
 // As shade desaturates what's outside a selection shown.
@@ -538,6 +898,11 @@ fn texture_box() -> vec3<f32> {
 
 fn texel_size() -> vec3<f32> {
     return vec3(1.0 / vec2<f32>(textureDimensions(data_cube)), 1.0);
+}
+
+// The texture's size in texels, z in layers.
+fn texels() -> vec3<f32> {
+    return vec3(vec2<f32>(textureDimensions(data_cube)), params.layers);
 }
 
 fn normalised(value: f32) -> f32 {
@@ -607,29 +972,68 @@ fn argmax(r: Ray, floor: f32, stop: f32) -> vec2<f32> {
     return better(best, fetch(r.tail), r.steps);
 }
 
+// The ray's largest value, how far it is from the camera, and where it is.
+struct Peak {
+    value: f32,
+    t: f32,
+    at: vec3<f32>,
+};
+
+@if(!VOXELS)
+fn peak(r: Ray, floor: f32, stop: f32) -> Peak {
+    let best = argmax(r, floor, stop);
+    return Peak(best.x, r.t0 + best.y * r.step_length, select(sample_at(r, i32(best.y)), r.tail, best.y >= f32(r.steps)));
+}
+
+@if(VOXELS)
+fn peak(r: Ray, floor: f32, stop: f32) -> Peak {
+    var best = Peak(-F32_MAX, 0.0, vec3(0.0));
+    var it = walking(r.walk);
+    var more = enter_first(&it, r.walk, floor, true, true);
+    for (var i = 0; more && best.value < stop && i < most_voxels(); i += 8) {
+        let e = eight(&it, r.walk);
+        best = better4(better4(best, e.f, r, stop), e.g, r, stop);
+        // Under the floor a cell whose max is the floor still counts; past it a tie can't beat the best.
+        more = keep_on(&it, r.walk, max(floor, best.value), best.value < floor, true);
+    }
+    return best;
+}
+
+// The best so far, or the voxel if it's higher and the best hasn't reached `stop`.
+fn better_voxel(best: Peak, value: f32, v: Voxel, r: Ray, stop: f32) -> Peak {
+    if v.on && best.value < stop && value > best.value {
+        return Peak(value, r.t0 + 0.5 * (v.t + v.out), middle(v));
+    }
+    return best;
+}
+
+@if(VOXELS)
+fn better4(best: Peak, f: Four, r: Ray, stop: f32) -> Peak {
+    let ab = better_voxel(better_voxel(best, f.x.x, f.a, r, stop), f.x.y, f.b, r, stop);
+    return better_voxel(better_voxel(ab, f.x.z, f.c, r, stop), f.x.w, f.d, r, stop);
+}
+
 @if(MODE_DEPTH_CUED)
 fn march(r: Ray) -> vec4<f32> {
-    let best = argmax(r, raw(params.threshold_min), raw(params.threshold_max));
-    if best.x == -F32_MAX {
+    let best = peak(r, raw(params.threshold_min), raw(params.threshold_max));
+    if best.value == -F32_MAX {
         return vec4(0.0);
     }
-    let at = select(sample_at(r, i32(best.y)), r.tail, best.y >= f32(r.steps));
-    let color = shade(normalised(best.x), in_selection(r, at));
+    let color = shade(normalised(best.value), in_selection(r, best.at));
     // Darker by up to depth_cue from the box's nearest point (about) to its far side.
     let diag = length(r.clip_max - r.clip_min);
     let near = length(r.origin - 0.5 * (r.clip_min + r.clip_max)) - 0.5 * diag;
-    let t = r.t0 + best.y * r.step_length;
-    return vec4(color.rgb * (1.0 - modes.depth_cue * clamp((t - near) / diag, 0.0, 1.0)), color.a);
+    return vec4(color.rgb * (1.0 - modes.depth_cue * clamp((best.t - near) / diag, 0.0, 1.0)), color.a);
 }
 
 @if(MODE_PEAK_CHANNEL)
 fn march(r: Ray) -> vec4<f32> {
-    let best = argmax(r, modes.level, F32_MAX);
-    if best.x < modes.level {
+    let best = peak(r, modes.level, F32_MAX);
+    if best.value < modes.level {
         return vec4(0.0);
     }
-    let at = select(sample_at(r, i32(best.y)), r.tail, best.y >= f32(r.steps));
-    return saturated(vec4(channel_color(floor(at.z) + 0.5), scaled(normalised(best.x))), in_selection(r, at));
+    let color = vec4(channel_color(floor(best.at.z) + 0.5), scaled(normalised(best.value)));
+    return saturated(color, in_selection(r, best.at));
 }
 
 // napari's attenuated MIP: each sample, 0 at `lo` and 1 at threshold Max, dimmed by the optical depth in front of
@@ -639,12 +1043,9 @@ fn attenuate(s: vec2<f32>, value: f32, lo: f32, inv: f32, depth: f32) -> vec2<f3
     return vec2(max(s.x, u * exp(-s.y)), s.y + u * depth);
 }
 
-@if(MODE_ATTENUATED)
-fn march(r: Ray) -> vec4<f32> {
-    // The noise under the level would dim everything behind it.
-    let lo = max(raw(params.threshold_min), modes.level);
-    let hi = raw(params.threshold_max);
-    let inv = 1.0 / max(hi - lo, 1e-30);
+// The peak and optical depth along the ray, from `lo` up.
+@if(MODE_ATTENUATED && !VOXELS)
+fn attenuated(r: Ray, lo: f32, inv: f32) -> vec2<f32> {
     let depth = modes.attenuation * r.step_length;
     var s = vec2(0.0);
     var k = 0;
@@ -670,7 +1071,43 @@ fn march(r: Ray) -> vec4<f32> {
         }
         k = span.end;
     }
-    s = attenuate(s, fetch(r.tail), lo, inv, depth * r.tail_steps);
+    return attenuate(s, fetch(r.tail), lo, inv, depth * r.tail_steps);
+}
+
+@if(MODE_ATTENUATED && VOXELS)
+fn attenuated(r: Ray, lo: f32, inv: f32) -> vec2<f32> {
+    var s = vec2(0.0);
+    var it = walking(r.walk);
+    var more = enter_first(&it, r.walk, lo, false, true);
+    for (var i = 0; more && exp(-s.y) > s.x && i < most_voxels(); i += 8) {
+        let e = eight(&it, r.walk);
+        s = attenuate4(attenuate4(s, e.f, lo, inv), e.g, lo, inv);
+        more = keep_on(&it, r.walk, lo, false, true);
+    }
+    return s;
+}
+
+// As attenuate, for a voxel that counts, until nothing behind can beat the peak.
+@if(MODE_ATTENUATED && VOXELS)
+fn attenuate_voxel(s: vec2<f32>, value: f32, v: Voxel, lo: f32, inv: f32) -> vec2<f32> {
+    if v.on && exp(-s.y) > s.x {
+        return attenuate(s, value, lo, inv, modes.attenuation * length_in(v));
+    }
+    return s;
+}
+
+@if(MODE_ATTENUATED && VOXELS)
+fn attenuate4(s: vec2<f32>, f: Four, lo: f32, inv: f32) -> vec2<f32> {
+    let ab = attenuate_voxel(attenuate_voxel(s, f.x.x, f.a, lo, inv), f.x.y, f.b, lo, inv);
+    return attenuate_voxel(attenuate_voxel(ab, f.x.z, f.c, lo, inv), f.x.w, f.d, lo, inv);
+}
+
+@if(MODE_ATTENUATED)
+fn march(r: Ray) -> vec4<f32> {
+    // The noise under the level would dim everything behind it.
+    let lo = max(raw(params.threshold_min), modes.level);
+    let hi = raw(params.threshold_max);
+    let s = attenuated(r, lo, 1.0 / max(hi - lo, 1e-30));
     if s.x <= 0.0 {
         return vec4(0.0);
     }
@@ -686,6 +1123,7 @@ fn clipped(value: f32, z: f32) -> vec4<f32> {
 }
 
 // The clipped moments over the ray. A cell under the level counts without being sampled, unless it has a NaN.
+@if(!VOXELS)
 fn moments(r: Ray) -> vec4<f32> {
     var acc = vec4(0.0);
     var k = 0;
@@ -715,6 +1153,34 @@ fn moments(r: Ray) -> vec4<f32> {
         k = span.end;
     }
     return acc + clipped(fetch(r.tail), r.tail.z) * r.tail_steps;
+}
+
+@if(VOXELS)
+fn moments(r: Ray) -> vec4<f32> {
+    var acc = vec4(0.0);
+    var it = walking(r.walk);
+    var more = enter_first(&it, r.walk, modes.level, false, false);
+    for (var i = 0; i < most_voxels(); i += 8) {
+        // Cells stepped over count as the noise median.
+        acc += vec4(modes.noise_median, 1.0, 0.0, 0.0) * it.skipped;
+        it.skipped = 0.0;
+        if !more {
+            break;
+        }
+        let e = eight(&it, r.walk);
+        acc = clipped4(clipped4(acc, e.f), e.g);
+        more = keep_on(&it, r.walk, modes.level, false, false);
+    }
+    return acc;
+}
+
+fn clipped_voxel(acc: vec4<f32>, value: f32, v: Voxel) -> vec4<f32> {
+    return select(acc, acc + clipped(value, f32(v.at.z)) * length_in(v), v.on);
+}
+
+fn clipped4(acc: vec4<f32>, f: Four) -> vec4<f32> {
+    let ab = clipped_voxel(clipped_voxel(acc, f.x.x, f.a), f.x.y, f.b);
+    return clipped_voxel(clipped_voxel(ab, f.x.z, f.c), f.x.w, f.d);
 }
 
 @if(MODE_CLIPPED_MOMENT)
@@ -781,8 +1247,8 @@ fn glowing(g: Glow) -> bool {
     return !(g.alpha > 0.99 && (modes.mida <= -1.0 || g.peak >= 1.0));
 }
 
-@if(MODE_EMISSION)
-fn march(r: Ray) -> vec4<f32> {
+@if(MODE_EMISSION && !VOXELS)
+fn emitted(r: Ray) -> Glow {
     var g = Glow(vec3(0.0), 0.0, 0.0);
     var k = 0;
     while k < r.steps && glowing(g) {
@@ -812,6 +1278,40 @@ fn march(r: Ray) -> vec4<f32> {
     if glowing(g) {
         g = glow(g, fetch(r.tail), r.tail, r.tail_steps, r);
     }
+    return g;
+}
+
+// Each voxel's opacity from the ray's length in it.
+@if(MODE_EMISSION && VOXELS)
+fn emitted(r: Ray) -> Glow {
+    var g = Glow(vec3(0.0), 0.0, 0.0);
+    var it = walking(r.walk);
+    var more = enter_first(&it, r.walk, modes.level, true, true);
+    for (var i = 0; more && glowing(g) && i < most_voxels(); i += 8) {
+        let e = eight(&it, r.walk);
+        g = glow4(glow4(g, e.f, r), e.g, r);
+        more = keep_on(&it, r.walk, modes.level, true, true);
+    }
+    return g;
+}
+
+@if(MODE_EMISSION && VOXELS)
+fn glow_voxel(g: Glow, value: f32, v: Voxel, r: Ray) -> Glow {
+    if v.on && glowing(g) {
+        return glow(g, value, middle(v), length_in(v) / r.step_length, r);
+    }
+    return g;
+}
+
+@if(MODE_EMISSION && VOXELS)
+fn glow4(g: Glow, f: Four, r: Ray) -> Glow {
+    let ab = glow_voxel(glow_voxel(g, f.x.x, f.a, r), f.x.y, f.b, r);
+    return glow_voxel(glow_voxel(ab, f.x.z, f.c, r), f.x.w, f.d, r);
+}
+
+@if(MODE_EMISSION)
+fn march(r: Ray) -> vec4<f32> {
+    let g = emitted(r);
     var color = select(vec4(0.0), vec4(g.color / g.alpha, g.alpha), g.alpha > 0.0);
     if modes.mida > 0.0 {
         // Towards the maximum, drawn as Maximum draws it.
@@ -848,15 +1348,19 @@ fn facing(n: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
     return select(u, -u, dot(u, direction) > 0.0);
 }
 
+// A texel, masked.
+fn load(i: vec3<i32>) -> f32 {
+    var value = textureLoad(data_cube, i.xy, i.z, 0).r;
+    @if(MASK) {
+        value = masked(value, textureLoad(mask, i.xy, i.z, 0).r > 0.0);
+    }
+    return value;
+}
+
 // A texel, masked, with NaN as the noise median so that it can't poison an interpolation.
 fn texel(i: vec3<i32>) -> f32 {
     let last = vec3(vec2<i32>(textureDimensions(data_cube)), i32(params.layers)) - 1;
-    let c = clamp(i, vec3(0), last);
-    var value = textureLoad(data_cube, c.xy, c.z, 0).r;
-    @if(MASK) {
-        value = masked(value, textureLoad(mask, c.xy, c.z, 0).r > 0.0);
-    }
-    return filled(value);
+    return filled(load(clamp(i, vec3(0), last)));
 }
 
 // By hand, since R32Float is unfilterable: 8 loads.

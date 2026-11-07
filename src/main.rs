@@ -157,7 +157,10 @@ impl Settings {
                 scale_type: config.default_scaling_type.0,
                 ..default()
             },
-            modes: default(),
+            modes: modes::ModeSettings {
+                high_precision: config.high_precision,
+                ..default()
+            },
             wcs_axes: true,
             z_scale,
         }

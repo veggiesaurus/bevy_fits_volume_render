@@ -336,8 +336,27 @@ fn rendering_section(
         !data.source.has_cube(),
         unit,
     );
-    ui.add(egui::Slider::new(&mut p.jitter, JITTER).text("Jitter"));
-    ui.add(egui::Slider::new(&mut p.max_steps, RAYMARCHING_STEPS).text("Ray-marching steps"));
+    let precise = s.modes.high_precision_used();
+    ui.horizontal(|ui| {
+        ui.add_enabled(
+            !precise,
+            egui::Slider::new(&mut p.jitter, JITTER).text("Jitter"),
+        )
+        .on_disabled_hover_text("High precision has no jitter");
+        ui.add_enabled(
+            s.modes.mode.takes_high_precision(),
+            egui::Checkbox::new(&mut s.modes.high_precision, "High precision"),
+        )
+        .on_hover_text("Visits every voxel along each ray for an exact image, and is slower")
+        .on_disabled_hover_text(
+            "No effect on the isosurface and shells, which find their surfaces between samples",
+        );
+    });
+    ui.add_enabled(
+        !precise,
+        egui::Slider::new(&mut p.max_steps, RAYMARCHING_STEPS).text("Ray-marching steps"),
+    )
+    .on_disabled_hover_text("The step count doesn't apply in high precision");
     z_scale_row(ui, data.info.dims, &mut s.z_scale);
     if data.wcs.is_some() {
         ui.checkbox(&mut s.wcs_axes, "WCS axes");

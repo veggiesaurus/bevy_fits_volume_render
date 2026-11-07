@@ -341,6 +341,11 @@ impl RenderMode {
         }
     }
 
+    /// Not the isosurface or shells, which find their surfaces between samples and so keep fixed steps.
+    pub fn takes_high_precision(self) -> bool {
+        !matches!(self, Self::Isosurface | Self::Shells)
+    }
+
     /// `at`, the level, where the mode uses one: not Maximum, Average or depth cued, nor the clipped moments when a
     /// mask leaves what counts to it.
     fn level<T>(self, masked: bool, at: T) -> Option<T> {
@@ -379,6 +384,8 @@ pub struct ModeSettings {
     pub apply_mask: bool,
     /// How much of a voxel outside the mask shows, 0 to 1.
     pub outside_mask: f32,
+    /// Every voxel along each ray rather than fixed steps.
+    pub high_precision: bool,
 }
 
 impl Default for ModeSettings {
@@ -396,7 +403,15 @@ impl Default for ModeSettings {
             processing: Processing::default(),
             apply_mask: false,
             outside_mask: 0.25,
+            high_precision: false,
         }
+    }
+}
+
+impl ModeSettings {
+    /// High precision, where the mode takes it.
+    pub fn high_precision_used(&self) -> bool {
+        self.high_precision && self.mode.takes_high_precision()
     }
 }
 
@@ -439,6 +454,7 @@ pub struct VolumeKey {
     mask: bool,
     snr_opacity: bool,
     lit: bool,
+    high_precision: bool,
 }
 
 impl From<&VolumeMaterial> for VolumeKey {
@@ -460,6 +476,17 @@ impl VolumeKey {
             (self.mask, "MASK"),
             (self.snr_opacity, "SNR_OPACITY"),
             (self.lit, "LIT"),
+            (self.high_precision, "VOXELS"),
+            // High precision compiles Average and Maximum as separate pipelines, as each is lighter alone.
+            (
+                self.high_precision && self.mode == RenderMode::Average,
+                "VOXELS_AVERAGE",
+            ),
+            // High precision fetches past the texture, which the browser makes safe but native shaders don't.
+            (
+                self.high_precision && !cfg!(target_arch = "wasm32"),
+                "GUARD_LOADS",
+            ),
         ] {
             if on {
                 fragment.shader_defs.push(def.into());
@@ -550,6 +577,7 @@ fn update_material(
         mask: mask.is_some(),
         snr_opacity: emission && m.snr_opacity,
         lit: emission && m.lit,
+        high_precision: m.high_precision_used(),
     };
 }
 
