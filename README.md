@@ -90,7 +90,8 @@ The shader takes the same samples as iDaVIE's, apart from the step changes below
 - after a crop the outline shrinks to the crop and the camera re-frames it, and again on reset. iDaVIE keeps the full cube's outline with the crop inside it and leaves the camera where it is
 - no foveated rendering for now, so every pixel gets the full step count, as in iDaVIE with `foveatedRendering` off. iDaVIE's default config turns it on, so turn it off in its `config.json` for side by side comparisons
 - only point filtering (iDaVIE's `bilinearFiltering` is off by default)
-- uncompressed FITS only (funpack a tile-compressed `.fits.fz` first), showing the first three axes longer than 1 (a 2D image is one plane) and the first plane of any others (Stokes I of an IQU cube)
+- tile-compressed `.fits.fz` is read as fpack writes it with RICE_1, GZIP_1, GZIP_2 or no compression, but not PLIO_1 or HCOMPRESS_1 (funpack those first)
+- the first three axes longer than 1 are shown (a 2D image is one plane), and the first plane of any others (Stokes I of an IQU cube)
 - integer BLANK values become NaN; iDaVIE turns off cfitsio's null check and shows them as `BZERO + BSCALE * BLANK`
 - the cube is downsampled to a fixed set of power-of-two levels, plus iDaVIE's factors for the whole cube when they aren't one of them, with blocks aligned to the whole cube. So a crop can get up to 2.6x fewer texels than in iDaVIE, whose factors step through 1, 2, 3, 4, 5
 - Maximum reads a max-downsampled copy and Average a mean-downsampled one, where iDaVIE's config picks one for both

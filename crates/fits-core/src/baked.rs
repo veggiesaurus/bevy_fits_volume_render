@@ -96,8 +96,8 @@ impl Index {
         let dims = info.dims;
         let voxels = dims.iter().try_fold(1u64, |n, &d| n.checked_mul(d as u64));
         let most = usize::from(u16::MAX) * CUBELET;
-        let Some(voxels) =
-            voxels.filter(|&n| n <= 1 << 40 && dims.iter().all(|&d| (1..=most).contains(&d)))
+        let Some(voxels) = voxels
+            .filter(|&n| n <= crate::MOST_VOXELS && dims.iter().all(|&d| (1..=most).contains(&d)))
         else {
             return Err(format!("a cube of {dims:?}"));
         };

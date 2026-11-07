@@ -11,6 +11,7 @@ pub mod carta;
 pub mod codec;
 mod cubelet;
 pub mod engine;
+mod fz;
 pub mod remote;
 pub mod wire;
 pub use cubelet::{
@@ -22,6 +23,8 @@ pub use noise::{
 };
 
 const BLOCK: usize = 2880;
+/// The most voxels a cube whose size its file doesn't back may claim: a baked cube, or a compressed one.
+const MOST_VOXELS: u64 = 1 << 40;
 /// Voxels read, decoded and summarised per task: 4 MB of output, small enough to stay in cache.
 const CHUNK_VOXELS: usize = 1 << 20;
 
@@ -186,14 +189,17 @@ pub fn parse_hdu(value: &str) -> Result<usize, String> {
 
 pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Cube, String> {
     let image = find_image(source, hdu)?;
-    let (data, stats, histogram) = read_data(
-        source,
-        image.offset,
-        &image.header.cards,
-        image.bitpix,
-        image.width,
-        image.len,
-    )?;
+    let (data, stats, histogram) = match &image.tiled {
+        None => read_data(
+            source,
+            image.offset,
+            &image.header.cards,
+            image.bitpix,
+            image.width,
+            image.len,
+        )?,
+        Some(tiled) => read_tiled(source, &image, tiled)?,
+    };
     let header = image.header;
     let mut cube = Cube {
         info: FileInfo {
@@ -235,57 +241,97 @@ struct Image {
     width: usize,
     len: usize,
     offset: u64,
+    /// NAXISn.
+    lengths: Vec<u64>,
+    /// The table of tiles, for a tile-compressed image.
+    tiled: Option<fz::Tiled>,
 }
 
 fn find_image<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Image, String> {
     let size = source.size().map_err(|e| e.to_string())?;
     let (mut index, mut offset) = (0, 0);
-    let (mut primary, mut compressed): (Vec<String>, _) = (Vec::new(), None);
-    let tile_compressed = |n| {
-        format!(
-            "HDU {n} is a tile-compressed image, which isn't supported; decompress it with funpack"
-        )
-    };
+    let mut primary: Vec<String> = Vec::new();
+    // Why the first compressed image that can't be read can't, for when there's no other.
+    let mut refused = None;
     loop {
-        let Some(mut cards) = read_header(source, &mut offset)? else {
-            return Err(match (hdu, compressed) {
+        let Some(cards) = read_header(source, &mut offset)? else {
+            return Err(match (hdu, refused) {
                 (Some(n), _) => format!("HDU {n} not found, the file has {index}"),
-                (None, Some(n)) => tile_compressed(n),
+                (None, Some(refused)) => refused,
                 (None, None) => "no image HDU with NAXIS >= 2 found".into(),
             });
         };
         let bitpix: i64 = num(&cards, "BITPIX")?.ok_or("missing BITPIX")?;
         let axes = axis_lengths(&cards)?;
-        let naxis = axes.len();
-        if ![8, 16, 32, 64, -32, -64].contains(&bitpix) {
+        let supported = |bitpix| [8, 16, 32, 64, -32, -64].contains(&bitpix);
+        if !supported(bitpix) {
             return Err(format!("HDU {index}: unsupported BITPIX {bitpix}"));
         }
         let width = bitpix.unsigned_abs() / 8;
         // A random-groups primary (UVFITS) has NAXIS1 = 0 and is no image.
         let groups = value(&cards, "GROUPS").as_deref() == Some("T");
-        let tiled = value(&cards, "ZIMAGE").as_deref() == Some("T");
-        compressed = compressed.or(tiled.then_some(index));
-        let is_cube = naxis >= 2
-            && axes.iter().all(|&n| n > 0)
-            && !groups
-            && (index == 0 || value(&cards, "XTENSION").as_deref() == Some("IMAGE"));
+        // A tile-compressed image is a binary table, whose Z keywords describe the image.
+        let tiled = (value(&cards, "ZIMAGE").as_deref() == Some("T")
+            && value(&cards, "XTENSION").as_deref() == Some("BINTABLE"))
+        .then(|| fz::image_cards(&cards));
+        // The image's BITPIX and NAXISn, and for a compressed one its table, or why it can't be read.
+        let image = match &tiled {
+            None => Ok((bitpix, axes.clone(), None)),
+            Some(image) => (|| {
+                let bitpix: i64 = num(image, "BITPIX")?.ok_or("no ZBITPIX")?;
+                if !supported(bitpix) {
+                    return Err(format!("unsupported ZBITPIX {bitpix}"));
+                }
+                let lengths = axis_lengths(image).map_err(|e| e.replace("NAXIS", "ZNAXIS"))?;
+                let table = fz::Tiled::new(&cards, &lengths, bitpix)?;
+                Ok((bitpix, lengths, Some(table)))
+            })(),
+        };
+        let is_image = |lengths: &[u64]| {
+            lengths.len() >= 2
+                && lengths.iter().all(|&n| n > 0)
+                && !groups
+                && (index == 0
+                    || tiled.is_some()
+                    || value(&cards, "XTENSION").as_deref() == Some("IMAGE"))
+        };
+        let is_cube = image
+            .as_ref()
+            .is_ok_and(|(_, lengths, _)| is_image(lengths));
+        if let (None, Some(_), Err(e)) = (hdu, &tiled, &image) {
+            refused.get_or_insert(format!("HDU {index}: {e}"));
+        }
 
         if hdu == Some(index) || (hdu.is_none() && is_cube) {
-            if !is_cube {
-                return Err(match tiled {
-                    true => tile_compressed(index),
-                    false => format!("HDU {index} is not an image with two or more non-empty axes"),
+            let (image_bitpix, lengths, table) = image.map_err(|e| format!("HDU {index}: {e}"))?;
+            if !is_image(&lengths) {
+                return Err(format!(
+                    "HDU {index} is not an image with two or more non-empty axes"
+                ));
+            }
+            let (dims, picked, len) =
+                shown_axes(&lengths).map_err(|e| format!("HDU {index}: {e}"))?;
+            // Checked before allocating, so a header can't claim more memory than its file backs. A compressed image
+            // is held to baked cubes' limit of 2^40 voxels too, every plane of it.
+            let fits = match &table {
+                Some(table) => checked_product(&lengths)
+                    .filter(|&voxels| voxels <= MOST_VOXELS)
+                    .and_then(|voxels| voxels.checked_mul(image_bitpix.unsigned_abs() / 8))
+                    .is_some_and(|bytes| table.holds(offset, size, bytes)),
+                None => (len as u64)
+                    .checked_mul(width)
+                    .and_then(|bytes| bytes.checked_add(offset))
+                    .is_some_and(|end| end <= size),
+            };
+            if !fits {
+                return Err(match table {
+                    Some(_) => {
+                        format!("HDU {index}: a compressed image larger than its data could hold")
+                    }
+                    None => format!("HDU {index}: data truncated"),
                 });
             }
-            let (dims, picked, len) = shown_axes(&axes).map_err(|e| format!("HDU {index}: {e}"))?;
-            // Checked before allocating, so a header can't claim more memory than its file backs.
-            if (len as u64)
-                .checked_mul(width)
-                .and_then(|bytes| bytes.checked_add(offset))
-                .is_none_or(|end| end > size)
-            {
-                return Err(format!("HDU {index}: data truncated"));
-            }
+            let mut cards = tiled.unwrap_or(cards);
             // The keyword inheritance convention. The extension's cards come first, so its values win.
             if index > 0 && value(&cards, "INHERIT").as_deref() == Some("T") {
                 let structural = ["SIMPLE", "BITPIX", "EXTEND", "GROUPS", "PCOUNT", "GCOUNT"];
@@ -304,10 +350,12 @@ fn find_image<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Imag
                     dims,
                     axes: picked,
                 },
-                bitpix,
-                width: width as usize,
+                bitpix: image_bitpix,
+                width: image_bitpix.unsigned_abs() as usize / 8,
                 len,
                 offset,
+                lengths,
+                tiled: table,
             });
         }
 
@@ -387,7 +435,7 @@ fn read_header<S: Source + ?Sized>(
         *offset += BLOCK as u64;
         if cards.is_empty() && !block.starts_with(b"SIMPLE  =") && !block.starts_with(b"XTENSION=")
         {
-            return Err("not an uncompressed FITS file".into());
+            return Err("not a FITS file".into());
         }
         for card in block.chunks(80) {
             if card.starts_with(b"END     ") {
@@ -451,6 +499,45 @@ fn num<T: FromStr>(cards: &[String], key: &str) -> Result<Option<T>, String> {
         .transpose()
 }
 
+/// BSCALE, BZERO and, for integer data, BLANK. A real BLANK with no fraction (-32768.0) is taken too.
+fn scaling(cards: &[String], bitpix: i64) -> Result<(f64, f64, Option<i64>), String> {
+    let bscale: f64 = num(cards, "BSCALE")?.unwrap_or(1.0);
+    let bzero: f64 = num(cards, "BZERO")?.unwrap_or(0.0);
+    let blank: Option<i64> = if bitpix > 0 {
+        num(cards, "BLANK").or_else(|e| match num::<f64>(cards, "BLANK")? {
+            Some(b) if b.fract() == 0.0 => Ok(Some(b as i64)),
+            _ => Err(e),
+        })?
+    } else {
+        None
+    };
+    Ok((bscale, bzero, blank))
+}
+
+/// Room for `len` voxels. Natively the OS zeroes these pages lazily, so they're first touched by the parallel tasks
+/// rather than by one thread up front, and only those written are committed. wasm32 has no overcommit, so there a
+/// failed allocation is reported instead.
+fn allocate(len: usize) -> Result<Vec<f32>, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return Ok(vec![0.0; len]);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| format!("cannot allocate {len} voxels"))?;
+        data.resize(len, 0.0);
+        Ok(data)
+    }
+}
+
+/// A pool of its own with a thread per core, since Bevy's compute pool only gets some of them.
+#[cfg(not(target_arch = "wasm32"))]
+fn all_cores() -> TaskPool {
+    bevy_tasks::TaskPoolBuilder::new()
+        .num_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
+        .build()
+}
+
 /// Reads, decodes and summarises the data a chunk at a time, on all cores natively.
 fn read_data<S: Source + ?Sized>(
     source: &S,
@@ -460,17 +547,7 @@ fn read_data<S: Source + ?Sized>(
     width: usize,
     len: usize,
 ) -> Result<(Vec<f32>, Stats, Histogram), String> {
-    let bscale: f64 = num(cards, "BSCALE")?.unwrap_or(1.0);
-    let bzero: f64 = num(cards, "BZERO")?.unwrap_or(0.0);
-    // BLANK only applies to integer data. A real with no fraction (-32768.0) is taken too.
-    let blank: Option<i64> = if bitpix > 0 {
-        num(cards, "BLANK").or_else(|e| match num::<f64>(cards, "BLANK")? {
-            Some(b) if b.fract() == 0.0 => Ok(Some(b as i64)),
-            _ => Err(e),
-        })?
-    } else {
-        None
-    };
+    let (bscale, bzero, blank) = scaling(cards, bitpix)?;
     let int = |raw: i64| {
         if Some(raw) == blank {
             f32::NAN
@@ -480,18 +557,7 @@ fn read_data<S: Source + ?Sized>(
     };
     let float = |raw: f64| (bzero + bscale * raw) as f32;
 
-    // Natively the OS zeroes these pages lazily, so they're first touched by the parallel tasks rather than
-    // by one thread up front. wasm32 has no overcommit, so there a failed allocation is reported instead.
-    #[cfg(not(target_arch = "wasm32"))]
-    let mut data = vec![0.0; len];
-    #[cfg(target_arch = "wasm32")]
-    let mut data = {
-        let mut data = Vec::new();
-        data.try_reserve_exact(len)
-            .map_err(|_| format!("cannot allocate {len} voxels"))?;
-        data.resize(len, 0.0);
-        data
-    };
+    let mut data = allocate(len)?;
     let decode = |chunk: usize, out: &mut [f32]| -> Result<Moments, String> {
         let read = |buf: &mut [u8]| {
             source
@@ -520,13 +586,8 @@ fn read_data<S: Source + ?Sized>(
         }
         Ok(Moments::of(out))
     };
-    // A pool of its own with a thread per core, since Bevy's compute pool only gets some of them.
     #[cfg(not(target_arch = "wasm32"))]
-    let pool = bevy_tasks::TaskPoolBuilder::new()
-        .num_threads(std::thread::available_parallelism().map_or(4, |n| n.get()))
-        .build();
-    #[cfg(not(target_arch = "wasm32"))]
-    let chunks = data.par_chunk_map_mut(&pool, CHUNK_VOXELS, decode);
+    let chunks = data.par_chunk_map_mut(&all_cores(), CHUNK_VOXELS, decode);
     #[cfg(target_arch = "wasm32")]
     let chunks: Vec<_> = data
         .chunks_mut(CHUNK_VOXELS)
@@ -536,23 +597,70 @@ fn read_data<S: Source + ?Sized>(
     let moments = chunks.into_iter().try_fold(Moments::EMPTY, |all, chunk| {
         Ok::<_, String>(all.merge(chunk?))
     })?;
-    let stats = moments.stats(len);
+    let (stats, histogram) = summarise(&data, moments);
+    Ok((data, stats, histogram))
+}
 
-    // The range is only known once every chunk is in, so the histogram takes a second pass.
+/// A tile-compressed image's data, the first plane of any axes not shown, decoded on all cores natively, then
+/// summarised.
+fn read_tiled<S: Source + ?Sized>(
+    source: &S,
+    image: &Image,
+    tiled: &fz::Tiled,
+) -> Result<(Vec<f32>, Stats, Histogram), String> {
+    let [width, height, _] = image.header.dims;
+    let shown = [1, width, width * height].map(|s| s as u64);
+    let (mut strides, mut fixed) = (vec![0; image.lengths.len()], Vec::new());
+    for (axis, stride) in strides.iter_mut().enumerate() {
+        match image.header.axes.iter().position(|&a| a == axis) {
+            Some(i) => *stride = shown[i],
+            None => fixed.push((axis, 0)),
+        }
+    }
+    let scaling = scaling(&image.header.cards, image.bitpix)?;
+    let data = tiled.read(
+        source,
+        image.offset,
+        &image.lengths,
+        &fixed,
+        &strides,
+        image.bitpix,
+        scaling,
+        image.len,
+    )?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let chunks = data.par_chunk_map(&all_cores(), CHUNK_VOXELS, |_, chunk| Moments::of(chunk));
+    #[cfg(target_arch = "wasm32")]
+    let chunks: Vec<_> = data.chunks(CHUNK_VOXELS).map(Moments::of).collect();
+    let moments = chunks.into_iter().fold(Moments::EMPTY, Moments::merge);
+    let (stats, histogram) = summarise(&data, moments);
+    Ok((data, stats, histogram))
+}
+
+/// The statistics of `data`, whose chunks' `moments` are in, and its histogram, which takes a second pass since the
+/// range is only known once they are.
+fn summarise(data: &[f32], moments: Moments) -> (Stats, Histogram) {
+    let len = data.len();
+    let stats = moments.stats(len);
     let bins = ((moments.n as f64).sqrt().round() as usize).clamp(1, MAX_BINS);
     let count = |values: &[f32]| count(values, stats.min, stats.max, bins);
     // A few parts per thread, so the faster cores pick up the slack.
     #[cfg(not(target_arch = "wasm32"))]
-    let parts = data.par_chunk_map(&pool, len.div_ceil(4 * pool.thread_num()), |_, part| {
-        count(part)
-    });
+    let parts = {
+        let pool = all_cores();
+        data.par_chunk_map(
+            &pool,
+            len.div_ceil(4 * pool.thread_num()).max(1),
+            |_, part| count(part),
+        )
+    };
     #[cfg(target_arch = "wasm32")]
-    let parts = [count(&data)];
+    let parts = [count(data)];
     let mut counts = vec![0; bins];
     for part in parts {
         counts.iter_mut().zip(part).for_each(|(c, n)| *c += n);
     }
-    Ok((data, stats, Histogram::of_counts(&counts)))
+    (stats, Histogram::of_counts(&counts))
 }
 
 /// At most u16::MAX bins, so a u16 slot can't overrun a table and its last slot takes the non-finite voxels.
@@ -881,12 +989,12 @@ mod tests {
         }
     }
 
-    fn pad(mut bytes: Vec<u8>, fill: u8) -> Vec<u8> {
+    pub(crate) fn pad(mut bytes: Vec<u8>, fill: u8) -> Vec<u8> {
         bytes.resize(bytes.len().div_ceil(BLOCK) * BLOCK, fill);
         bytes
     }
 
-    fn header(cards: &[&str]) -> Vec<u8> {
+    pub(crate) fn header(cards: &[&str]) -> Vec<u8> {
         let text: String = cards
             .iter()
             .chain(&["END"])

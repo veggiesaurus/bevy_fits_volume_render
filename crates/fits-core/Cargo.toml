@@ -7,6 +7,8 @@ edition = "2024"
 [dependencies]
 bytemuck = "1"
 bevy_tasks = { version = "0.20", features = ["multi_threaded"] }
+# For GZIP tiles of .fits.fz, and already in the tree through png.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 prost = "0.14"
 zfp-rs = "1.0.1"
 

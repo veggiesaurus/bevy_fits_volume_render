@@ -264,7 +264,7 @@ fn join(directory: &str, name: &str) -> String {
 
 fn is_fits(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    [".fits", ".fit", ".fts"]
+    [".fits", ".fit", ".fts", ".fz"]
         .iter()
         .any(|ext| name.ends_with(ext))
 }
@@ -1573,6 +1573,38 @@ mod tests {
             session.add(add.clone());
         }
         assert_eq!(session.hits.len(), ids.len());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_compressed_cube_that_unpacks_past_the_budget_is_refused_before_its_read() {
+        let (root, _) = root_with_cube("unit-fz-budget");
+        // 40 x 30 16-bit integers, fpacked, which unpack to 4.8 kB of floats.
+        let fz = include_bytes!("../../fits-core/testdata/image16.fits.fz");
+        std::fs::write(root.join("image.fits.fz"), fz).unwrap();
+        let (mut session, _, mut replies) = session(&root);
+        session.server.cubes().budget = 4000;
+        let open = proto::OpenFile {
+            file: "image.fits.fz".into(),
+            file_id: 1,
+            ..Default::default()
+        };
+        let mut stream = futures_util::stream::pending();
+        let open = frame(EventType::OpenFile, 0, &open);
+        (session
+            .handle(&open, &mut stream, &mut VecDeque::new())
+            .await)
+            .unwrap();
+        let Some(Message::Binary(bytes)) = replies.recv().await else {
+            panic!("no ack")
+        };
+        let ack: proto::OpenFileAck = carta::unframe(&bytes).unwrap().decode().unwrap();
+        assert!(
+            !ack.success && ack.message.contains("not enough memory"),
+            "{}",
+            ack.message
+        );
+        assert!(session.server.cubes().held.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
