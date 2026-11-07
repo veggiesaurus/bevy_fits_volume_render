@@ -172,6 +172,12 @@ pub enum Event {
         dims: [usize; 3],
         mask: Vec<u8>,
     },
+    /// The next event's cubelet came over the network, from a server or static hosting, in `bytes`, with `to_read`
+    /// bytes still to come for the viewer when the source knows it.
+    Fetched {
+        bytes: u64,
+        to_read: Option<u64>,
+    },
 }
 
 pub struct Engine {

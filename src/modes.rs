@@ -247,7 +247,7 @@ pub fn receive(event: Event, extras: &mut ResMut<Extras>, uploads: &mut Uploads)
                 uploads.push_bytes(image, origin, dims, mask);
             }
         }
-        Event::Cubelet { .. } | Event::PixelValue { .. } => {}
+        Event::Cubelet { .. } | Event::PixelValue { .. } | Event::Fetched { .. } => {}
     }
 }
 

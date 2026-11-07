@@ -312,6 +312,10 @@ fn a_cube_opens_and_its_cubelets_histogram_and_values_come_through_the_adapter()
                 assert_eq!(value, voxel([123, 45, 67]));
                 None
             }
+            Received::Event {
+                event: Event::Fetched { .. },
+                ..
+            } => None,
             r => panic!("{r:?}"),
         });
         let factors = opened.levels[usize::from(id.level)];
@@ -646,6 +650,10 @@ fn removed_cubelets_never_arrive_and_the_rest_do() {
                     event: Event::Cubelet { id, .. },
                     ..
                 } => arrived.push(id.at()),
+                Received::Event {
+                    event: Event::Fetched { .. },
+                    ..
+                } => {}
                 r => panic!("{r:?}"),
             }
             if arrived.len() == wanted.len() && wait > Duration::from_secs(1) {

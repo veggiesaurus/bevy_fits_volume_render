@@ -441,6 +441,11 @@ impl Wire for Event {
                 dims.write(w);
                 write_bytes(mask, w);
             }
+            Event::Fetched { bytes, to_read } => {
+                5u8.write(w);
+                bytes.write(w);
+                to_read.write(w);
+            }
         }
     }
 
@@ -477,6 +482,10 @@ impl Wire for Event {
                 origin: Wire::read(r)?,
                 dims: Wire::read(r)?,
                 mask: read_bytes(r)?,
+            },
+            5 => Event::Fetched {
+                bytes: Wire::read(r)?,
+                to_read: Wire::read(r)?,
             },
             _ => return None,
         })
@@ -825,6 +834,10 @@ mod tests {
                 mask: vec![0, 1, 1, 0, 0, 1],
             },
         ));
+        round_trip(Event::Fetched {
+            bytes: 30_550,
+            to_read: Some(31_000_000),
+        });
         round_trip(Request::RemoveCubelets { ids: vec![] });
         round_trip(Request::PixelValue {
             id: u32::MAX,

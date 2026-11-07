@@ -215,6 +215,54 @@ fn cube_section(
     });
 }
 
+/// Data on its way, at the top right where nothing else is: a whole file downloading, or the shown cube's cubelets
+/// that have come out of those asked for, with those that came from the cache and the bytes the rest took.
+pub fn progress(mut contexts: EguiContexts, data: Option<Res<Dataset>>) -> Result {
+    let mb = |bytes: f64| format!("{:.1}", bytes / 1e6);
+    #[cfg(target_arch = "wasm32")]
+    let download = crate::web::download();
+    #[cfg(not(target_arch = "wasm32"))]
+    let download = None::<(f64, f64)>;
+    let (text, fraction) = if let Some((got, total)) = download {
+        if total > 0.0 {
+            (
+                format!("downloading {} / {} MB", mb(got), mb(total)),
+                got / total,
+            )
+        } else {
+            (format!("downloading {} MB", mb(got)), 0.0)
+        }
+    } else if let Some((data, p)) = data.zip(crate::source::progress()) {
+        let mut text = format!("cubelets {} / {}", p.done, p.asked);
+        // Only a server's or a baked cube's are cached.
+        let cached = p.done.saturating_sub(p.fetched);
+        if !data.source.has_cube() && cached > 0 {
+            text += &format!(" ({cached} cached)");
+        }
+        let got = mb(p.bytes as f64);
+        match p.to_read.map(|to_read| p.bytes + to_read) {
+            Some(total) if total > 0 => text += &format!("\n{got} / {} MB", mb(total as f64)),
+            None if p.bytes > 0 => text += &format!("\n{got} MB"),
+            _ => {}
+        }
+        (text, p.done as f64 / p.asked as f64)
+    } else {
+        return Ok(());
+    };
+    egui::Area::new(egui::Id::new("progress"))
+        .anchor(egui::Align2::RIGHT_TOP, [-10.0, 10.0])
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(contexts.ctx_mut()?, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(200.0);
+                ui.label(text);
+                ui.add(egui::ProgressBar::new(fraction as f32).desired_height(4.0));
+            });
+        });
+    Ok(())
+}
+
 fn rendering_section(
     ui: &mut egui::Ui,
     data: &Dataset,

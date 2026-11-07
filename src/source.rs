@@ -3,11 +3,52 @@
 //! and in the browser in a Web Worker (web.rs); or a server (remote.rs). It wakes the app when there's something to
 //! collect.
 
+use std::{collections::HashSet, sync::Mutex};
+
 pub use crate::fits::engine::{CubeletId, Event, Mode, Request};
 #[cfg(target_arch = "wasm32")]
 use crate::web::WorkerSource as LocalSource;
 #[cfg(not(target_arch = "wasm32"))]
 use local::DataSource as LocalSource;
+
+/// What's been asked of the shown cube's source, and what's come back, since it last had nothing to come.
+#[derive(Default)]
+struct Asked {
+    /// Cubelets asked for that haven't come.
+    outstanding: HashSet<CubeletId>,
+    progress: Progress,
+}
+
+/// One cube's at a time, as one is shown at a time.
+static ASKED: Mutex<Option<Asked>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Default)]
+pub struct Progress {
+    pub done: usize,
+    pub asked: usize,
+    /// How many came over the network, the rest of `done` having come from the cache, the bytes they took, and what's
+    /// still to read when the source knows it.
+    pub fetched: usize,
+    pub bytes: u64,
+    pub to_read: Option<u64>,
+}
+
+/// The shown cube's cubelets that have come out of those asked for, while some are still to come.
+pub fn progress() -> Option<Progress> {
+    let asked = ASKED.lock().unwrap();
+    let asked = asked
+        .as_ref()
+        .filter(|asked| !asked.outstanding.is_empty())?;
+    Some(Progress {
+        asked: asked.progress.done + asked.outstanding.len(),
+        ..asked.progress
+    })
+}
+
+/// The shown cube's cubelets that are still to come won't now, as its server's connection has closed.
+pub fn forget() {
+    *ASKED.lock().unwrap() = None;
+}
 
 pub enum DataSource {
     /// A file read here, or in the browser by its worker.
@@ -22,6 +63,24 @@ impl DataSource {
     }
 
     pub fn send(&self, request: Request) {
+        let mut asked = ASKED.lock().unwrap();
+        match &request {
+            // Sent first for each cube.
+            Request::Levels { .. } => *asked = Some(Asked::default()),
+            Request::AddCubelets { ids } => {
+                let asked = asked.get_or_insert_default();
+                if asked.outstanding.is_empty() {
+                    asked.progress = Progress::default();
+                }
+                asked.outstanding.extend(ids);
+            }
+            Request::RemoveCubelets { ids } => {
+                let asked = asked.get_or_insert_default();
+                ids.iter().for_each(|id| _ = asked.outstanding.remove(id));
+            }
+            _ => {}
+        }
+        drop(asked);
         match self {
             Self::Local(source) => source.send(request),
             Self::Remote(source) => source.send(request),
@@ -30,10 +89,25 @@ impl DataSource {
 
     /// The events that have arrived since the last call.
     pub fn drain(&self) -> Vec<Event> {
-        match self {
+        let mut events = match self {
             Self::Local(source) => source.drain(),
             Self::Remote(source) => source.drain(),
-        }
+        };
+        let mut asked = ASKED.lock().unwrap();
+        let asked = asked.get_or_insert_default();
+        let p = &mut asked.progress;
+        events.retain(|event| match *event {
+            Event::Cubelet { id, .. } => {
+                p.done += usize::from(asked.outstanding.remove(&id));
+                true
+            }
+            Event::Fetched { bytes, to_read } => {
+                (p.fetched, p.bytes, p.to_read) = (p.fetched + 1, p.bytes + bytes, to_read);
+                false
+            }
+            _ => true,
+        });
+        events
     }
 
     pub fn is_remote(&self) -> bool {

@@ -539,10 +539,14 @@ impl Client {
                     let tolerance = open.tolerance.unwrap_or(0.0);
                     kept.keep(&mut self.memory, id, tolerance, message.payload);
                 }
-                vec![Received::Event {
-                    file_id: data.file_id,
-                    event: Event::Cubelet { id, cubelet },
-                }]
+                let (file_id, bytes) = (data.file_id, bytes.len() as u64);
+                let fetched = Event::Fetched {
+                    bytes,
+                    to_read: None,
+                };
+                [fetched, Event::Cubelet { id, cubelet }]
+                    .map(|event| Received::Event { file_id, event })
+                    .into()
             }
             EventType::PixelValueResponse => {
                 let value: proto::PixelValueResponse = message.decode()?;

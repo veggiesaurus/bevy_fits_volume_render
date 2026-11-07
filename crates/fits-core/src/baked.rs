@@ -462,6 +462,16 @@ impl Source {
             });
         }
         if read.shown {
+            // ponytail: sums the reads still to make each time one comes, where a running total would be cheaper.
+            let to_read = (self.reads.values())
+                .filter(|read| read.shown)
+                .filter_map(|read| self.records.get(&read.id))
+                .map(|&(_, len)| u64::from(len))
+                .sum();
+            events.push(Event::Fetched {
+                bytes: bytes.len() as u64,
+                to_read: Some(to_read),
+            });
             events.push(Event::Cubelet { id, cubelet });
         } else {
             self.last = Some((id, cubelet));
@@ -622,6 +632,19 @@ mod tests {
                     .is_none()
             );
             let mut arrived = read(&mut source);
+            // Each came over the network, the second with nothing left to read.
+            let fetched: Vec<_> = (arrived.iter())
+                .filter_map(|event| match *event {
+                    Event::Fetched { bytes, to_read } => Some((bytes, to_read)),
+                    _ => None,
+                })
+                .collect();
+            let len = |id| index.cubelets.iter().find(|c| c.0 == id).unwrap().2 as u64;
+            assert_eq!(
+                fetched,
+                [(len(ids[0]), Some(len(ids[1]))), (len(ids[1]), Some(0))]
+            );
+            arrived.retain(|event| !matches!(event, Event::Fetched { .. }));
             // A cursor value comes from level 0's cubelet, which is exact when level 0 is.
             // That's read once, and from the cache after.
             let voxel = [20, 30, 40];

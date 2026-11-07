@@ -36,7 +36,7 @@
   <div id="status" role="status">Starting</div>
 </div>
 <script type="module">
-import init, { clear, connect, opened, pick, receive, receive_remote, server, server_lost } from "./pkg/bevy_fits_volume_render.js";
+import init, { clear, connect, downloaded, downloading, opened, pick, receive, receive_remote, server, server_lost } from "./pkg/bevy_fits_volume_render.js";
 
 // A fits-server's token comes after the #, which isn't sent with requests, and it's taken out of the address bar at
 // once so that it isn't kept in the history either. The viewer sends it to the server in its first message. It's
@@ -78,7 +78,10 @@ function failed(message) {
   worker.terminate();
   worker = null;
   workerHolds(undefined);
-  if (started) server_lost(`the data worker failed: ${message}`);
+  if (started) {
+    server_lost(`the data worker failed: ${message}`);
+    downloaded();
+  }
   status.textContent = `The data worker failed: ${message}`;
 }
 
@@ -97,6 +100,7 @@ let latest = { id: 0 };
 
 function load(name, source) {
   latest = { id: latest.id + 1, name, pick: pick() };
+  downloaded();
   worker ??= startWorker();
   status.textContent = `Loading ${name}`;
   worker.postMessage({ load: latest.id, source, hdu });
@@ -110,7 +114,11 @@ function fromWorker(data) {
   const { name } = latest;
   if (data.got !== undefined) {
     status.textContent = `Downloading ${mb(data.got)}${data.total ? ` of ${mb(data.total)}` : ""}`;
-  } else if (data.reading) {
+    // And at the top right.
+    return downloading(data.got, data.total ?? 0);
+  }
+  downloaded();
+  if (data.reading) {
     status.textContent = `Loading ${name}`;
   } else {
     try {

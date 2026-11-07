@@ -38,6 +38,8 @@ static EVENTS: Mutex<Vec<(u32, Event)>> = Mutex::new(Vec::new());
 static SERVER: Mutex<Option<Remote>> = Mutex::new(None);
 /// How many files have been picked, a file in the page or a cube on a server, so that only the latest is shown.
 static PICKS: AtomicU32 = AtomicU32::new(0);
+/// A file on its way to the worker, as the bytes that have come and the total, or 0 when the server didn't say.
+static DOWNLOAD: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
 type Receive = Box<dyn FnMut(Received)>;
 
@@ -177,6 +179,25 @@ fn page_config(config_toml: &str, overrides: &str) -> Result<config::Config, Str
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
     config::from_toml((!config_toml.is_empty()).then_some(config_toml), &overrides)
+}
+
+/// Called from web/index.html as the worker downloads a file.
+#[wasm_bindgen]
+pub fn downloading(got: f64, total: f64) {
+    *DOWNLOAD.lock().unwrap() = Some((got, total));
+    wake();
+}
+
+/// Called from web/index.html once the download is over, however it ended.
+#[wasm_bindgen]
+pub fn downloaded() {
+    *DOWNLOAD.lock().unwrap() = None;
+    wake();
+}
+
+/// The file on its way to the worker, if there is one.
+pub fn download() -> Option<(f64, f64)> {
+    *DOWNLOAD.lock().unwrap()
 }
 
 /// Called from web/index.html when the worker has read the file of load `load` in `seconds`, which was the viewer's

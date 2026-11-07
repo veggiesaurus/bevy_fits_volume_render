@@ -291,6 +291,9 @@ pub fn poll(
                 remote.opening = None;
                 // The first reason is the one that says what happened.
                 remote.closed.get_or_insert(reason);
+                if data.as_ref().is_some_and(|data| data.source.is_remote()) {
+                    crate::source::forget();
+                }
                 failed = true;
             }
             Received::Event { .. } => {}

@@ -264,6 +264,7 @@ fn main() -> AppExit {
         EguiPrimaryContextPass,
         (
             ui::ui,
+            ui::progress,
             axes::draw_axes.run_if(resource_exists::<AxisAnnotation>),
         ),
     );
