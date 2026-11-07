@@ -897,8 +897,17 @@ impl Session {
         });
         let (file, header, metadata) = header.await.map_err(|e| e.to_string())??;
         let modified = modified(&metadata).as_nanos();
-        let content_id: Arc<str> =
-            format!("{canonical}:{}:{modified}:{}", metadata.len(), header.hdu).into();
+        // A cube whose Stokes axis is shown a plane at a time says which, so that cubelets cached when it was shown
+        // along z don't stand for it.
+        let plane = header
+            .stokes()
+            .map_or(String::new(), |_| ":stokes 0".into());
+        let content_id: Arc<str> = format!(
+            "{canonical}:{}:{modified}:{}{plane}",
+            metadata.len(),
+            header.hdu
+        )
+        .into();
         let bytes = (header.dims.iter().product::<usize>() * size_of::<f32>()) as u64;
         // A cube a session read is shared. Otherwise it's read, one read at a time, and that's when it's checked
         // against the budget, so that no other read can take the room in between.

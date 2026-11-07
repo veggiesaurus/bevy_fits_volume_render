@@ -523,6 +523,9 @@ impl Wire for FileInfo {
             stats: Wire::read(r)?,
             histogram: Histogram(Wire::read(r)?),
             sigma: Wire::read(r)?,
+            // Not sent, since the baked cubes' indexes on static hosting don't have it: the browser shows a cube's
+            // first Stokes plane.
+            stokes: 0,
         })
     }
 }

@@ -256,6 +256,8 @@ pub struct Args {
     pub server: Option<String>,
     pub config: Option<PathBuf>,
     pub hdu: Option<usize>,
+    /// The plane of a local file's Stokes axis.
+    pub stokes: Option<usize>,
     pub overrides: Vec<(String, String)>,
 }
 
@@ -263,13 +265,14 @@ pub struct Args {
 pub const USAGE: &str = concat!(
     "usage: ",
     env!("CARGO_PKG_NAME"),
-    " [--config PATH] [--hdu N] [--<config-key> VALUE]... CUBE.fits\n",
+    " [--config PATH] [--hdu N] [--stokes N] [--<config-key> VALUE]... CUBE.fits\n",
     "       ",
     env!("CARGO_PKG_NAME"),
     " --server URL [OPTIONS]... [PATH]\n",
     "  --server URL        a fits-server's ws://host:port/?token=... URL, to browse its files or open PATH under its root\n",
     "  --config PATH       config file (default: $XDG_CONFIG_HOME/idavie-bevy/config.toml)\n",
     "  --hdu N             HDU index, 0 = primary (default: first image with NAXIS >= 3)\n",
+    "  --stokes N          plane of a local file's Stokes axis, 0 = the first (default: 0)\n",
     "  --<config-key> V    override any config key, e.g. --gpu-memory-limit-mb 512"
 );
 
@@ -277,6 +280,7 @@ pub const USAGE: &str = concat!(
 #[cfg(not(target_arch = "wasm32"))]
 pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
     let (mut file, mut config, mut hdu, mut overrides) = (None, None, None, Vec::new());
+    let mut stokes = None;
     let mut server = None;
     while let Some(arg) = args.next() {
         if arg == "-h" || arg == "--help" {
@@ -295,17 +299,27 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>
             "config" => config = Some(PathBuf::from(value)),
             "server" => server = Some(value),
             "hdu" => hdu = Some(crate::fits::parse_hdu(&value)?),
+            "stokes" => {
+                let plane = value
+                    .parse()
+                    .map_err(|_| format!("--stokes needs a number, got '{value}'"));
+                stokes = Some(plane?)
+            }
             _ => overrides.push((key.to_string(), value)),
         }
     }
     if file.is_none() && server.is_none() {
         return Err(USAGE.into());
     }
+    if server.is_some() && stokes.is_some() {
+        return Err("--stokes is for a local file".into());
+    }
     Ok(Some(Args {
         file,
         server,
         config,
         hdu,
+        stokes,
         overrides,
     }))
 }

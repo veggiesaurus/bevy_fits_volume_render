@@ -3,7 +3,10 @@
 
 use prost::Message;
 
-use crate::{FileInfo, Histogram, ImageHeader, Stats, axis_lengths, engine::Mode, num, shown_axes};
+use crate::{
+    FileInfo, Histogram, ImageHeader, Stats, axis_lengths, engine::Mode, num, shown_axes,
+    stokes_names, stokes_typed,
+};
 
 // Generated from carta-protobuf, whose doc comments have tabs.
 #[allow(clippy::all)]
@@ -202,22 +205,27 @@ pub fn cards(entries: &[HeaderEntry]) -> Vec<String> {
         .collect()
 }
 
-/// The FileInfoExtended of an image header, its axes as carta_backend numbers them, from 1.
+/// The FileInfoExtended of an image header, its axes as carta_backend numbers them, from 1, with 0 for one there isn't,
+/// and the names of the planes of its Stokes axis, if it has one that isn't shown along z.
 pub fn file_info_extended(header: &ImageHeader) -> proto::FileInfoExtended {
     let naxis = num(&header.cards, "NAXIS").ok().flatten().unwrap_or(0);
     let [width, height, depth] = header.dims.map(|d| d.min(i32::MAX as usize) as i32);
     let [x, y, z] = header.axes.map(|a| a as i32 + 1);
+    let stokes = stokes_typed(&header.cards).filter(|&(a, n)| n == 1 || !header.axes.contains(&a));
+    let stokes_vals = stokes.map_or(Vec::new(), |stokes| stokes_names(&header.cards, stokes));
     proto::FileInfoExtended {
         dimensions: naxis,
         width,
         height,
         depth,
-        stokes: 1,
+        stokes: stokes_vals.len().max(1) as i32,
+        stokes_vals,
         header_entries: header_entries(&header.cards),
         axes_numbers: Some(proto::AxesNumbers {
             spatial_x: x,
             spatial_y: y,
-            depth: z,
+            depth: if z <= naxis { z } else { 0 },
+            stokes: stokes.map_or(0, |(a, _)| a as i32 + 1),
             ..Default::default()
         }),
         ..Default::default()
@@ -292,7 +300,7 @@ fn histogram_from(message: &proto::Histogram) -> Result<Histogram, String> {
 /// The dims and axes `read_fits` would read an image of `cards` with.
 pub fn image_axes(cards: &[String]) -> Result<([usize; 3], [usize; 3]), String> {
     let lengths = axis_lengths(cards)?;
-    let (dims, axes, _) = shown_axes(&lengths)?;
+    let (dims, axes, _) = shown_axes(&lengths, cards)?;
     if dims.contains(&0) {
         return Err(format!("an image of {dims:?}"));
     }
@@ -323,6 +331,8 @@ pub fn file_info(
         stats: stats_from(statistics)?,
         histogram: histogram_from(histogram)?,
         sigma,
+        // ponytail: a server's cube is always its first Stokes plane until OPEN_FILE can ask for another.
+        stokes: 0,
     })
 }
 

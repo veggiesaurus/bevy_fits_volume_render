@@ -16,7 +16,7 @@ cargo run --release -- ~/cubes/m25n512_hicube_gal15.fits
 cargo run --release -- --help
 ```
 
-`--config PATH` picks a config file, `--hdu N` picks an HDU (0 is the primary; by default it takes the first image with two or more axes) and any config key can be overridden as `--key value`, e.g. `--gpu-memory-limit-mb 128 --default-color-map Viridis`.
+`--config PATH` picks a config file, `--hdu N` picks an HDU (0 is the primary; by default it takes the first image with two or more axes), `--stokes N` a plane of a Stokes axis (0, the first, by default) and any config key can be overridden as `--key value`, e.g. `--gpu-memory-limit-mb 128 --default-color-map Viridis`.
 
 The config lives at `$XDG_CONFIG_HOME/idavie-bevy/config.toml` (`~/.config/idavie-bevy/config.toml` when that's unset) and is written with the defaults on first run. The keys are the rendering subset of iDaVIE's `config.json`, with the same defaults, plus `jitter`, which iDaVIE sets on the material, the starting thresholds, which iDaVIE always starts at 0 and 1, and the z scale a cube opens at:
 
@@ -91,7 +91,7 @@ The shader takes the same samples as iDaVIE's, apart from the step changes below
 - no foveated rendering for now, so every pixel gets the full step count, as in iDaVIE with `foveatedRendering` off. iDaVIE's default config turns it on, so turn it off in its `config.json` for side by side comparisons
 - only point filtering (iDaVIE's `bilinearFiltering` is off by default)
 - tile-compressed `.fits.fz` is read as fpack writes it with RICE_1, GZIP_1, GZIP_2 or no compression, but not PLIO_1 or HCOMPRESS_1 (funpack those first)
-- the first three axes longer than 1 are shown (a 2D image is one plane), and the first plane of any others (Stokes I of an IQU cube)
+- the first three axes longer than 1 are shown (a 2D image is one plane), and the first plane of any others, except that a Stokes axis is left out when three others are longer than 1. A local file's Stokes plane can then be picked with `--stokes`, but not yet a server's or one in the browser
 - integer BLANK values become NaN; iDaVIE turns off cfitsio's null check and shows them as `BZERO + BSCALE * BLANK`
 - the cube is downsampled to a fixed set of power-of-two levels, plus iDaVIE's factors for the whole cube when they aren't one of them, with blocks aligned to the whole cube. So a crop can get up to 2.6x fewer texels than in iDaVIE, whose factors step through 1, 2, 3, 4, 5
 - Maximum reads a max-downsampled copy and Average a mean-downsampled one, where iDaVIE's config picks one for both

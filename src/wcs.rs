@@ -12,6 +12,8 @@ pub struct Wcs {
     frames: Mutex<FrameSet>,
     /// The FITS pixel axes (0-based) shown as the cube's x, y and z.
     axes: [usize; 3],
+    /// An axis that isn't shown, and the GRID position of its plane that is, when that isn't its first.
+    plane: Option<(usize, f64)>,
 }
 
 impl Wcs {
@@ -51,17 +53,25 @@ impl Wcs {
         Some(Wcs {
             frames: Mutex::new(fs),
             axes,
+            plane: None,
         })
     }
 
-    /// The GRID position of the cube's x, y and z `grid`, on the shown (first) plane of any other axes.
+    /// On plane `plane` (0-based) of `axis`, one that isn't shown, rather than its first.
+    pub fn at_plane(mut self, axis: usize, plane: usize) -> Self {
+        self.plane = Some((axis, plane as f64 + 1.0));
+        self
+    }
+
+    /// The GRID position of the cube's x, y and z `grid`, on the shown plane of any other axes.
     fn grid_point(&self, nin: usize, grid: [f64; 3]) -> Vec<f64> {
         (0..nin)
-            .map(|p| {
-                self.axes
-                    .iter()
-                    .position(|&a| a == p)
-                    .map_or(1.0, |i| grid[i])
+            .map(|p| match self.axes.iter().position(|&a| a == p) {
+                Some(i) => grid[i],
+                None => self
+                    .plane
+                    .filter(|&(axis, _)| axis == p)
+                    .map_or(1.0, |(_, grid)| grid),
             })
             .collect()
     }

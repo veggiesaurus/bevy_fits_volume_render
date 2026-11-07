@@ -133,6 +133,8 @@ pub struct FileInfo {
     pub histogram: Histogram,
     /// `Cube::sigma`, taken at open.
     pub sigma: Option<f64>,
+    /// The plane of the Stokes axis shown, if there's one.
+    pub stokes: usize,
 }
 
 impl FileInfo {
@@ -150,23 +152,43 @@ impl FileInfo {
         Some(value(&self.cards, "BUNIT")?.trim_start().to_string()).filter(|u| !u.is_empty())
     }
 
-    /// "1 of 3 along STOKES" when the HDU holds more than the one plane of its other axes that's shown.
+    /// The Stokes axis that's shown a plane at a time, and the plane.
+    pub fn stokes_plane(&self) -> Option<(usize, usize)> {
+        stokes_axis(&self.cards).map(|axis| (axis, self.stokes))
+    }
+
+    /// "2 of 3 along STOKES (Q)" when the HDU holds more than the one plane of its other axes that's shown.
     pub fn other_planes(&self) -> Option<String> {
         let naxis: usize = num(&self.cards, "NAXIS").ok()??;
-        let others: Vec<(u64, String)> = (1..=naxis)
+        let stokes = stokes_axis(&self.cards).filter(|a| !self.axes.contains(a));
+        let others: Vec<(usize, u64, String)> = (1..=naxis)
             .filter(|a| !self.axes.contains(&(a - 1)))
             .map(|a| {
                 let n = num(&self.cards, &format!("NAXIS{a}")).ok().flatten();
                 let name = value(&self.cards, &format!("CTYPE{a}"));
-                (n.unwrap_or(1), name.unwrap_or(format!("axis {a}")))
+                (a - 1, n.unwrap_or(1), name.unwrap_or(format!("axis {a}")))
             })
-            .filter(|(n, _)| *n > 1)
+            .filter(|(_, n, _)| *n > 1)
             .collect();
-        let planes = others
-            .iter()
-            .try_fold(1u64, |p, (n, _)| p.checked_mul(*n))?;
-        let names: Vec<&str> = others.iter().map(|(_, name)| name.as_str()).collect();
-        (planes > 1).then(|| format!("1 of {planes} along {}", names.join(", ")))
+        let (mut planes, mut plane) = (1u64, 0u64);
+        for (axis, n, _) in &others {
+            if Some(*axis) == stokes {
+                plane += self.stokes as u64 * planes;
+            }
+            planes = planes.checked_mul(*n)?;
+        }
+        let names: Vec<&str> = others.iter().map(|(_, _, name)| name.as_str()).collect();
+        let named = stokes_typed(&self.cards).filter(|&(a, _)| Some(a) == stokes);
+        let name =
+            named.and_then(|stokes| stokes_names(&self.cards, stokes).get(self.stokes).cloned());
+        let shown = name.map_or(String::new(), |name| format!(" ({name})"));
+        (planes > 1).then(|| {
+            format!(
+                "{} of {planes} along {}{shown}",
+                plane + 1,
+                names.join(", ")
+            )
+        })
     }
 }
 
@@ -188,17 +210,23 @@ pub fn parse_hdu(value: &str) -> Result<usize, String> {
 }
 
 pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Cube, String> {
+    read_stokes(source, hdu, 0)
+}
+
+/// `read_fits`, of plane `stokes` of the image's Stokes axis, which isn't one of those shown.
+pub fn read_stokes<S: Source + ?Sized>(
+    source: &S,
+    hdu: Option<usize>,
+    stokes: usize,
+) -> Result<Cube, String> {
     let image = find_image(source, hdu)?;
+    let planes = image.stokes.map_or(1, |axis| image.lengths[axis]);
+    if stokes as u64 >= planes {
+        return Err(format!("no Stokes plane {stokes}: the image has {planes}"));
+    }
     let (data, stats, histogram) = match &image.tiled {
-        None => read_data(
-            source,
-            image.offset,
-            &image.header.cards,
-            image.bitpix,
-            image.width,
-            image.len,
-        )?,
-        Some(tiled) => read_tiled(source, &image, tiled)?,
+        None => read_data(source, &image, stokes)?,
+        Some(tiled) => read_tiled(source, &image, tiled, stokes)?,
     };
     let header = image.header;
     let mut cube = Cube {
@@ -210,6 +238,7 @@ pub fn read_fits<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<C
             stats,
             histogram,
             sigma: None,
+            stokes,
         },
         data,
     };
@@ -226,12 +255,36 @@ pub struct ImageHeader {
     pub axes: [usize; 3],
 }
 
+impl ImageHeader {
+    /// The Stokes axis that's shown a plane at a time, if there's one.
+    pub fn stokes(&self) -> Option<usize> {
+        stokes_axis(&self.cards)
+    }
+}
+
 /// The header of the image `read_fits` would read, without reading its data.
 pub fn read_image_header<S: Source + ?Sized>(
     source: &S,
     hdu: Option<usize>,
 ) -> Result<ImageHeader, String> {
     find_image(source, hdu).map(|image| image.header)
+}
+
+impl Image {
+    /// Where plane `stokes` of the Stokes axis is, in voxels from the image's first: `run` of them at a time, a run
+    /// every `stride`, from `first`. One run, unless a shown axis comes after the Stokes axis.
+    fn plane(&self, stokes: usize) -> (u64, u64, u64) {
+        let len = self.len as u64;
+        let Some(axis) = self.stokes else {
+            return (0, len, len);
+        };
+        let below: u64 = self.lengths[..axis].iter().product();
+        let after = (self.header.axes.iter()).any(|&a| a > axis && a < self.lengths.len());
+        match after {
+            true => (stokes as u64 * below, below, below * self.lengths[axis]),
+            false => (stokes as u64 * below, len, len),
+        }
+    }
 }
 
 /// An image's header and where its data is.
@@ -243,6 +296,8 @@ struct Image {
     offset: u64,
     /// NAXISn.
     lengths: Vec<u64>,
+    /// The Stokes axis, if it's one that isn't shown.
+    stokes: Option<usize>,
     /// The table of tiles, for a tile-compressed image.
     tiled: Option<fz::Tiled>,
 }
@@ -309,17 +364,31 @@ fn find_image<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Imag
                     "HDU {index} is not an image with two or more non-empty axes"
                 ));
             }
+            let mut cards = tiled.unwrap_or(cards);
+            // The keyword inheritance convention. The extension's cards come first, so its values win. The axes are
+            // picked after, since a CTYPE can be inherited.
+            if index > 0 && value(&cards, "INHERIT").as_deref() == Some("T") {
+                let structural = ["SIMPLE", "BITPIX", "EXTEND", "GROUPS", "PCOUNT", "GCOUNT"];
+                let commentary = ["COMMENT", "HISTORY", ""];
+                cards.extend(primary.into_iter().filter(|c| {
+                    let key = c[..8].trim_end();
+                    !key.starts_with("NAXIS")
+                        && !structural.contains(&key)
+                        && !commentary.contains(&key)
+                }));
+            }
             let (dims, picked, len) =
-                shown_axes(&lengths).map_err(|e| format!("HDU {index}: {e}"))?;
-            // Checked before allocating, so a header can't claim more memory than its file backs. A compressed image
-            // is held to baked cubes' limit of 2^40 voxels too, every plane of it.
+                shown_axes(&lengths, &cards).map_err(|e| format!("HDU {index}: {e}"))?;
+            let stokes = stokes_axis(&cards);
+            // Checked before allocating, so a header can't claim more memory than its file backs, every plane of it. A
+            // compressed image is held to baked cubes' limit of 2^40 voxels too.
             let fits = match &table {
                 Some(table) => checked_product(&lengths)
                     .filter(|&voxels| voxels <= MOST_VOXELS)
                     .and_then(|voxels| voxels.checked_mul(image_bitpix.unsigned_abs() / 8))
                     .is_some_and(|bytes| table.holds(offset, size, bytes)),
-                None => (len as u64)
-                    .checked_mul(width)
+                None => checked_product(&lengths)
+                    .and_then(|voxels| voxels.checked_mul(width))
                     .and_then(|bytes| bytes.checked_add(offset))
                     .is_some_and(|end| end <= size),
             };
@@ -330,18 +399,6 @@ fn find_image<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Imag
                     }
                     None => format!("HDU {index}: data truncated"),
                 });
-            }
-            let mut cards = tiled.unwrap_or(cards);
-            // The keyword inheritance convention. The extension's cards come first, so its values win.
-            if index > 0 && value(&cards, "INHERIT").as_deref() == Some("T") {
-                let structural = ["SIMPLE", "BITPIX", "EXTEND", "GROUPS", "PCOUNT", "GCOUNT"];
-                let commentary = ["COMMENT", "HISTORY", ""];
-                cards.extend(primary.into_iter().filter(|c| {
-                    let key = c[..8].trim_end();
-                    !key.starts_with("NAXIS")
-                        && !structural.contains(&key)
-                        && !commentary.contains(&key)
-                }));
             }
             return Ok(Image {
                 header: ImageHeader {
@@ -355,6 +412,7 @@ fn find_image<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Imag
                 len,
                 offset,
                 lengths,
+                stokes,
                 tiled: table,
             });
         }
@@ -384,8 +442,6 @@ fn find_image<S: Source + ?Sized>(source: &S, hdu: Option<usize>) -> Result<Imag
     }
 }
 
-/// The first three axes longer than 1, then length-1 axes, then ones past NAXIS. Leaving out length-1 axes
-/// keeps the first x * y * z values in order, so CASA's RA, DEC, STOKES(1), FREQ loads every channel.
 /// NAXISn for each of an image's NAXIS axes, of which FITS allows 999.
 fn axis_lengths(cards: &[String]) -> Result<Vec<u64>, String> {
     let naxis: u64 = num(cards, "NAXIS")?
@@ -396,9 +452,59 @@ fn axis_lengths(cards: &[String]) -> Result<Vec<u64>, String> {
         .collect()
 }
 
+/// The most planes a Stokes axis has: I, Q, U and V, or four correlations, or both, with room to spare.
+const MOST_STOKES: u64 = 8;
+
+/// The first axis (0-based) past the first two whose CTYPE is STOKES, and its planes, if it has no more than a Stokes
+/// axis can. One with more is shown as any other axis is.
+fn stokes_typed(cards: &[String]) -> Option<(usize, u64)> {
+    let lengths = axis_lengths(cards).ok()?;
+    let is_stokes =
+        |a: usize| value(cards, &format!("CTYPE{}", a + 1)).is_some_and(|t| t.trim() == "STOKES");
+    let axis = (2..lengths.len()).find(|&a| is_stokes(a))?;
+    Some((axis, lengths[axis])).filter(|&(_, n)| (1..=MOST_STOKES).contains(&n))
+}
+
+/// The Stokes axis that's shown a plane at a time: one of more than one plane, when three other axes are longer than
+/// one, which it would otherwise keep from being shown. RA, DEC, STOKES(4) shows its planes along z instead.
+fn stokes_axis(cards: &[String]) -> Option<usize> {
+    let (axis, planes) = stokes_typed(cards)?;
+    let lengths = axis_lengths(cards).ok()?;
+    let others = (lengths.iter().enumerate())
+        .filter(|&(a, &n)| a != axis && n > 1)
+        .count();
+    (planes > 1 && others >= 3).then_some(axis)
+}
+
+/// The names of the planes of a Stokes axis, `axis` of `planes`, from its WCS: I, Q, U and V, the circular and linear
+/// correlations, or the number where it isn't one of those.
+pub(crate) fn stokes_names(cards: &[String], (axis, planes): (usize, u64)) -> Vec<String> {
+    let get = |key: &str, default: f64| {
+        num::<f64>(cards, &format!("{key}{}", axis + 1))
+            .ok()
+            .flatten()
+            .unwrap_or(default)
+    };
+    let (crval, cdelt, crpix) = (get("CRVAL", 0.0), get("CDELT", 1.0), get("CRPIX", 0.0));
+    const NAMES: [&str; 13] = [
+        "YX", "XY", "YY", "XX", "LR", "RL", "LL", "RR", "", "I", "Q", "U", "V",
+    ];
+    (0..planes.min(MOST_STOKES))
+        .map(|i| {
+            let code = (crval + (i as f64 + 1.0 - crpix) * cdelt).round() as i64;
+            let at = code.checked_add(8).and_then(|at| usize::try_from(at).ok());
+            let name = at.and_then(|at| NAMES.get(at)).filter(|n| !n.is_empty());
+            name.map_or(code.to_string(), |n| n.to_string())
+        })
+        .collect()
+}
+
 /// The dims of the axes shown, which axes they are, and their voxels, which fit in memory.
-fn shown_axes(lengths: &[u64]) -> Result<([usize; 3], [usize; 3], usize), String> {
-    let picked = pick_axes(lengths);
+fn shown_axes(
+    lengths: &[u64],
+    cards: &[String],
+) -> Result<([usize; 3], [usize; 3], usize), String> {
+    let picked = pick_axes(lengths, stokes_axis(cards));
     let shown = picked.map(|a| lengths.get(a).copied().unwrap_or(1));
     let len = checked_product(&shown)
         .and_then(|n| usize::try_from(n).ok())
@@ -407,10 +513,12 @@ fn shown_axes(lengths: &[u64]) -> Result<([usize; 3], [usize; 3], usize), String
     Ok((shown.map(|n| n as usize), picked, len))
 }
 
-fn pick_axes(lengths: &[u64]) -> [usize; 3] {
+/// The first three axes longer than 1 but `stokes`, then length-1 axes, then ones past NAXIS. Leaving out length-1
+/// axes keeps the first x * y * z values in order, so CASA's RA, DEC, STOKES(1), FREQ loads every channel.
+fn pick_axes(lengths: &[u64], stokes: Option<usize>) -> [usize; 3] {
     let n = lengths.len();
     let mut picked = (0..n)
-        .filter(|&a| lengths[a] > 1)
+        .filter(|&a| lengths[a] > 1 && Some(a) != stokes)
         .chain((0..n).filter(|&a| lengths[a] == 1))
         .chain(n..);
     std::array::from_fn(|_| picked.next().unwrap())
@@ -538,16 +646,15 @@ fn all_cores() -> TaskPool {
         .build()
 }
 
-/// Reads, decodes and summarises the data a chunk at a time, on all cores natively.
+/// Reads, decodes and summarises plane `stokes` of the data a chunk at a time, on all cores natively.
 fn read_data<S: Source + ?Sized>(
     source: &S,
-    offset: u64,
-    cards: &[String],
-    bitpix: i64,
-    width: usize,
-    len: usize,
+    image: &Image,
+    stokes: usize,
 ) -> Result<(Vec<f32>, Stats, Histogram), String> {
-    let (bscale, bzero, blank) = scaling(cards, bitpix)?;
+    let (bitpix, width, len) = (image.bitpix, image.width, image.len);
+    let (bscale, bzero, blank) = scaling(&image.header.cards, bitpix)?;
+    let (first, run, stride) = image.plane(stokes);
     let int = |raw: i64| {
         if Some(raw) == blank {
             f32::NAN
@@ -559,10 +666,19 @@ fn read_data<S: Source + ?Sized>(
 
     let mut data = allocate(len)?;
     let decode = |chunk: usize, out: &mut [f32]| -> Result<Moments, String> {
-        let read = |buf: &mut [u8]| {
-            source
-                .read_at(offset + (chunk * CHUNK_VOXELS * width) as u64, buf)
-                .map_err(|e| format!("reading FITS data: {e}"))
+        // The chunk's voxels, a run of the plane or part of one at a time.
+        let read = |mut buf: &mut [u8]| {
+            let mut voxel = (chunk * CHUNK_VOXELS) as u64;
+            while !buf.is_empty() {
+                let within = voxel % run;
+                let bytes = (((run - within) as usize) * width).min(buf.len());
+                let at = first + voxel / run * stride + within;
+                let (now, rest) = buf.split_at_mut(bytes);
+                (source.read_at(image.offset + at * width as u64, now))
+                    .map_err(|e| format!("reading FITS data: {e}"))?;
+                (buf, voxel) = (rest, voxel + (bytes / width) as u64);
+            }
+            Ok::<_, String>(())
         };
         // 32-bit values are read straight into the output and converted in place.
         if width == 4 {
@@ -601,12 +717,13 @@ fn read_data<S: Source + ?Sized>(
     Ok((data, stats, histogram))
 }
 
-/// A tile-compressed image's data, the first plane of any axes not shown, decoded on all cores natively, then
-/// summarised.
+/// A tile-compressed image's data, plane `stokes` of its Stokes axis and the first of any other axes not shown, decoded
+/// on all cores natively, then summarised.
 fn read_tiled<S: Source + ?Sized>(
     source: &S,
     image: &Image,
     tiled: &fz::Tiled,
+    stokes: usize,
 ) -> Result<(Vec<f32>, Stats, Histogram), String> {
     let [width, height, _] = image.header.dims;
     let shown = [1, width, width * height].map(|s| s as u64);
@@ -614,6 +731,7 @@ fn read_tiled<S: Source + ?Sized>(
     for (axis, stride) in strides.iter_mut().enumerate() {
         match image.header.axes.iter().position(|&a| a == axis) {
             Some(i) => *stride = shown[i],
+            None if Some(axis) == image.stokes => fixed.push((axis, stokes as u64)),
             None => fixed.push((axis, 0)),
         }
     }
@@ -984,6 +1102,7 @@ mod tests {
                 stats: Moments::EMPTY.stats(0),
                 histogram: Histogram(vec![0]),
                 sigma: None,
+                stokes: 0,
             },
             data,
         }
@@ -1412,12 +1531,13 @@ mod tests {
 
     #[test]
     fn picks_the_first_three_axes_longer_than_one() {
-        let image = |lengths: &[u64]| {
+        // A float cube whose voxels count up, with its Stokes axis named.
+        let image = |lengths: &[u64], stokes: usize| {
             let mut cards = vec![
                 "SIMPLE  =                    T".to_string(),
                 "BITPIX  =                  -32".to_string(),
                 format!("NAXIS   = {:>20}", lengths.len()),
-                "CTYPE4  = 'STOKES  '".to_string(),
+                format!("CTYPE{stokes}  = 'STOKES  '"),
             ];
             cards.extend(
                 (1..)
@@ -1432,26 +1552,106 @@ mod tests {
                 values.iter().flat_map(|v| v.to_be_bytes()).collect(),
                 0,
             ));
-            read_fits(&file[..], None).unwrap()
+            file
         };
+        let read = |file: Vec<u8>| read_fits(&file[..], None).unwrap();
         // CASA's RA, DEC, STOKES(1), FREQ order.
-        let casa = image(&[2, 2, 1, 4]);
+        let casa = read(image(&[2, 2, 1, 4], 3));
         assert_eq!(
             (casa.info.dims, casa.info.axes, casa.info.other_planes()),
             ([2, 2, 4], [0, 1, 3], None)
         );
         assert_eq!(casa.data, (0..16).map(|v| v as f32).collect::<Vec<_>>());
-        let flat = image(&[3, 2]);
+        let flat = read(image(&[3, 2], 3));
         assert_eq!(
             (flat.info.dims, flat.info.axes, flat.data.len()),
             ([3, 2, 1], [0, 1, 2], 6)
         );
-        let stokes = image(&[2, 2, 2, 3]);
+        let stokes = read(image(&[2, 2, 2, 3], 4));
         assert_eq!((stokes.info.dims, stokes.data.len()), ([2, 2, 2], 8));
         assert_eq!(
             stokes.info.other_planes().as_deref(),
-            Some("1 of 3 along STOKES")
+            Some("1 of 3 along STOKES (I)")
         );
+        // With no third axis but Stokes, its planes are shown along z, as before.
+        let planes = read(image(&[2, 2, 4], 3));
+        assert_eq!(
+            (planes.info.dims, planes.info.other_planes()),
+            ([2, 2, 4], None)
+        );
+        // CASA's single Stokes plane is still named, and a WCS that makes no Stokes code is a number.
+        let casa_info = carta::file_info_extended(&casa.info.header());
+        assert_eq!(
+            (
+                casa_info.stokes,
+                casa_info.stokes_vals,
+                casa_info.axes_numbers.unwrap().stokes
+            ),
+            (1, vec!["I".to_string()], 3)
+        );
+        let far = ["CRVAL3  =               1.0E300".to_string()];
+        assert_eq!(stokes_names(&far, (2, 1)), [i64::MAX.to_string()]);
+
+        // A Stokes axis before the spectral one is left out of those shown, and any of its planes can be.
+        let file = image(&[2, 2, 3, 4], 3);
+        let q = read_stokes(&file[..], None, 1).unwrap();
+        assert_eq!(
+            (q.info.dims, q.info.axes, q.info.stokes),
+            ([2, 2, 4], [0, 1, 3], 1)
+        );
+        let want = (0..16).map(|i| (i % 4 + 4 * (1 + 3 * (i / 4))) as f32);
+        assert_eq!(q.data, want.collect::<Vec<_>>());
+        assert_eq!(
+            q.info.other_planes().as_deref(),
+            Some("2 of 3 along STOKES (Q)")
+        );
+        let extended = carta::file_info_extended(&q.info.header());
+        let axes = extended.axes_numbers.unwrap();
+        assert_eq!(
+            (
+                extended.stokes,
+                extended.stokes_vals,
+                axes.stokes,
+                axes.depth
+            ),
+            (3, vec!["I".to_string(), "Q".into(), "U".into()], 3, 4)
+        );
+        assert!(read_stokes(&file[..], None, 3).is_err());
+        // A header that claims more planes than its file holds is refused, and so is a Stokes axis with more than any
+        // has, before its planes are named.
+        let claims = |ctype4: &str, naxis4: u64| {
+            let cards = [
+                "SIMPLE  =                    T".to_string(),
+                "BITPIX  =                  -32".into(),
+                "NAXIS   =                    4".into(),
+                "NAXIS1  =                    2".into(),
+                "NAXIS2  =                    2".into(),
+                "NAXIS3  =                    2".into(),
+                format!("NAXIS4  = {naxis4:>20}"),
+                format!("CTYPE4  = '{ctype4:<8}'"),
+            ];
+            let mut file = header(&cards.iter().map(String::as_str).collect::<Vec<_>>());
+            file.extend(pad(vec![0; 32 * 3], 0));
+            read_image_header(&file[..], None).err().unwrap_or_default()
+        };
+        assert_eq!(claims("FREQ", 3), "");
+        assert!(claims("FREQ", 100).contains("truncated"));
+        assert!(claims("STOKES", 4_000_000_000).contains("truncated"));
+
+        // And the same of a tile-compressed one, from cfitsio's fpack -r of RA, DEC, STOKES(3), FREQ(4) integers.
+        let fz = include_bytes!("../testdata/stokes.fits.fz");
+        for stokes in 0..3 {
+            let plane = read_stokes(&fz[..], None, stokes).unwrap();
+            let want = (0..8 * 6 * 4).map(|i| (i % 48 + 48 * (stokes + 3 * (i / 48))) as f32);
+            assert_eq!(
+                (plane.info.dims, plane.data),
+                ([8, 6, 4], want.collect::<Vec<_>>())
+            );
+        }
+        // fpack -t 8,6,3 of the same, whose tiles span every Stokes plane, so they'd be decoded whole for one.
+        let span = include_bytes!("../testdata/stokes-span.fits.fz");
+        let refused = read_stokes(&span[..], None, 0).err().unwrap();
+        assert!(refused.contains("span 3 planes of axis 3"), "{refused}");
     }
 
     #[test]

@@ -89,7 +89,12 @@ impl Dataset {
     ) -> Self {
         Self {
             name,
-            wcs: wcs::Wcs::from_cards(&info.cards, info.axes),
+            wcs: wcs::Wcs::from_cards(&info.cards, info.axes).map(|wcs| {
+                match info.stokes_plane() {
+                    Some((axis, plane)) => wcs.at_plane(axis, plane),
+                    None => wcs,
+                }
+            }),
             info,
             source,
             config,
@@ -466,7 +471,7 @@ fn load_native() -> Start {
     let start = Instant::now();
     let file =
         std::fs::File::open(&path).unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
-    let cube = fits::read_fits(&file, args.hdu)
+    let cube = fits::read_stokes(&file, args.hdu, args.stokes.unwrap_or(0))
         .unwrap_or_else(|e| fail(format!("{}: {e}", path.display())));
     let name = path.file_name().map_or_else(
         || path.display().to_string(),
