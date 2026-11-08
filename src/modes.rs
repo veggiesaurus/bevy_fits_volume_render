@@ -2,8 +2,11 @@
 //! level, the mask and the processing the cubelets come with. The data source measures the shown texture's noise and
 //! makes its mask.
 
+use std::time::Duration;
+
 use bevy::{
     asset::{RenderAssetUsages, uuid_handle},
+    platform::time::Instant,
     prelude::*,
     render::render_resource::{
         Extent3d, RenderPipelineDescriptor, ShaderType, TextureDimension, TextureFormat,
@@ -14,8 +17,9 @@ use bevy_egui::egui;
 
 use crate::{
     CubeState, Dataset, Settings,
-    config::ASINH,
-    fits::{Noise, Processing, Smoothing},
+    camera::Orbit,
+    config::{ASINH, Precision},
+    fits::{Noise, Processing, Region, Smoothing},
     source::{Event, Mode, Request},
     upload::Uploads,
     view,
@@ -28,6 +32,10 @@ pub const MASK_SIGMAS: f32 = 5.0;
 
 const MEASURING: &str = "measuring the noise";
 
+/// How long the view stays still before Adaptive visits every voxel: longer than the gaps between pointer events in a
+/// slow drag or between wheel notches, so that neither flips it back and forth, and short enough to feel immediate.
+const SETTLE: Duration = Duration::from_millis(200);
+
 /// No mask: one voxel, bound until a mask is made.
 pub const NO_MASK: Handle<Image> = uuid_handle!("6f0c1d0e-3b7a-4f53-9a51-2c0b4d8e7a19");
 
@@ -37,6 +45,7 @@ impl Plugin for ModesPlugin {
     fn build(&self, app: &mut App) {
         let cube_shown = resource_exists::<CubeState>;
         app.init_resource::<Extras>()
+            .init_resource::<Motion>()
             .add_message::<GenerateMask>()
             .add_systems(Startup, insert_no_mask)
             .add_systems(
@@ -45,11 +54,16 @@ impl Plugin for ModesPlugin {
                     (follow_texture, generate_mask)
                         .before(crate::update_material)
                         .run_if(cube_shown),
+                    track_motion
+                        .after(crate::camera::orbit_camera)
+                        .before(update_material)
+                        .run_if(cube_shown),
                     update_material.after(crate::update_material).run_if(
                         cube_shown.and_then(
                             resource_exists_and_changed::<Settings>
                                 .or_eager(resource_exists_and_changed::<CubeState>)
-                                .or_eager(resource_changed::<Extras>),
+                                .or_eager(resource_changed::<Extras>)
+                                .or_eager(resource_changed::<Motion>),
                         ),
                     ),
                 ),
@@ -342,7 +356,7 @@ impl RenderMode {
     }
 
     /// Not the isosurface or shells, which find their surfaces between samples and so keep fixed steps.
-    pub fn takes_high_precision(self) -> bool {
+    pub fn takes_precise(self) -> bool {
         !matches!(self, Self::Isosurface | Self::Shells)
     }
 
@@ -384,8 +398,7 @@ pub struct ModeSettings {
     pub apply_mask: bool,
     /// How much of a voxel outside the mask shows, 0 to 1.
     pub outside_mask: f32,
-    /// Every voxel along each ray rather than fixed steps.
-    pub high_precision: bool,
+    pub precision: Precision,
 }
 
 impl Default for ModeSettings {
@@ -403,17 +416,65 @@ impl Default for ModeSettings {
             processing: Processing::default(),
             apply_mask: false,
             outside_mask: 0.25,
-            high_precision: false,
+            precision: Precision::Adaptive,
         }
     }
 }
 
 impl ModeSettings {
-    /// High precision, where the mode takes it.
-    pub fn high_precision_used(&self) -> bool {
-        self.high_precision && self.mode.takes_high_precision()
+    /// Whether rays visit every voxel: in Precise, and in Adaptive once the view is still, where the mode takes it.
+    pub fn precise(&self, still: bool) -> bool {
+        self.mode.takes_precise()
+            && match self.precision {
+                Precision::Fast => false,
+                Precision::Adaptive => still,
+                Precision::Precise => true,
+            }
+    }
+
+    /// Whether Adaptive switches between fixed steps and every voxel in this mode.
+    pub fn adapts(&self) -> bool {
+        self.precision == Precision::Adaptive && self.mode.takes_precise()
     }
 }
+
+/// Whether the view is still, for Adaptive: nothing has moved it for SETTLE.
+#[derive(Resource, Default)]
+pub struct Motion {
+    pub still: bool,
+    moved: Option<Instant>,
+}
+
+/// Notes when the view last moved, for Adaptive: the camera, the window's shape, or a drag changing the settings or the
+/// selection. The app otherwise only redraws on input, so it's woken once the view has been still for SETTLE.
+fn track_motion(
+    camera: Single<(Ref<Transform>, Ref<Projection>), With<Orbit>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    settings: Res<Settings>,
+    state: Res<CubeState>,
+    mut selection: Local<Option<Region>>,
+    mut motion: ResMut<Motion>,
+) {
+    let (transform, projection) = *camera;
+    let dragging = buttons.get_pressed().next().is_some();
+    let view = transform.is_changed() || projection.is_changed();
+    let drag = dragging && (settings.is_changed() || *selection != state.selection);
+    *selection = state.selection;
+    let now = Instant::now();
+    if settings.modes.adapts() && (view || drag) {
+        motion.bypass_change_detection().moved = Some(now);
+        crate::wake_at(now + SETTLE);
+    }
+    let still = motion.moved.is_none_or(|moved| now - moved >= SETTLE);
+    if motion.still != still {
+        motion.still = still;
+    }
+}
+
+/// The material of an empty mesh drawn beside the volume with the pipeline Adaptive isn't using, so that both are built
+/// before it switches between them.
+#[derive(Resource)]
+pub struct Warm(pub Handle<VolumeMaterial>);
 
 fn smoothing_name(smoothing: Smoothing) -> &'static str {
     match smoothing {
@@ -454,7 +515,7 @@ pub struct VolumeKey {
     mask: bool,
     snr_opacity: bool,
     lit: bool,
-    high_precision: bool,
+    precise: bool,
 }
 
 impl From<&VolumeMaterial> for VolumeKey {
@@ -476,17 +537,14 @@ impl VolumeKey {
             (self.mask, "MASK"),
             (self.snr_opacity, "SNR_OPACITY"),
             (self.lit, "LIT"),
-            (self.high_precision, "VOXELS"),
-            // High precision compiles Average and Maximum as separate pipelines, as each is lighter alone.
+            (self.precise, "VOXELS"),
+            // Precise compiles Average and Maximum as separate pipelines, as each is lighter alone.
             (
-                self.high_precision && self.mode == RenderMode::Average,
+                self.precise && self.mode == RenderMode::Average,
                 "VOXELS_AVERAGE",
             ),
-            // High precision fetches past the texture, which the browser makes safe but native shaders don't.
-            (
-                self.high_precision && !cfg!(target_arch = "wasm32"),
-                "GUARD_LOADS",
-            ),
+            // Precise fetches past the texture, which the browser makes safe but native shaders don't.
+            (self.precise && !cfg!(target_arch = "wasm32"), "GUARD_LOADS"),
         ] {
             if on {
                 fragment.shader_defs.push(def.into());
@@ -525,6 +583,8 @@ fn update_material(
     state: Res<CubeState>,
     data: Res<Dataset>,
     extras: Res<Extras>,
+    motion: Res<Motion>,
+    warm: Res<Warm>,
     mut materials: ResMut<Assets<VolumeMaterial>>,
 ) {
     let Some(mut material) = materials.get_mut(&state.material) else {
@@ -577,8 +637,19 @@ fn update_material(
         mask: mask.is_some(),
         snr_opacity: emission && m.snr_opacity,
         lit: emission && m.lit,
-        high_precision: m.high_precision_used(),
+        precise: m.precise(motion.still),
     };
+    let other = VolumeKey {
+        precise: material.key.precise ^ m.adapts(),
+        ..material.key
+    };
+    drop(material);
+    // The empty mesh's material needs only the key to build its pipeline, so the rest stays as it was made.
+    if materials.get(&warm.0).is_some_and(|warm| warm.key != other)
+        && let Some(mut warm) = materials.get_mut(&warm.0)
+    {
+        warm.key = other;
+    }
 }
 
 /// The planes holding the middle 98% of the flux, so the channel colours span the line rather than the band, and a few

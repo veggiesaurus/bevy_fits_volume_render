@@ -14,8 +14,7 @@ pub struct Config {
     pub default_color_map: ColorMap,
     pub default_scaling_type: Scaling,
     pub jitter: f32,
-    /// Every voxel along each ray rather than fixed steps.
-    pub high_precision: bool,
+    pub precision: Precision,
     pub threshold_min: f32,
     pub threshold_max: f32,
     pub z_scale: ZScale,
@@ -37,7 +36,7 @@ impl Default for Config {
             default_color_map: ColorMap::try_from("Inferno".to_string()).unwrap(),
             default_scaling_type: Scaling::try_from("Linear".to_string()).unwrap(),
             jitter: 1.0,
-            high_precision: false,
+            precision: Precision::Adaptive,
             threshold_min: 0.0,
             threshold_max: 1.0,
             z_scale: ZScale::Cube,
@@ -49,6 +48,43 @@ impl Default for Config {
             },
             max_mode_downsampling: serde::de::IgnoredAny,
         }
+    }
+}
+
+/// How a ray samples the texture: at fixed steps, at every voxel it passes through, or fixed steps while the view
+/// moves and every voxel once it's still.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase", try_from = "String")]
+pub enum Precision {
+    Fast,
+    Adaptive,
+    Precise,
+}
+
+impl Precision {
+    pub const ALL: [Self; 3] = [Self::Fast, Self::Adaptive, Self::Precise];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast",
+            Self::Adaptive => "Adaptive",
+            Self::Precise => "Precise",
+        }
+    }
+
+    pub fn about(self) -> &'static str {
+        match self {
+            Self::Fast => "Fixed steps along each ray, the fastest",
+            Self::Adaptive => "Fixed steps while the view moves, then every voxel once it's still",
+            Self::Precise => "Visits every voxel along each ray for an exact image, and is slower",
+        }
+    }
+}
+
+impl TryFrom<String> for Precision {
+    type Error = String;
+    fn try_from(name: String) -> Result<Self, String> {
+        index("precision", &Self::ALL.map(Self::name), &name).map(|i| Self::ALL[i as usize])
     }
 }
 
@@ -365,6 +401,9 @@ mod tests {
             (config.default_color_map, config.default_scaling_type),
             (ColorMap(72), Scaling(2))
         );
+
+        let precision = from_toml(None, &[("precision".into(), "Precise".into())]).unwrap();
+        assert_eq!(precision.precision, Precision::Precise);
 
         let err = from_toml(None, &[("max_steps".into(), "100".into())]).unwrap_err();
         assert!(err.contains("max_steps"), "{err}");

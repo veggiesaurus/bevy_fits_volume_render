@@ -246,7 +246,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let t = intersect_box(in.ray_origin, direction, params.slice_min, params.slice_max);
     // Early exit of pixels missing the bounding box or occluded by opaque objects. Within a step counts as
     // occluded, since the last sample would land a step in front of the box and wrap round to the far side,
-    // tinting the front edges of the outline. High precision has no steps, so within a voxel along the ray does.
+    // tinting the front edges of the outline. Precise has no steps, so within a voxel along the ray does.
     var margin = step_length;
     @if(VOXELS) {
         let rate = abs(direction / (params.texture_max - params.texture_min) * texels());
@@ -266,7 +266,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let step_vector = normalize(ray_delta);
     let required_steps = i32(clamp(total_length / step_length, 0.0, max_steps));
 
-    // Unity's _Time.xy is (t / 20, t). High precision has no jitter.
+    // Unity's _Time.xy is (t / 20, t). Precise has no jitter.
     var jitter = params.jitter;
     @if(VOXELS) {
         jitter = 0.0;
@@ -282,7 +282,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     @if(ASINH) {
         set_noise_floor(ray_delta * region_scale);
     }
-    // High precision's walk, from where the ray enters the box, in texels with z in layers.
+    // Precise's walk, from where the ray enters the box, in texels with z in layers.
     let walked = walk((p_near + region_offset) * region_scale * texels(), direction * region_scale * texels(), total_length);
     @if(VOXELS && !CUSTOM) {
         let layers = vec3(1.0, 1.0, params.layers);
@@ -398,7 +398,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     return shade((top.x - params.scale_min) / scale_range, top.y == top.x);
 }
 
-// High precision: the ray o + t d in texels, z in layers, t from 0 to its object-space length `end`, through every voxel
+// Precise: the ray o + t d in texels, z in layers, t from 0 to its object-space length `end`, through every voxel
 // it passes once each by Amanatides and Woo's traversal, mostly eight voxels at a time so that their fetches overlap.
 // After each batch the walk steps over the rest of the grid cell it's in, and any cells after it, if they can't change
 // the result. Visiting some of such a cell's voxels doesn't change the result either, so the check needn't fall on a
@@ -846,7 +846,7 @@ struct Ray {
     // The clip box.
     clip_min: vec3<f32>,
     clip_max: vec3<f32>,
-    // High precision's walk, in display-space lengths from where the ray enters the box, which is t0 as high precision
+    // Precise's walk, in display-space lengths from where the ray enters the box, which is t0 as Precise
     // has no jitter.
     walk: Walk,
 };
@@ -865,7 +865,7 @@ fn in_selection(r: Ray, a: vec3<f32>) -> bool {
 
 fn crosses_selection(r: Ray) -> bool {
     let t = intersect_box(r.start, r.da, r.selection_min, r.selection_max);
-    // High precision takes the whole ray, so the part step at its end counts too.
+    // Precise takes the whole ray, so the part step at its end counts too.
     var end = f32(r.steps);
     @if(VOXELS) {
         end += r.tail_steps;

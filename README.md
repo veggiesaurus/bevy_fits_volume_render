@@ -18,7 +18,7 @@ cargo run --release -- --help
 
 `--config PATH` picks a config file, `--hdu N` picks an HDU (0 is the primary; by default it takes the first image with two or more axes), `--stokes N` a plane of a Stokes axis (0, the first, by default) and any config key can be overridden as `--key value`, e.g. `--gpu-memory-limit-mb 128 --default-color-map Viridis`.
 
-The config lives at `$XDG_CONFIG_HOME/idavie-bevy/config.toml` (`~/.config/idavie-bevy/config.toml` when that's unset) and is written with the defaults on first run. The keys are the rendering subset of iDaVIE's `config.json`, with the same defaults, plus `jitter`, which iDaVIE sets on the material, `high_precision`, which iDaVIE doesn't have, the starting thresholds, which iDaVIE always starts at 0 and 1, and the z scale a cube opens at:
+The config lives at `$XDG_CONFIG_HOME/idavie-bevy/config.toml` (`~/.config/idavie-bevy/config.toml` when that's unset) and is written with the defaults on first run. The keys are the rendering subset of iDaVIE's `config.json`, with the same defaults, plus `jitter`, which iDaVIE sets on the material, `precision`, which iDaVIE doesn't have, the starting thresholds, which iDaVIE always starts at 0 and 1, and the z scale a cube opens at:
 
 ```toml
 gpu_memory_limit_mb = 384       # texture budget; the cube is downsampled to fit, as in iDaVIE
@@ -26,7 +26,7 @@ max_raymarching_steps = 384
 default_color_map = "Inferno"   # any name from iDaVIE's ColorMapEnum
 default_scaling_type = "Linear" # Linear, Log, Sqrt, Square, Power, Gamma or Asinh
 jitter = 1.0
-high_precision = false          # every voxel along each ray for an exact image, slower than fixed steps
+precision = "adaptive"          # "fast" (fixed steps), "precise" (every voxel along each ray) or "adaptive" (fast while the view moves, precise once it's still)
 threshold_min = 0.0             # where the colour map starts and ends, as fractions of the data range
 threshold_max = 1.0
 z_scale = "cube"                # "cube" (as deep as it's wide), "voxels" (cubic voxels) or a number relative to cubic voxels
@@ -34,9 +34,9 @@ zfp_tolerance_sigmas = 1.0      # how far a server's cubelets may be off, in the
 cache_memory_mb = 1024          # a server's cubelets kept in memory, compressed (256 by default in the browser)
 ```
 
-The view only redraws on input (and while data is still arriving), so an idle window leaves the GPU alone. Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping keeps the selection, the same as iDaVIE. A crop the texture on screen already holds finely enough is immediate; otherwise it starts from the current view and sharpens as the finer data arrives, and the panel shows the downsampling factors before and after. Every cube comes up the same way, coarse first.
+The view only redraws on input (and while data is still arriving, and once when it settles in Adaptive), so an idle window leaves the GPU alone. Drag to orbit, right- or middle-drag to pan, scroll to zoom, shift-drag to select a region, C or Enter to crop to it, R to reset the crop and Esc to clear the selection. A selection covers the two axes facing the camera and keeps the depth range of the previous one, so rotate and shift-drag again to narrow the third axis, or drag one of the blue arrows on its faces or squares on its corners to resize it. Cropping keeps the selection, the same as iDaVIE. A crop the texture on screen already holds finely enough is immediate; otherwise it starts from the current view and sharpens as the finer data arrives, and the panel shows the downsampling factors before and after. Every cube comes up the same way, coarse first.
 
-`SCREENSHOT=out.png` saves a frame once rendering has settled and exits, which is handy for side by side comparisons with iDaVIE.
+`SCREENSHOT=out.png` saves a frame once rendering has settled and exits, which is handy for side by side comparisons with iDaVIE (with `--precision fast` for its fixed steps).
 
 ## Server
 
@@ -109,7 +109,7 @@ The shader takes the same samples as iDaVIE's, apart from the step changes below
 - the near plane follows the camera in, so a small crop doesn't end up behind it, and the far plane and zoom limits follow the region shown, so a deep box isn't cut off
 - the step count is capped at two per texel along the texture's diagonal, so a small crop or a heavily downsampled cube takes fewer steps than in iDaVIE. Voxel edges can shift by a fraction of a voxel compared with iDaVIE
 - the view only redraws on input, so the jitter noise holds still while nothing changes; iDaVIE renders every frame
-- high precision, which visits each voxel of the texture shown that a ray passes through, once and without jitter, with Average weighting it by the ray's length in it. On M83 CO it takes two to eight times as long as fixed steps, as a ray there passes through more voxels than fixed steps takes samples and each voxel costs more to find than a step. The gap is smaller on a small cube, where fixed steps take two samples a texel. It's exact for the texture shown, so for a downsampled level its voxels rather than the cube's, and the isosurface and shells keep their steps
+- three precisions. Fast takes the fixed steps. Precise visits each voxel of the texture shown that a ray passes through, once and without jitter, with Average weighting it by the ray's length in it. On M83 CO it takes two to eight times as long as fixed steps, as a ray there passes through more voxels than fixed steps takes samples and each voxel costs more to find than a step. The gap is smaller on a small cube, where fixed steps take two samples a texel. It's exact for the texture shown, so for a downsampled level its voxels rather than the cube's, and the isosurface and shells keep their steps. Adaptive, the default, takes fixed steps while the view moves and switches to Precise, drawing a frame, once it has been still for 0.2 s, so moving is as fast as Fast and a still view is exact
 - rendering modes past Maximum and Average: depth cued and attenuated maximum, peak and mean channel colours, emission-absorption with MIDA, S/N opacity and lighting, an isosurface, translucent shells and a clipped moment 0. Asinh scaling starts from the noise, and the noise can be normalised, the cube smoothed and a SoFiA-style smooth-and-clip mask made, all by the data source (the worker, in the browser). The noise and the mask come from the shown texture's level, so from a downsampled cube when that's what's shown
 
 WCS comes from [starlink-ast](https://github.com/Starlink/starlink-ast-rs), the Rust port of AST, with spectral axes shown in MHz or km/s. The port doesn't include AST's `Plot3D`, so the WCS ticks on the bounding box are our own. Each axis is labelled on the box edge that's on the silhouette, at round values found with AST's transforms and formatted with AST's `Format`. The tick spacing is chosen by hand because `astGap` isn't ported either.

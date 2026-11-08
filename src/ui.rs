@@ -8,7 +8,9 @@ use bevy_egui::{EguiContexts, egui};
 
 use crate::{
     CubeState, Dataset, Settings,
-    config::{ASINH, COLOR_MAPS, GAMMA, JITTER, RAYMARCHING_STEPS, SCALING_TYPES, ZScale},
+    config::{
+        ASINH, COLOR_MAPS, GAMMA, JITTER, Precision, RAYMARCHING_STEPS, SCALING_TYPES, ZScale,
+    },
     fits::{Noise, PERCENTILES, Region},
     modes::{self, Extras, GenerateMask},
     selection::{CropRequest, Hover},
@@ -336,27 +338,39 @@ fn rendering_section(
         !data.source.has_cube(),
         unit,
     );
-    let precise = s.modes.high_precision_used();
-    ui.horizontal(|ui| {
-        ui.add_enabled(
-            !precise,
+    ui.add_enabled_ui(s.modes.mode.takes_precise(), |ui| {
+        egui::ComboBox::from_label("Precision")
+            .selected_text(s.modes.precision.name())
+            .show_ui(ui, |ui| {
+                for precision in Precision::ALL {
+                    ui.selectable_value(&mut s.modes.precision, precision, precision.name())
+                        .on_hover_text(precision.about());
+                }
+            })
+            .response
+            .on_hover_text(s.modes.precision.about())
+            .on_disabled_hover_text(
+                "No effect on the isosurface and shells, which find their surfaces between samples",
+            );
+    });
+    let fixed = !s.modes.precise(false);
+    let jitter = ui
+        .add_enabled(
+            fixed,
             egui::Slider::new(&mut p.jitter, JITTER).text("Jitter"),
         )
-        .on_disabled_hover_text("High precision has no jitter");
-        ui.add_enabled(
-            s.modes.mode.takes_high_precision(),
-            egui::Checkbox::new(&mut s.modes.high_precision, "High precision"),
+        .on_disabled_hover_text("Precise has no jitter");
+    let steps = ui
+        .add_enabled(
+            fixed,
+            egui::Slider::new(&mut p.max_steps, RAYMARCHING_STEPS).text("Ray-marching steps"),
         )
-        .on_hover_text("Visits every voxel along each ray for an exact image, and is slower")
-        .on_disabled_hover_text(
-            "No effect on the isosurface and shells, which find their surfaces between samples",
-        );
-    });
-    ui.add_enabled(
-        !precise,
-        egui::Slider::new(&mut p.max_steps, RAYMARCHING_STEPS).text("Ray-marching steps"),
-    )
-    .on_disabled_hover_text("The step count doesn't apply in high precision");
+        .on_disabled_hover_text("The step count doesn't apply in Precise");
+    if s.modes.adapts() {
+        let moving = "Applies while the view moves, as Adaptive visits every voxel once it's still";
+        jitter.on_hover_text(moving);
+        steps.on_hover_text(moving);
+    }
     z_scale_row(ui, data.info.dims, &mut s.z_scale);
     if data.wcs.is_some() {
         ui.checkbox(&mut s.wcs_axes, "WCS axes");

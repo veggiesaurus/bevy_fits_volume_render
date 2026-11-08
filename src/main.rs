@@ -16,9 +16,13 @@ mod wcs;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
-use std::{sync::OnceLock, time::Duration};
+use std::{
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
 
 use bevy::{
+    camera::visibility::NoFrustumCulling,
     diagnostic::FrameTimeDiagnosticsPlugin,
     platform::time::Instant,
     prelude::*,
@@ -58,6 +62,61 @@ static WAKE: OnceLock<EventLoopProxy<WinitUserEvent>> = OnceLock::new();
 pub fn wake() {
     if let Some(proxy) = WAKE.get() {
         let _ = proxy.send_event(WinitUserEvent::WakeUp);
+    }
+}
+
+/// When the timer from `wake_at` wakes the app. Only one timer runs at a time.
+static WAKE_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Wakes the app once at `at`, or at the latest time it's given before then.
+pub fn wake_at(at: Instant) {
+    let mut due = WAKE_AT.lock().unwrap();
+    let running = due.is_some();
+    *due = Some(due.map_or(at, |due| due.max(at)));
+    drop(due);
+    if !running {
+        start_timer();
+    }
+}
+
+/// How much longer the timer has to wait, or None once it has woken the app.
+fn time_left() -> Option<Duration> {
+    let mut due = WAKE_AT.lock().unwrap();
+    let left = due.map_or(Duration::ZERO, |at| {
+        at.saturating_duration_since(Instant::now())
+    });
+    if left.is_zero() {
+        *due = None;
+        drop(due);
+        wake();
+        return None;
+    }
+    Some(left)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn start_timer() {
+    std::thread::spawn(|| {
+        while let Some(left) = time_left() {
+            std::thread::sleep(left);
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn start_timer() {
+    use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+    let Some(left) = time_left() else {
+        return;
+    };
+    let set_timeout = js_sys::Reflect::get(&js_sys::global(), &"setTimeout".into())
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok());
+    let then = Closure::once_into_js(start_timer);
+    let ms = JsValue::from(left.as_secs_f64() * 1e3);
+    if set_timeout.is_none_or(|f| f.call2(&JsValue::NULL, &then, &ms).is_err()) {
+        // No timer, so let the next call try again.
+        *WAKE_AT.lock().unwrap() = None;
     }
 }
 
@@ -158,7 +217,7 @@ impl Settings {
                 ..default()
             },
             modes: modes::ModeSettings {
-                high_precision: config.high_precision,
+                precision: config.precision,
                 ..default()
             },
             wcs_axes: true,
@@ -203,6 +262,9 @@ fn main() -> AppExit {
                     ..default()
                 }
                 .into(),
+                // As on macOS and in the browser, so that a pipeline Adaptive switches to is built before it's drawn
+                // rather than skipped while it builds.
+                synchronous_pipeline_compilation: true,
                 ..default()
             }),
     )
@@ -516,6 +578,7 @@ fn clear_dataset(
     commands.remove_resource::<CubeState>();
     commands.remove_resource::<AxisAnnotation>();
     commands.remove_resource::<BoxShape>();
+    commands.remove_resource::<modes::Warm>();
 }
 
 /// The whole cube starts as the coarsest level's one cubelet, which the source can cut at once, and `view::refine`
@@ -557,7 +620,7 @@ fn spawn_volume(
 
     let settings = Settings::new(&data);
     let shape = BoxShape::new(dims, settings.z_scale);
-    let material = materials.add(VolumeMaterial {
+    let volume = VolumeMaterial {
         params: settings.params,
         data_cube: full.handle.clone(),
         color_map: images.add(volume::color_map_image()),
@@ -565,7 +628,9 @@ fn spawn_volume(
         modes: default(),
         mask: modes::NO_MASK,
         key: default(),
-    });
+    };
+    let warm = materials.add(volume.clone());
+    let material = materials.add(volume);
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
         MeshMaterial3d(material.clone()),
@@ -574,6 +639,15 @@ fn spawn_volume(
         Visibility::Hidden,
         DatasetEntity,
     ));
+    // A box with no size, so that it covers no pixels, but its pipeline is built.
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(0.0, 0.0, 0.0))),
+        MeshMaterial3d(warm.clone()),
+        NoFrustumCulling,
+        Visibility::Hidden,
+        DatasetEntity,
+    ));
+    commands.insert_resource(modes::Warm(warm));
     outline::spawn_outlines(&mut commands, &mut meshes, &mut line_materials);
     commands.insert_resource(settings);
     commands.insert_resource(modes::Extras::default());
